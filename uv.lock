@@ -2696,7 +2696,7 @@ requires-dist = [
     { name = "torchcodec", marker = "extra == 'vlm'" },
     { name = "torchdata" },
     { name = "transformers" },
-    { name = "transformers", marker = "extra == 'vlm'", specifier = ">=4.53.2" },
+    { name = "transformers", marker = "extra == 'vlm'", specifier = ">=4.51.0,<4.54.0" },
     { name = "wandb" },
 ]
 provides-extras = ["vlm", "fa"]
