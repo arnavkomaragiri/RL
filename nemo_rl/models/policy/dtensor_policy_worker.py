@@ -639,9 +639,48 @@ class DTensorPolicyWorker:
                     mb_iterator = batch.make_microbatch_iterator(mbs)
                     iterator_len = batch.size // mbs
 
+                def pad_sample(mb1, target_length: int):
+                    # pad input_ids to target_length
+                    batch_size, seq_len = mb1["input_ids"].shape
+                    if seq_len < target_length:
+                        pad_len = target_length - seq_len
+                        pad_ids = torch.randint(
+                            low=0,
+                            high=self.tokenizer.vocab_size,
+                            size=(batch_size, pad_len),
+                            device=mb1["input_ids"].device,
+                        )
+                        mb1["input_ids"] = torch.cat([mb1["input_ids"], pad_ids], dim=1)
+
+                    # pad token_mask to target_length
+                    if "token_mask" in mb1:
+                        batch_size, seq_len = mb1["token_mask"].shape
+                        if seq_len < target_length:
+                            pad_len = target_length - seq_len
+                            pad_ids = torch.zeros((batch_size, pad_len), device=mb1["token_mask"].device)
+                            mb1["token_mask"] = torch.cat([mb1["token_mask"], pad_ids], dim=1)
+
+                    # pad reference_policy_logprobs to target_length
+                    if "reference_policy_logprobs" in mb1:
+                        batch_size, seq_len = mb1["reference_policy_logprobs"].shape
+                        if seq_len < target_length:
+                            pad_len = target_length - seq_len
+                            pad_ids = torch.zeros((batch_size, pad_len), device=mb1["reference_policy_logprobs"].device)
+                            mb1["reference_policy_logprobs"] = torch.cat([mb1["reference_policy_logprobs"], pad_ids], dim=1)
+
+                    return mb1
+
+
+                target_seqlen = 12288
                 for mb_idx, mb in enumerate(
                     itertools.chain(mb_iterator, dummy_iterator)
                 ):
+                    torch.cuda.empty_cache()
+                    mb = pad_sample(mb, target_seqlen)
+                    stats = torch.cuda.memory_stats()
+                    peak_bytes_requirement = stats["allocated_bytes.all.peak"]
+                    print(f"Peak memory: {peak_bytes_requirement / 1024 ** 3:.2f} GB")
+
                     with torch.autocast(device_type="cuda", dtype=self.dtype):
                         if self.enable_seq_packing:
                             input_ids = mb.get("input_ids").cuda()

@@ -420,6 +420,7 @@ def dpo_train(
 
             with timer.time("total_step_time"):
                 print("▶ Taking a training step...")
+                print("batch", batch["input_ids"].shape)
                 train_results = policy.train(
                     batch,
                     loss_fn,
