@@ -22,7 +22,10 @@ from typing import Any, Generator, Iterable, Optional, cast
 import ray
 import torch
 from accelerate import init_empty_weights
-from nemo_automodel import NeMoAutoModelForCausalLM
+from nemo_automodel import (
+    NeMoAutoModelForCausalLM,
+    NeMoAutoModelForSequenceClassification,
+)
 from nemo_automodel.components._transformers.utils import sliding_window_overwrite
 from nemo_automodel.components.distributed.cp_utils import (
     create_context_parallel_ctx,
@@ -51,8 +54,10 @@ from torch.distributed.fsdp import (
     OffloadPolicy,
 )
 from torch.distributed.tensor import DTensor, Shard
-from transformers import AutoConfig, AutoTokenizer
-from transformers.integrations.accelerate import find_tied_parameters
+from transformers import (
+    AutoConfig,
+    AutoTokenizer,
+)
 from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
@@ -60,7 +65,6 @@ from nemo_rl.algorithms.loss_functions import SequencePackingLossWrapper
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import get_logprobs_from_vocab_parallel_logits
 from nemo_rl.models.huggingface.common import (
-    ModelFlag,
     get_flash_attention_kwargs,
     pack_sequences,
 )
@@ -70,8 +74,10 @@ from nemo_rl.models.policy.interfaces import (
     ReferenceLogprobOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
+    configure_dynamo_cache,
     configure_expandable_segments,
     get_gpu_info,
+    get_handle_from_tensor,
     get_runtime_env_for_policy_worker,
     import_class_from_path,
     is_vllm_v1_engine_enabled,
@@ -80,6 +86,7 @@ from nemo_rl.utils.native_checkpoint import (
     load_checkpoint,
     save_checkpoint,
 )
+from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 
 @ray.remote(
@@ -114,6 +121,10 @@ class DTensorPolicyWorkerV2:
         # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
         if not self.is_generation_colocated:
             os.environ["NCCL_CUMEM_ENABLE"] = "1"
+
+        # Disable dynamo autotune_local_cache to avoid crash when there's already a cache
+        # with different order of node_bundles
+        configure_dynamo_cache()
 
         # Only enable expandable_segments on Hopper and newer architectures (compute capability 9.x+)
         configure_expandable_segments()
@@ -158,10 +169,43 @@ class DTensorPolicyWorkerV2:
             if self.enable_seq_packing
             else None,
         )
+
+        self._is_reward_model = self.cfg.get("reward_model_cfg", {}).get(
+            "enabled", False
+        )
+        if self._is_reward_model:
+            # Ensure sequence packing is disabled.
+            if self.enable_seq_packing:
+                raise NotImplementedError(
+                    "Sequence packing is not supported for reward models"
+                )
+            # Load model as a Reward Model.
+            rm_type = self.cfg["reward_model_cfg"]["reward_model_type"]
+            if rm_type == "bradley_terry":
+                model_class = NeMoAutoModelForSequenceClassification
+                if model_config.num_labels != 1:
+                    # For Bradley-Terry reward models, the linear head has a single output.
+                    # In the transformers library, the default setting for model_config.num_labels is 2
+                    # (https://github.com/huggingface/transformers/blob/v4.52.4/src/transformers/configuration_utils.py#L259).
+                    # Since num_labels is used as the out_features for the linear head
+                    # (https://github.com/huggingface/transformers/blob/v4.52.4/src/transformers/models/llama/modeling_llama.py#L738)
+                    # if num_labels is not 1, we set it to 1. This change may trigger a warning that some weights are not initialized
+                    # from the model checkpoint and are instead initialized using model_config.initializer_range
+                    # (https://github.com/huggingface/transformers/blob/v4.52.4/src/transformers/models/llama/configuration_llama.py#L62).
+                    print(
+                        "model_config.num_labels is not 1. Setting it to 1 since this value is used as the out_features "
+                        "for the linear head of Bradley-Terry reward models."
+                    )
+                    model_config.num_labels = 1
+            else:
+                raise ValueError(f"Unknown reward model type: {rm_type}")
+        else:
+            model_class = NeMoAutoModelForCausalLM
+
         full_state_dict = None
         if self.rank == 0:
             print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
-            model = NeMoAutoModelForCausalLM.from_pretrained(
+            model = model_class.from_pretrained(
                 model_name,
                 device_map="cpu",  # load weights onto CPU initially
                 trust_remote_code=True,
@@ -176,20 +220,20 @@ class DTensorPolicyWorkerV2:
         # The actual weights will be broadcast from rank 0.
 
         with init_empty_weights():
-            self.model = NeMoAutoModelForCausalLM.from_config(
+            self.model = model_class.from_config(
                 model_config,
                 attn_implementation="flash_attention_2"
                 if self.enable_seq_packing
                 else None,
+                trust_remote_code=True,
             )
 
-        # caching since this property is not always preserved after FSDP
-        self.num_tied_weights = len(find_tied_parameters(self.model))
-        self.skip_tie_check = os.environ.get(
-            "NRL_SKIP_TIED_WEIGHT_CHECK"
-        ) or ModelFlag.SKIP_DTENSOR_TIED_WEIGHTS_CHECK.matches(model_name)
+        if self.model.config.pad_token_id is None:
+            self.model.config.pad_token_id = tokenizer.pad_token_id
 
+        # caching since this property is not always preserved after FSDP
         self.tokenizer = tokenizer
+
         # ------------------------------------------------
         # 3) Move to GPU + Composable FSDP
         #    (Initialize device mesh, shard submodules, then shard entire model)
@@ -243,10 +287,6 @@ class DTensorPolicyWorkerV2:
         self.model = fsdp2_strategy_parallelize(
             self.model,
             device_mesh=self.device_mesh,
-            sequence_parallel=sequence_parallel_enabled,
-            activation_checkpointing=self.cfg["dtensor_cfg"][
-                "activation_checkpointing"
-            ],
             mp_policy=MixedPrecisionPolicy(
                 param_dtype=self.dtype,
                 reduce_dtype=torch.float32,
@@ -255,8 +295,13 @@ class DTensorPolicyWorkerV2:
             offload_policy=CPUOffloadPolicy(pin_memory=False)
             if self.cpu_offload
             else OffloadPolicy(),
+            sequence_parallel=sequence_parallel_enabled,
+            activation_checkpointing=self.cfg["dtensor_cfg"][
+                "activation_checkpointing"
+            ],
             tp_shard_plan=self.cfg["dtensor_cfg"]["custom_parallel_plan"],
-            dp_mesh_name="dp_cp",
+            dp_replicate_mesh_name="dp",
+            dp_shard_cp_mesh_name="cp",
             tp_mesh_name="tp",
         )
 
@@ -274,7 +319,7 @@ class DTensorPolicyWorkerV2:
 
         # Handle tied word embeddings after loading the state dict
         # We need to actually tie the parameters at the model level
-        is_tied_lm_head = getattr(
+        is_tied_lm_head = hasattr(self.model, "lm_head") and getattr(
             getattr(self.model, "config", {}), "tie_word_embeddings", False
         )
         if is_tied_lm_head:
@@ -390,6 +435,7 @@ class DTensorPolicyWorkerV2:
         """Return information about the GPU being used by this worker."""
         return get_gpu_info(self.model)
 
+    @wrap_with_nvtx_name("dtensor_policy_worker/train")
     def train(
         self,
         data: BatchedDataDict[Any],
@@ -399,15 +445,6 @@ class DTensorPolicyWorkerV2:
         mbs: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
-        # Check if the model has tied weights
-        if (
-            self.num_tied_weights != 0
-            and self.cfg["dtensor_cfg"]["tensor_parallel_size"] > 1
-            and not self.skip_tie_check
-        ):
-            raise ValueError(
-                f"Using dtensor policy with tp size {self.cfg['dtensor_cfg']['tensor_parallel_size']} for model ({self.cfg['model_name']}) that has tied weights (num_tied_weights={self.num_tied_weights}) is not supported (https://github.com/NVIDIA-NeMo/RL/issues/227). Please use dtensor policy with tensor parallel == 1 instead."
-            )
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:
@@ -569,7 +606,7 @@ class DTensorPolicyWorkerV2:
 
                     with get_train_context(False, False, context_parallel_ctx)():
                         with torch.autocast(device_type="cuda", dtype=self.dtype):
-                            outputs = self.model(
+                            model_args = dict(
                                 input_ids=input_ids,
                                 attention_mask=attention_mask,
                                 position_ids=position_ids,
@@ -577,11 +614,21 @@ class DTensorPolicyWorkerV2:
                                 flash_attn_kwargs=flash_attn_kwargs,
                             )
 
+                            if self._is_reward_model:
+                                # `flash_attn_kwarg` is not supported for `LlamaForSequenceClassification`.
+                                # Note that it should be empty anyway since sequence packing
+                                # is not supported for reward models.
+                                assert not flash_attn_kwargs
+                                del model_args["flash_attn_kwargs"]
+
+                            outputs = self.model(**model_args)
+
                         # Get logprobs
                         if not hasattr(outputs, "logits"):
                             logits = self.model.lm_head(outputs.last_hidden_state)
                         else:
                             logits = outputs.logits
+                        del outputs
 
                         # Apply temperature scaling
                         logits = self._apply_temperature_scaling(logits)
@@ -648,6 +695,7 @@ class DTensorPolicyWorkerV2:
                             global_valid_seqs,
                             global_valid_toks,
                         )
+                        del logits
 
                         # skip the update for dummy batches
                         if mb_idx < iterator_len:
@@ -723,11 +771,14 @@ class DTensorPolicyWorkerV2:
                 "global_loss": global_loss.cpu(),
                 "grad_norm": grad_norm,
                 "rank": torch.distributed.get_rank(),
+                "gpu_name": torch.cuda.get_device_name(),
+                "model_dtype": self.dtype,
                 "all_mb_metrics": dict(mb_metrics),
             }
 
             return metrics
 
+    @wrap_with_nvtx_name("dtensor_policy_worker/get_logprobs")
     def get_logprobs(
         self, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
     ) -> BatchedDataDict[LogprobOutputSpec]:
@@ -904,8 +955,9 @@ class DTensorPolicyWorkerV2:
                                 placements=[Shard(sequence_dim), Shard(-1)],
                             )
 
+                        logits = logits.to(torch.float32)
                         token_logprobs = get_logprobs_from_vocab_parallel_logits(
-                            logits.to(torch.float32),
+                            logits,
                             input_ids_dtensor,
                             seq_index_tensor,
                         )
@@ -913,8 +965,9 @@ class DTensorPolicyWorkerV2:
                         assert token_logprobs.shape[1] == seq_len - 1
                     else:
                         if isinstance(logits, DTensor):
+                            logits = logits.to(torch.float32)
                             token_logprobs = get_logprobs_from_vocab_parallel_logits(
-                                logits.to(torch.float32), input_ids
+                                logits, input_ids
                             )
                         else:
                             # Extract logprobs for each token in the sequence by gathering the logprob
@@ -924,15 +977,15 @@ class DTensorPolicyWorkerV2:
                             #   token_ids: [batch_size, sequence_length] - actual tokens
                             # Output shape: [batch_size, sequence_length] - logprob of each token given previous
                             # We get logprob of token[t+1] from logits[t], prepending 0 to maintain sequence length
-
-                            log_probs = torch.nn.functional.log_softmax(
-                                outputs.logits.to(torch.float32), dim=-1
-                            )
+                            logits = outputs.logits.to(torch.float32)
+                            log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
                             next_tokens = input_ids[:, 1:]
                             log_probs = log_probs[:, :-1]
                             token_logprobs = log_probs.gather(
                                 dim=-1, index=next_tokens.unsqueeze(-1)
                             ).squeeze(-1)
+
+                del outputs, logits
 
                 token_logprobs = torch.cat(
                     [torch.zeros_like(token_logprobs[:, :1]), token_logprobs], dim=1
@@ -1008,6 +1061,7 @@ class DTensorPolicyWorkerV2:
                     val = to_local_if_dtensor(v)
                     val.copy_(curr_state_dict[k])
 
+    @wrap_with_nvtx_name("dtensor_policy_worker/get_reference_policy_logprobs")
     def get_reference_policy_logprobs(
         self, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
     ) -> BatchedDataDict[ReferenceLogprobOutputSpec]:
@@ -1092,8 +1146,11 @@ class DTensorPolicyWorkerV2:
         """
         from nemo_rl.utils.nvml import get_free_memory_bytes
 
+        # Manually move model to cuda for cpu offload case
+        if self.cpu_offload:
+            self.model = self.move_to_cuda(self.model)
+
         # Get state_dict
-        self.model = self.move_to_cuda(self.model)
         self._held_sharded_state_dict_reference: dict[str, torch.Tensor] = (
             self.model.state_dict()
         )
@@ -1110,9 +1167,8 @@ class DTensorPolicyWorkerV2:
         return self.refit_param_info, total_available_bytes
 
     @torch.no_grad()
+    @wrap_with_nvtx_name("dtensor_policy_worker/get_weights_ipc_handles")
     def get_weights_ipc_handles(self, keys: Iterable[str]) -> dict[str, Any]:
-        from torch.multiprocessing.reductions import reduce_tensor
-
         assert self._held_sharded_state_dict_reference is not None, (
             "prepare_weights_for_ipc must be called before get_weights_ipc_handles"
         )
@@ -1142,7 +1198,7 @@ class DTensorPolicyWorkerV2:
         # Create handles for the tensors
         all_handles = []
         for key, p in converted_params.items():
-            handle = reduce_tensor(p.detach())
+            handle = get_handle_from_tensor(p)
             all_handles.append((key, handle))
 
         # (pack_tensor_for_ipc: bool, handles: list)
@@ -1153,6 +1209,15 @@ class DTensorPolicyWorkerV2:
     @torch.no_grad()
     def broadcast_weights_for_collective(self) -> None:
         """Broadcast the weights for collective communication."""
+        # Manually move model to cuda for cpu offload case
+        if self.cpu_offload:
+            print(
+                "[WARNING]: Unless you are lacking of memory, it is not recommended to enable cpu_offload when "
+                "using non-colocated generation since it will have an extra onload and offload at refit stage."
+            )
+            self.model = self.move_to_cuda(self.model)
+
+        # Broadcast the weights for collective communication
         for _, tensor in self.model.state_dict().items():
             if isinstance(tensor, DTensor):
                 tensor = tensor.full_tensor()
@@ -1160,6 +1225,12 @@ class DTensorPolicyWorkerV2:
                 tensor = tensor.to(self.dtype, non_blocking=True)
                 self.model_update_group.broadcast(tensor.data, src=0)
 
+        # Manually move model to cpu for cpu offload case
+        # cpu offload needs model on CPU before model forward
+        if self.cpu_offload:
+            self.model = self.move_to_cpu(self.model)
+
+    @wrap_with_nvtx_name("dtensor_policy_worker/prepare_for_lp_inference")
     def prepare_for_lp_inference(self) -> None:
         if not self.cpu_offload:
             self.move_to_cuda(self.model)
@@ -1169,6 +1240,7 @@ class DTensorPolicyWorkerV2:
         self.model.eval()
         self.offload_before_refit()
 
+    @wrap_with_nvtx_name("dtensor_policy_worker/prepare_for_training")
     def prepare_for_training(self, *args, **kwargs) -> None:
         # onload models and optimizer state to cuda
         if not self.cpu_offload:
@@ -1177,9 +1249,6 @@ class DTensorPolicyWorkerV2:
             # when cpu offload is enabled, the buffers do not get moved
             # to cuda automatically, so we need to do that manually
             self.model = self.move_buffer_to_device(self.model, "cuda")
-
-        # have to move buffers to cuda manually for cpu offload case
-        self.move_buffer_to_device(self.model, "cuda")
 
         self.model.train()
         # Move optimizer state to CUDA if it exists
@@ -1196,6 +1265,7 @@ class DTensorPolicyWorkerV2:
         torch.cuda.empty_cache()
 
     @torch.no_grad()
+    @wrap_with_nvtx_name("dtensor_policy_worker/offload_before_refit")
     def offload_before_refit(self) -> None:
         """Offload the optimizer to the CPU."""
         torch.randn(1).cuda()  # wake up torch allocator
@@ -1209,6 +1279,7 @@ class DTensorPolicyWorkerV2:
         torch.cuda.empty_cache()
 
     @torch.no_grad()
+    @wrap_with_nvtx_name("dtensor_policy_worker/offload_after_refit")
     def offload_after_refit(self) -> None:
         # Offload as much as possible on the CPU
         self.model = self.move_to_cpu(self.model)
