@@ -5,6 +5,16 @@ grpo:
   num_prompts_per_step: 64
   num_generations_per_prompt: 32
 
+loss_fn:
+  reference_policy_kl_penalty: 0.01
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.2
+  # (default off) loss formulation improvements (docs/guides/grpo.md#loss)
+  use_on_policy_kl_approximation: false
+  use_importance_sampling_correction: true
+  token_level_loss: true
+  ratio_clip_c: null
+
 policy:
   model_name: "Qwen/Qwen3-30B-A3B"
   tokenizer:
@@ -17,7 +27,6 @@ policy:
   precision: "bfloat16"
   fsdp_offload_enabled: false
   activation_checkpointing_enabled: false
-
   dtensor_cfg:
     enabled: false
 
@@ -71,6 +80,24 @@ policy:
       gpu_memory_utilization: 0.7
       enforce_eager: false
       max_model_len: ${policy.max_total_sequence_length}
+
+logger:
+  log_dir: "logs"  # Base directory for all logs
+  num_val_samples_to_print: 0 # Number of validation samples to pretty print on terminal
+  wandb_enabled: true
+  tensorboard_enabled: false
+  mlflow_enabled: false  # Disable MLflow logging
+  monitor_gpus: false  # If true, will monitor GPU usage and log to wandb and/or tensorboard
+  wandb:
+    project: "grpo-dev-megatron"
+    name: "ak_megatron_q3-30a3b-imp-sampl"
+  tensorboard: {}
+  mlflow:
+    experiment_name: "grpo-dev"
+    run_name: "ak_megatron_q3-30a3b"
+  gpu_monitoring:
+    collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
+    flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
 
 cluster:
   gpus_per_node: 8
