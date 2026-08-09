@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Two-GPU smoke test for Harbor/OpenCode -> Gym model server -> token capture -> GRPO.
+# Requires Docker and the BBH Harbor dataset at $HOME/store/data/edison/harbor-bbh/val.
+#
+# RAY_TMPDIR=/tmp RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 uv run python \
+#   examples/nemo_gym/run_grpo_nemo_gym.py \
+#   --config examples/nemo_gym/grpo_bbh_harbor_tokcap_smoke.yaml
+
+defaults: "grpo_rg_claude_code_tokcap_tools.yaml"
+
+data:
+  train:
+    data_path: "${oc.env:GYM_ROOT}/responses_api_agents/gym_harbor_agent/data/bbh.jsonl"
+  validation:
+    data_path: "${oc.env:GYM_ROOT}/responses_api_agents/gym_harbor_agent/data/bbh.jsonl"
+
+env:
+  nemo_gym:
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - responses_api_agents/gym_harbor_agent/configs/harbor_agent.yaml
+    token_id_capture:
+      enabled: true
+      dir: /tmp/ng_tokcap_harbor_smoke

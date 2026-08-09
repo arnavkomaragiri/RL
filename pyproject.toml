@@ -442,6 +442,28 @@ constraint-dependencies = [
 exclude-dependencies = ["nvidia-cutlass-dsl-libs-base"]
 
 conflicts = [
+  # Gym's standalone vLLM server and these NeMo-RL backends pin incompatible
+  # vLLM/FlashInfer stacks. They run in separate environments and cannot be synced together.
+  [
+    { package = "nemo-gym", extra = "vllm" },
+    { package = "nemo-rl", extra = "sglang" },
+  ],
+  [
+    { package = "nemo-gym", extra = "vllm" },
+    { package = "nemo-rl", extra = "automodel" },
+  ],
+  [
+    { package = "nemo-gym", extra = "vllm" },
+    { package = "nemo-rl", extra = "mcore" },
+  ],
+  [
+    { package = "nemo-gym", extra = "vllm" },
+    { package = "nemo-rl", extra = "trtllm" },
+  ],
+  [
+    { package = "nemo-gym", extra = "vllm" },
+    { package = "nemo-rl", extra = "vllm" },
+  ],
   [
     { extra = "fsdp" },
     { extra = "sglang" },
