@@ -1,0 +1,55 @@
+# One-step diagnostic for OpenCode token IDs/logprobs through Harbor/OpenSandbox.
+# Required environment: HARBOR_DATASET_PATH and OPENSANDBOX_API_KEY.
+# OPENSANDBOX_DOMAIN overrides the provider's default in-cluster service name.
+defaults: ./grpo-qwen3-30ba3b-thinking-swe1-16n8g-megatron-cp2-r3-async-gym.yaml
+
+grpo:
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 2
+  max_num_steps: 1
+  val_at_start: false
+  val_at_end: false
+  val_period: 1000
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/grpo-qwen3-30ba3b-thinking-harbor-bbh-async-smoke
+
+policy:
+  train_global_batch_size: 4
+  generation_batch_size: 4
+  generation:
+    colocated:
+      resources:
+        num_nodes: 2
+        gpus_per_node: 8
+
+data:
+  train:
+    data_path: "${oc.env:GYM_ROOT}/responses_api_agents/gym_harbor_agent/data/bbh_harbor_rl_v0_val.jsonl"
+  validation:
+    data_path: "${oc.env:GYM_ROOT}/responses_api_agents/gym_harbor_agent/data/bbh_harbor_rl_v0_val.jsonl"
+
+env:
+  should_log_nemo_gym_responses: true
+  nemo_gym:
+    # Four concurrent rollouts request 1 CPU and 2 GiB in aggregate.
+    num_samples_in_parallel: 4
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - nemo_gym/sandbox/providers/opensandbox/configs/opensandbox.yaml
+      - responses_api_agents/gym_harbor_agent/configs/harbor_agent.yaml
+      - responses_api_agents/gym_harbor_agent/configs/harbor_agent_opensandbox.yaml
+    token_id_capture:
+      enabled: true
+      dir: ${oc.env:RAY_TMPDIR,/tmp}/ng_tokcap_bbh_harbor_async_smoke
+    # Remove the SWE-specific agent registration inherited by the base recipe.
+    single_step_tool_use_with_argument_comparison_swe: null
+
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-thinking-harbor-bbh-async-smoke
+  wandb:
+    name: grpo-qwen3-30ba3b-thinking-harbor-bbh-async-smoke
+
+cluster:
+  num_nodes: 4
