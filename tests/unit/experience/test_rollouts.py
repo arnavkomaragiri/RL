@@ -1214,6 +1214,31 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
     assert rollout_results[-1].rollout_metrics["timing/rollout/total"] == 4.0
 
 
+def test_prepare_nemo_gym_rows_stamps_task_relative_rollout_indices():
+    rows = [
+        {
+            "responses_create_params": {},
+            "_ng_task_index": task_index,
+        }
+        for task_index in (10, 10, 11, 11)
+    ]
+    sampling_params = rollouts_mod.GenerationSamplingParams(
+        temperature=0.7,
+        top_p=0.9,
+        top_k=None,
+    )
+
+    rollouts_mod._prepare_nemo_gym_rows(
+        rows,
+        generation_config={"max_new_tokens": 32},
+        sampling_params=sampling_params,
+        num_generations=2,
+    )
+
+    assert [row["_rowidx"] for row in rows] == [0, 1, 2, 3]
+    assert [row["_ng_rollout_index"] for row in rows] == [0, 1, 0, 1]
+
+
 def test_nemo_gym_stream_accumulator_validates_rows_and_completion():
     rows = [
         {"agent_ref": {"name": "agent"}},
