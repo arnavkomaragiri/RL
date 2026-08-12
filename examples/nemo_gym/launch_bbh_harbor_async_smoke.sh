@@ -122,7 +122,7 @@ export HARBOR_BENCHMARK_NAME=${HARBOR_BENCHMARK_NAME}
 export RAY_TMPDIR=/tmp/ray-${RUN_ID}
 export NEMO_GYM_VENV_DIR=/tmp/nemo-gym-venvs-${RUN_ID}
 export NRL_MEGATRON_CHECKPOINT_DIR=${NRL_MEGATRON_CHECKPOINT_DIR}
-uv run python -u examples/run_grpo.py \\
+uv run python -u examples/nemo_gym/run_grpo_nemo_gym.py \\
     --config ${RECIPE} \\
     policy.model_name=${MODEL_PATH} \\
     cluster.num_nodes=${NUM_NODES} \\
