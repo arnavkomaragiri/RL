@@ -26,11 +26,14 @@ RUN_ID=${RUN_ID:-$(date -u +%Y%m%d-%H%M%S)}
 EXP_NAME=${EXP_NAME:-harbor-bbh-tokcap-${RUN_ID}}
 RUN_ROOT=${RUN_ROOT:-${REPO_LOCATION}/results/${EXP_NAME}}
 NRL_MEGATRON_CHECKPOINT_DIR=${NRL_MEGATRON_CHECKPOINT_DIR:-${RUN_ROOT}/megatron-checkpoints}
+NEMO_GYM_VENV_DIR=${NEMO_GYM_VENV_DIR:-${RUN_ROOT}/nemo-gym-venvs}
 RECIPE=${RECIPE:-examples/configs/recipes/llm/grpo-qwen3-30ba3b-thinking-4n8g-megatron-cp2-r3-async-gym-harbor-bbh-smoke.yaml}
 MODEL_PATH=${MODEL_PATH:-}
 
 HARBOR_DATASET_PATH=${HARBOR_DATASET_PATH:-}
 HARBOR_BENCHMARK_NAME=${HARBOR_BENCHMARK_NAME:-bbh-harbor-rl-v0}
+HARBOR_IMAGE_OVERRIDE=${HARBOR_IMAGE_OVERRIDE:-docker.io/akomaragiri89904/hypotest-kernel@sha256:bf07b75598a8c3fc069ba629bc116d1aad690ca91962530aff33e0c6de7fb949}
+HARBOR_SANDBOX_ENTRYPOINT=${HARBOR_SANDBOX_ENTRYPOINT:-'["sh","/opt/entrypoint.sh","tail","-f","/dev/null"]'}
 OPENSANDBOX_PROTOCOL=${OPENSANDBOX_PROTOCOL:-http}
 OPENSANDBOX_USE_SERVER_PROXY=${OPENSANDBOX_USE_SERVER_PROXY:-true}
 RUBRIC_MODEL=${RUBRIC_MODEL:-openai/nvidia/zai-org/glm-5.2}
@@ -60,6 +63,10 @@ if [[ -z "${OPENSANDBOX_DOMAIN:-}" ]]; then
 fi
 if [[ -z "${OPENSANDBOX_API_KEY:-}" ]]; then
     echo "Set OPENSANDBOX_API_KEY or OPENSANDBOX_API_KEY_FILE." >&2
+    exit 2
+fi
+if [[ -n "${OPENSANDBOX_CA_BUNDLE:-}" && ! -r "${OPENSANDBOX_CA_BUNDLE}" ]]; then
+    echo "OPENSANDBOX_CA_BUNDLE is not readable: ${OPENSANDBOX_CA_BUNDLE}" >&2
     exit 2
 fi
 if [[ -z "${CONTAINER}" ]]; then
@@ -126,8 +133,14 @@ if (( TRAINING_GPUS < 16 )); then
 fi
 
 export HARBOR_DATASET_PATH HARBOR_BENCHMARK_NAME
+export HARBOR_IMAGE_OVERRIDE HARBOR_SANDBOX_ENTRYPOINT
 export OPENSANDBOX_DOMAIN OPENSANDBOX_API_KEY
 export OPENSANDBOX_PROTOCOL OPENSANDBOX_USE_SERVER_PROXY
+if [[ -n "${OPENSANDBOX_CA_BUNDLE:-}" ]]; then
+    export OPENSANDBOX_CA_BUNDLE
+else
+    unset OPENSANDBOX_CA_BUNDLE
+fi
 export RUBRIC_MODEL RUBRIC_MODEL_API_BASE RUBRIC_MODEL_API_KEY
 
 SHARED_MOUNT=$(findmnt -n -o TARGET --target "${REPO_LOCATION}")
@@ -136,6 +149,7 @@ mkdir -p \
     "${RUN_ROOT}/slurm" \
     "${RUN_ROOT}/logs" \
     "${RUN_ROOT}/checkpoints" \
+    "${NEMO_GYM_VENV_DIR}" \
     "${NRL_MEGATRON_CHECKPOINT_DIR}"
 
 read -r -d '' COMMAND <<EOF || true
@@ -145,7 +159,7 @@ export GYM_ROOT=${REPO_LOCATION}/3rdparty/Gym-workspace/Gym
 export HARBOR_DATASET_PATH=${HARBOR_DATASET_PATH}
 export HARBOR_BENCHMARK_NAME=${HARBOR_BENCHMARK_NAME}
 export RAY_TMPDIR=/tmp/ray-${RUN_ID}
-export NEMO_GYM_VENV_DIR=/tmp/nemo-gym-venvs-${RUN_ID}
+export NEMO_GYM_VENV_DIR=${NEMO_GYM_VENV_DIR}
 export NRL_MEGATRON_CHECKPOINT_DIR=${NRL_MEGATRON_CHECKPOINT_DIR}
 uv run python -u examples/nemo_gym/run_grpo_nemo_gym.py \\
     --config ${RECIPE} \\
@@ -174,12 +188,15 @@ echo "Partition/account:     ${SLURM_PARTITION} / ${SLURM_ACCOUNT}"
 echo "OpenSandbox endpoint:  ${OPENSANDBOX_PROTOCOL}://${OPENSANDBOX_DOMAIN}"
 echo "OpenSandbox proxy:     ${OPENSANDBOX_USE_SERVER_PROXY}"
 echo "OpenSandbox API key:   set (value suppressed)"
+echo "OpenSandbox CA bundle: ${OPENSANDBOX_CA_BUNDLE:-system trust store}"
 echo "Rubric model:          ${RUBRIC_MODEL}"
 echo "Rubric API base:       ${RUBRIC_MODEL_API_BASE}"
 echo "Rubric API key:        set (value suppressed)"
 echo "Dataset:               ${HARBOR_DATASET_PATH}"
+echo "Sandbox image:         ${HARBOR_IMAGE_OVERRIDE}"
 echo "Run root:              ${RUN_ROOT}"
 echo "Megatron cache:        ${NRL_MEGATRON_CHECKPOINT_DIR}"
+echo "Gym venvs:             ${NEMO_GYM_VENV_DIR}"
 
 SBATCH_ARGS=(
     --parsable
