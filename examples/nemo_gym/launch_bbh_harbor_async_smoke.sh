@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 
 # Submit the one-step BBH Harbor/OpenSandbox async GRPO diagnostic on Slurm.
-# OpenSandbox secrets are inherited by sbatch and are never embedded in COMMAND.
-# OPENSANDBOX_API_KEY_FILE must contain only the raw key value, for example:
+# OpenSandbox and rubric secrets are inherited by sbatch and never embedded in COMMAND.
+# *_API_KEY_FILE must contain only the raw key value, for example:
 #   osb_example_key_value
-# Do not include OPENSANDBOX_API_KEY=, quotes, or other dotenv syntax.
+# Do not include a variable name, quotes, or other dotenv syntax.
 
 set -euo pipefail
 
@@ -33,6 +33,10 @@ HARBOR_DATASET_PATH=${HARBOR_DATASET_PATH:-}
 HARBOR_BENCHMARK_NAME=${HARBOR_BENCHMARK_NAME:-bbh-harbor-rl-v0}
 OPENSANDBOX_PROTOCOL=${OPENSANDBOX_PROTOCOL:-http}
 OPENSANDBOX_USE_SERVER_PROXY=${OPENSANDBOX_USE_SERVER_PROXY:-true}
+RUBRIC_MODEL=${RUBRIC_MODEL:-openai/nvidia/zai-org/glm-5.2}
+RUBRIC_MODEL_API_BASE=${RUBRIC_MODEL_API_BASE:-https://inference-api.nvidia.com/v1}
+RUBRIC_MODEL_API_KEY=${RUBRIC_MODEL_API_KEY:-${NVINF_API_KEY:-}}
+RUBRIC_MODEL_API_KEY_FILE=${RUBRIC_MODEL_API_KEY_FILE:-${NVINF_API_KEY_FILE:-}}
 
 if [[ -z "${OPENSANDBOX_API_KEY:-}" && -n "${OPENSANDBOX_API_KEY_FILE:-}" ]]; then
     if [[ ! -r "${OPENSANDBOX_API_KEY_FILE}" ]]; then
@@ -40,6 +44,14 @@ if [[ -z "${OPENSANDBOX_API_KEY:-}" && -n "${OPENSANDBOX_API_KEY_FILE:-}" ]]; th
         exit 2
     fi
     OPENSANDBOX_API_KEY=$(<"${OPENSANDBOX_API_KEY_FILE}")
+fi
+
+if [[ -z "${RUBRIC_MODEL_API_KEY}" && -n "${RUBRIC_MODEL_API_KEY_FILE}" ]]; then
+    if [[ ! -r "${RUBRIC_MODEL_API_KEY_FILE}" ]]; then
+        echo "RUBRIC_MODEL_API_KEY_FILE is not readable: ${RUBRIC_MODEL_API_KEY_FILE}" >&2
+        exit 2
+    fi
+    RUBRIC_MODEL_API_KEY=$(<"${RUBRIC_MODEL_API_KEY_FILE}")
 fi
 
 if [[ -z "${OPENSANDBOX_DOMAIN:-}" ]]; then
@@ -64,6 +76,18 @@ if [[ -z "${MODEL_PATH}" ]]; then
 fi
 if [[ -z "${HARBOR_DATASET_PATH}" ]]; then
     echo "HARBOR_DATASET_PATH is required." >&2
+    exit 2
+fi
+if [[ -z "${RUBRIC_MODEL}" ]]; then
+    echo "RUBRIC_MODEL is required by the BBH Harbor task environment." >&2
+    exit 2
+fi
+if [[ -z "${RUBRIC_MODEL_API_BASE}" ]]; then
+    echo "RUBRIC_MODEL_API_BASE is required by the BBH Harbor task environment." >&2
+    exit 2
+fi
+if [[ -z "${RUBRIC_MODEL_API_KEY}" ]]; then
+    echo "Set RUBRIC_MODEL_API_KEY, RUBRIC_MODEL_API_KEY_FILE, NVINF_API_KEY, or NVINF_API_KEY_FILE." >&2
     exit 2
 fi
 if [[ ! -r "${CONTAINER}" ]]; then
@@ -104,6 +128,7 @@ fi
 export HARBOR_DATASET_PATH HARBOR_BENCHMARK_NAME
 export OPENSANDBOX_DOMAIN OPENSANDBOX_API_KEY
 export OPENSANDBOX_PROTOCOL OPENSANDBOX_USE_SERVER_PROXY
+export RUBRIC_MODEL RUBRIC_MODEL_API_BASE RUBRIC_MODEL_API_KEY
 
 SHARED_MOUNT=$(findmnt -n -o TARGET --target "${REPO_LOCATION}")
 MOUNTS=${MOUNTS:-${SHARED_MOUNT}:${SHARED_MOUNT}}
@@ -149,6 +174,9 @@ echo "Partition/account:     ${SLURM_PARTITION} / ${SLURM_ACCOUNT}"
 echo "OpenSandbox endpoint:  ${OPENSANDBOX_PROTOCOL}://${OPENSANDBOX_DOMAIN}"
 echo "OpenSandbox proxy:     ${OPENSANDBOX_USE_SERVER_PROXY}"
 echo "OpenSandbox API key:   set (value suppressed)"
+echo "Rubric model:          ${RUBRIC_MODEL}"
+echo "Rubric API base:       ${RUBRIC_MODEL_API_BASE}"
+echo "Rubric API key:        set (value suppressed)"
 echo "Dataset:               ${HARBOR_DATASET_PATH}"
 echo "Run root:              ${RUN_ROOT}"
 echo "Megatron cache:        ${NRL_MEGATRON_CHECKPOINT_DIR}"
