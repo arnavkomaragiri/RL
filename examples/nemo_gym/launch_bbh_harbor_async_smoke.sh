@@ -115,6 +115,7 @@ export GYM_ROOT=${REPO_LOCATION}/3rdparty/Gym-workspace/Gym
 export HARBOR_DATASET_PATH=${HARBOR_DATASET_PATH}
 export HARBOR_BENCHMARK_NAME=${HARBOR_BENCHMARK_NAME}
 export RAY_TMPDIR=/tmp/ray-${RUN_ID}
+export NEMO_GYM_VENV_DIR=/tmp/nemo-gym-venvs-${RUN_ID}
 uv run python -u examples/run_grpo.py \\
     --config ${RECIPE} \\
     policy.model_name=${MODEL_PATH} \\
@@ -128,8 +129,7 @@ uv run python -u examples/run_grpo.py \\
     logger.log_dir=${RUN_ROOT}/logs \\
     logger.wandb.name=${EXP_NAME} \\
     checkpointing.checkpoint_dir=${RUN_ROOT}/checkpoints \\
-    env.nemo_gym.skip_venv_if_present=false \\
-    env.nemo_gym.uv_venv_dir=/tmp/nemo-gym-venvs-${RUN_ID}
+    env.nemo_gym.skip_venv_if_present=false
 EOF
 
 echo "Run name:             ${EXP_NAME}"
