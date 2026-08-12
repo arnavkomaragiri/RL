@@ -25,6 +25,7 @@ TRAIN_GLOBAL_BATCH_SIZE=$((NUM_PROMPTS_PER_STEP * NUM_GENERATIONS_PER_PROMPT))
 RUN_ID=${RUN_ID:-$(date -u +%Y%m%d-%H%M%S)}
 EXP_NAME=${EXP_NAME:-harbor-bbh-tokcap-${RUN_ID}}
 RUN_ROOT=${RUN_ROOT:-${REPO_LOCATION}/results/${EXP_NAME}}
+NRL_MEGATRON_CHECKPOINT_DIR=${NRL_MEGATRON_CHECKPOINT_DIR:-${RUN_ROOT}/megatron-checkpoints}
 RECIPE=${RECIPE:-examples/configs/recipes/llm/grpo-qwen3-30ba3b-thinking-4n8g-megatron-cp2-r3-async-gym-harbor-bbh-smoke.yaml}
 MODEL_PATH=${MODEL_PATH:-}
 
@@ -106,7 +107,11 @@ export OPENSANDBOX_PROTOCOL OPENSANDBOX_USE_SERVER_PROXY
 
 SHARED_MOUNT=$(findmnt -n -o TARGET --target "${REPO_LOCATION}")
 MOUNTS=${MOUNTS:-${SHARED_MOUNT}:${SHARED_MOUNT}}
-mkdir -p "${RUN_ROOT}/slurm" "${RUN_ROOT}/logs" "${RUN_ROOT}/checkpoints"
+mkdir -p \
+    "${RUN_ROOT}/slurm" \
+    "${RUN_ROOT}/logs" \
+    "${RUN_ROOT}/checkpoints" \
+    "${NRL_MEGATRON_CHECKPOINT_DIR}"
 
 read -r -d '' COMMAND <<EOF || true
 set -euo pipefail
@@ -116,6 +121,7 @@ export HARBOR_DATASET_PATH=${HARBOR_DATASET_PATH}
 export HARBOR_BENCHMARK_NAME=${HARBOR_BENCHMARK_NAME}
 export RAY_TMPDIR=/tmp/ray-${RUN_ID}
 export NEMO_GYM_VENV_DIR=/tmp/nemo-gym-venvs-${RUN_ID}
+export NRL_MEGATRON_CHECKPOINT_DIR=${NRL_MEGATRON_CHECKPOINT_DIR}
 uv run python -u examples/run_grpo.py \\
     --config ${RECIPE} \\
     policy.model_name=${MODEL_PATH} \\
@@ -145,6 +151,7 @@ echo "OpenSandbox proxy:     ${OPENSANDBOX_USE_SERVER_PROXY}"
 echo "OpenSandbox API key:   set (value suppressed)"
 echo "Dataset:               ${HARBOR_DATASET_PATH}"
 echo "Run root:              ${RUN_ROOT}"
+echo "Megatron cache:        ${NRL_MEGATRON_CHECKPOINT_DIR}"
 
 SBATCH_ARGS=(
     --parsable
