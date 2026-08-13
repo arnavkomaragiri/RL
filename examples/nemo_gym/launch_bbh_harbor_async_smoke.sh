@@ -10,6 +10,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_LOCATION=${REPO_LOCATION:-$(cd "${SCRIPT_DIR}/../.." && pwd)}
+CONTAINER_REPO_LOCATION=${CONTAINER_REPO_LOCATION:-/opt/nemo-rl}
 
 CONTAINER=${CONTAINER:-}
 SLURM_ACCOUNT=${SLURM_ACCOUNT:-}
@@ -144,7 +145,7 @@ fi
 export RUBRIC_MODEL RUBRIC_MODEL_API_BASE RUBRIC_MODEL_API_KEY
 
 SHARED_MOUNT=$(findmnt -n -o TARGET --target "${REPO_LOCATION}")
-MOUNTS=${MOUNTS:-${SHARED_MOUNT}:${SHARED_MOUNT}}
+MOUNTS=${MOUNTS:-${SHARED_MOUNT}:${SHARED_MOUNT},${REPO_LOCATION}:${CONTAINER_REPO_LOCATION}}
 mkdir -p \
     "${RUN_ROOT}/slurm" \
     "${RUN_ROOT}/logs" \
@@ -154,8 +155,8 @@ mkdir -p \
 
 read -r -d '' COMMAND <<EOF || true
 set -euo pipefail
-cd ${REPO_LOCATION}
-export GYM_ROOT=${REPO_LOCATION}/3rdparty/Gym-workspace/Gym
+cd ${CONTAINER_REPO_LOCATION}
+export GYM_ROOT=${CONTAINER_REPO_LOCATION}/3rdparty/Gym-workspace/Gym
 export HARBOR_DATASET_PATH=${HARBOR_DATASET_PATH}
 export HARBOR_BENCHMARK_NAME=${HARBOR_BENCHMARK_NAME}
 export RAY_TMPDIR=/tmp/ray-${RUN_ID}
@@ -179,6 +180,7 @@ EOF
 
 echo "Run name:             ${EXP_NAME}"
 echo "Container:            ${CONTAINER}"
+echo "Container source:     ${REPO_LOCATION} -> ${CONTAINER_REPO_LOCATION}"
 echo "Recipe:               ${RECIPE}"
 echo "Model:                ${MODEL_PATH}"
 echo "Nodes/GPUs:            ${NUM_NODES} x ${GPUS_PER_NODE}"
