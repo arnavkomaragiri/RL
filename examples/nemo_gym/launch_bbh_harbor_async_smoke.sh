@@ -26,6 +26,7 @@ TRAIN_GLOBAL_BATCH_SIZE=$((NUM_PROMPTS_PER_STEP * NUM_GENERATIONS_PER_PROMPT))
 RUN_ID=${RUN_ID:-$(date -u +%Y%m%d-%H%M%S)}
 EXP_NAME=${EXP_NAME:-harbor-bbh-tokcap-${RUN_ID}}
 RUN_ROOT=${RUN_ROOT:-${REPO_LOCATION}/results/${EXP_NAME}}
+HARBOR_JOBS_DIR=${HARBOR_JOBS_DIR:-${RUN_ROOT}/harbor-jobs}
 NRL_MEGATRON_CHECKPOINT_DIR=${NRL_MEGATRON_CHECKPOINT_DIR:-${RUN_ROOT}/megatron-checkpoints}
 NEMO_GYM_VENV_DIR=${NEMO_GYM_VENV_DIR:-${RUN_ROOT}/nemo-gym-venvs}
 RECIPE=${RECIPE:-examples/configs/recipes/llm/grpo-qwen3-30ba3b-thinking-4n8g-megatron-cp2-r3-async-gym-harbor-bbh-smoke.yaml}
@@ -142,7 +143,7 @@ if (( TRAINING_GPUS < 16 )); then
     exit 2
 fi
 
-export HARBOR_DATASET_PATH HARBOR_BENCHMARK_NAME
+export HARBOR_DATASET_PATH HARBOR_BENCHMARK_NAME HARBOR_JOBS_DIR
 export HARBOR_IMAGE_OVERRIDE HARBOR_SANDBOX_ENTRYPOINT
 export HARBOR_SANDBOX_PROBE_COMMAND HARBOR_SANDBOX_PROBE_EXPECTED_STDOUT
 export HARBOR_SANDBOX_PROBE_TIMEOUT_S HARBOR_SANDBOX_PROBE_DEADLINE_S
@@ -162,6 +163,7 @@ mkdir -p \
     "${RUN_ROOT}/slurm" \
     "${RUN_ROOT}/logs" \
     "${RUN_ROOT}/checkpoints" \
+    "${HARBOR_JOBS_DIR}" \
     "${NEMO_GYM_VENV_DIR}" \
     "${NRL_MEGATRON_CHECKPOINT_DIR}"
 
@@ -171,6 +173,7 @@ cd ${CONTAINER_REPO_LOCATION}
 export GYM_ROOT=${CONTAINER_REPO_LOCATION}/3rdparty/Gym-workspace/Gym
 export HARBOR_DATASET_PATH=${HARBOR_DATASET_PATH}
 export HARBOR_BENCHMARK_NAME=${HARBOR_BENCHMARK_NAME}
+export HARBOR_JOBS_DIR=${HARBOR_JOBS_DIR}
 export RAY_TMPDIR=/tmp/ray-${RUN_ID}
 export NEMO_GYM_VENV_DIR=${NEMO_GYM_VENV_DIR}
 export NRL_MEGATRON_CHECKPOINT_DIR=${NRL_MEGATRON_CHECKPOINT_DIR}
@@ -210,6 +213,7 @@ echo "Dataset:               ${HARBOR_DATASET_PATH}"
 echo "Sandbox image:         ${HARBOR_IMAGE_OVERRIDE}"
 echo "Sandbox prewarm:       ${HARBOR_SANDBOX_PROBE_COMMAND}"
 echo "Run root:              ${RUN_ROOT}"
+echo "Harbor jobs:           ${HARBOR_JOBS_DIR}"
 echo "Megatron cache:        ${NRL_MEGATRON_CHECKPOINT_DIR}"
 echo "Gym venvs:             ${NEMO_GYM_VENV_DIR}"
 
