@@ -68,10 +68,12 @@ DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
 
 def _has_nan_generation_logprobs(result: dict) -> bool:
     """Return whether a postprocessed rollout contains NaN policy logprobs."""
+    message_logs = result.get("training_message_logs") or [result["message_log"]]
     return any(
         message.get("generation_logprobs") is not None
         and torch.isnan(message["generation_logprobs"]).any()
-        for message in result["message_log"]
+        for message_log in message_logs
+        for message in message_log
     )
 
 
@@ -150,25 +152,30 @@ def _detect_invalid_tool_call_and_malformed_thinking(
     )
     thinking_tags = thinking_tags or DEFAULT_THINKING_TAGS
 
+    content = output_item_dict.get("content") or []
     is_output_message = (
-        "content" in output_item_dict
-        and len(output_item_dict["content"]) > 0
-        and "text" in output_item_dict["content"][0]
+        isinstance(content, list)
+        and bool(content)
+        and isinstance(content[0], dict)
+        and "text" in content[0]
     )
     # NeMo-Gym only attaches generation_token_ids to the last output item of a
     # model call (see vllm_model/app.py postprocess_chat_response). So this item
     # is guaranteed to be the final thing the model produced for this turn.
     # If it's a reasoning item, the model output only reasoning (no content/tool calls).
+    summary = output_item_dict.get("summary") or []
     is_reasoning_message = (
         output_item_dict.get("type") == "reasoning"
-        and len(output_item_dict.get("summary", [])) > 0
-        and "text" in output_item_dict["summary"][0]
+        and isinstance(summary, list)
+        and bool(summary)
+        and isinstance(summary[0], dict)
+        and "text" in summary[0]
     )
 
     is_invalid_tool_call = False
     has_malformed_thinking = False
     if is_output_message:
-        assistant_message_content = output_item_dict["content"][0]["text"]
+        assistant_message_content = content[0]["text"]
         if any(
             pattern in assistant_message_content
             for pattern in invalid_tool_call_patterns
@@ -177,7 +184,7 @@ def _detect_invalid_tool_call_and_malformed_thinking(
         if any(tag in assistant_message_content for tag in thinking_tags):
             has_malformed_thinking = True
     elif is_reasoning_message:
-        assistant_message_content = output_item_dict["summary"][0]["text"]
+        assistant_message_content = summary[0]["text"]
         if any(
             pattern in assistant_message_content
             for pattern in invalid_tool_call_patterns
@@ -394,6 +401,8 @@ def _token_capture_metrics(
         # Calls the model returned with no generated tokens. Non-zero usually means the output
         # budget or a content filter is truncating generations before the first token.
         "token_capture/empty_generation_calls": total("empty_generation_calls"),
+        "token_capture/retokenized_boundaries": total("retokenized_boundaries"),
+        "token_capture/retokenized_tokens_masked": total("retokenized_tokens_masked"),
         # How often a recorded parent link could not be used, so the builder inferred the parent
         # from token prefixes instead. Inference is correct but cannot disambiguate a retry.
         "token_capture/parent_link_fallbacks": float(
@@ -563,12 +572,16 @@ Depending on your data shape, you may want to change these values."""
         # server uncorrelated (no /ng-rollout prefix) and nothing is captured.
         from nemo_gym.global_config import ROLLOUT_ID_KEY_NAME
         from nemo_gym.token_id_capture import (
+            TokenIdCaptureConfig,
             TokenCaptureStore,
             token_id_capture_dirs_from_config,
         )
         from nemo_gym.token_id_capture.delivery import finalize_rollout_token_capture
 
         global_config_dict = self.cfg.get("initial_global_config_dict") or {}
+        token_capture_config = TokenIdCaptureConfig.model_validate(
+            global_config_dict
+        ).token_id_capture
         token_capture_dirs = token_id_capture_dirs_from_config(global_config_dict)
         # Where records are read from and retired. The colocated file store for now; a framework
         # staging records through its own data plane passes its own TokenSource here instead, and
@@ -644,7 +657,9 @@ Depending on your data shape, you may want to change these values."""
                 # reason; this is that copy for the low-level path.
                 nemo_gym_result[ROLLOUT_ID_KEY_NAME] = nemo_gym_row[ROLLOUT_ID_KEY_NAME]
                 built = await finalize_rollout_token_capture(
-                    nemo_gym_result, token_source
+                    nemo_gym_result,
+                    token_source,
+                    retire=not token_capture_config.retain_consumed,
                 )
                 if built is not None:
                     capture_metrics.append(built.get("metrics") or {})
@@ -707,6 +722,24 @@ Depending on your data shape, you may want to change these values."""
         assert isinstance(nemo_gym_result, dict), (
             f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
         )
+
+        # Token capture preserves every model invocation as an exact, independent
+        # Responses payload. Convert those calls separately; concatenating their
+        # message logs happens later, together with explicit attention boundaries.
+        training_message_logs = []
+        for training_response in nemo_gym_result.get(
+            "_ng_training_responses", []
+        ):
+            call_result = self._postprocess_nemo_gym_to_nemo_rl_result(
+                {
+                    "response": training_response,
+                    "responses_create_params": nemo_gym_result.get(
+                        "responses_create_params", {"input": []}
+                    ),
+                },
+                tokenizer,
+            )
+            training_message_logs.append(call_result["message_log"])
 
         processor = getattr(self, "_processor", None)
         per_turn_images = (
@@ -889,8 +922,12 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                 f"  → If (2): inspect why no assistant content was produced for this rollout."
             )
 
+        if not training_message_logs:
+            training_message_logs = [nemo_rl_message_log]
+
         return {
             "message_log": nemo_rl_message_log,
+            "training_message_logs": training_message_logs,
             "input_message_log": nemo_rl_message_log[:1],
             "full_result": nemo_gym_result,
         }

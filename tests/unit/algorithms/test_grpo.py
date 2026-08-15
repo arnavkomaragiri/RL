@@ -43,7 +43,9 @@ from nemo_rl.algorithms.grpo import (
     _resolve_logprob_skip_flags,
     _resolve_message_level_advantage_penalties,
     _should_use_async_rollouts,
+    _use_exact_nemo_gym_call_sequences,
     _validate_use_kl_in_reward_compat,
+    add_grpo_token_loss_masks_and_generation_logprobs,
     aggregate_rollout_metrics,
     async_grpo_train,
     compute_and_apply_seq_logprob_error_masking,
@@ -61,6 +63,11 @@ from nemo_rl.algorithms.reward_functions import (
 )
 from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
+from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
+from nemo_rl.data.packed_rollouts import (
+    PACKED_ATTENTION_SEGMENT_LENGTHS,
+    expand_batched_data_for_packed_attention,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
@@ -81,6 +88,115 @@ def _mock_policy_generation() -> MagicMock:
     policy_generation.requires_kv_scale_sync = False
     policy_generation.get_logger_metrics.return_value = {}
     return policy_generation
+
+
+def test_use_exact_nemo_gym_call_sequences_preserves_rollout_rows() -> None:
+    calls = [
+        [
+            [
+                {"role": "user", "token_ids": torch.tensor([10, 11])},
+                {"role": "assistant", "token_ids": torch.tensor([12])},
+            ],
+            [
+                {"role": "user", "token_ids": torch.tensor([20])},
+                {"role": "assistant", "token_ids": torch.tensor([21, 22])},
+            ],
+        ],
+        [
+            [
+                {"role": "user", "token_ids": torch.tensor([30])},
+                {"role": "assistant", "token_ids": torch.tensor([31])},
+            ]
+        ],
+    ]
+    batch = BatchedDataDict(
+        {
+            "message_log": [[{"role": "user", "token_ids": [0]}]] * 2,
+            "training_message_logs": calls,
+            "rewards": torch.tensor([1.0, 0.0]),
+        }
+    )
+
+    _use_exact_nemo_gym_call_sequences(batch)
+
+    assert batch[PACKED_ATTENTION_SEGMENT_LENGTHS] == [[3, 3], [2]]
+    assert [
+        [message["token_ids"].tolist() for message in message_log]
+        for message_log in batch["message_log"]
+    ] == [[[10, 11], [12], [20], [21, 22]], [[30], [31]]]
+    assert torch.equal(batch["rewards"], torch.tensor([1.0, 0.0]))
+
+
+def test_exact_calls_train_each_generated_token_once() -> None:
+    batch = BatchedDataDict(
+        {
+            "message_log": [[{"role": "user", "token_ids": torch.tensor([0])}]],
+            "training_message_logs": [
+                [
+                    [
+                        {"role": "user", "token_ids": torch.tensor([10])},
+                        {
+                            "role": "assistant",
+                            "token_ids": torch.tensor([11, 12]),
+                            "generation_logprobs": torch.tensor([-1.1, -1.2]),
+                        },
+                    ],
+                    [
+                        {
+                            "role": "user",
+                            # The second call replays turn 1 plus new context.
+                            "token_ids": torch.tensor([10, 11, 12, 20]),
+                        },
+                        {
+                            "role": "assistant",
+                            "token_ids": torch.tensor([21, 22]),
+                            "generation_logprobs": torch.tensor([-2.1, -2.2]),
+                        },
+                    ],
+                ]
+            ],
+        }
+    )
+
+    _use_exact_nemo_gym_call_sequences(batch)
+    add_grpo_token_loss_masks_and_generation_logprobs(batch["message_log"])
+    flat, input_lengths = batched_message_log_to_flat_message(
+        batch["message_log"], pad_value_dict={"token_ids": 0}
+    )
+    train_data = BatchedDataDict(
+        {
+            "input_ids": flat["token_ids"],
+            "input_lengths": input_lengths,
+            "token_mask": flat["token_loss_mask"],
+            PACKED_ATTENTION_SEGMENT_LENGTHS: batch[
+                PACKED_ATTENTION_SEGMENT_LENGTHS
+            ],
+        }
+    )
+
+    expanded, _ = expand_batched_data_for_packed_attention(train_data)
+
+    assert torch.equal(
+        expanded["input_ids"],
+        torch.tensor(
+            [
+                [10, 11, 12, 0, 0, 0],
+                [10, 11, 12, 20, 21, 22],
+            ]
+        ),
+    )
+    assert torch.equal(
+        expanded["token_mask"],
+        torch.tensor(
+            [
+                [0, 1, 1, 0, 0, 0],
+                [0, 0, 0, 0, 1, 1],
+            ]
+        ),
+    )
+    # ClippedPGLossFn consumes token_mask[:, 1:]. Replayed T1 tokens in the
+    # second prompt are context-only, so the four sampled tokens are counted once.
+    assert expanded["token_mask"][:, 1:].sum().item() == 4
 
 
 @patch("nemo_rl.algorithms.grpo.ray")

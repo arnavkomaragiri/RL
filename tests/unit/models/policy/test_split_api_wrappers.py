@@ -31,9 +31,16 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import torch
+
+from nemo_rl.data.packed_rollouts import (
+    PACKED_ATTENTION_SEGMENT_LENGTHS,
+    PACKED_ATTENTION_SELECTED_SEGMENTS,
+)
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, ROUTED_EXPERTS_FIELD
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.policy.tq_policy import TQPolicy
 
 
@@ -97,6 +104,36 @@ class TestPreshardedWrappers:
         assert [c[0] for c in w.calls] == ["fetch", "attach", "train_microbatch"]
         assert w.calls[-1][1] == {"data_from": meta}
 
+    def test_train_microbatch_expands_only_calls_selected_for_this_dp(self):
+        w = _SplitStubWorker()
+        data = BatchedDataDict(
+            {
+                "input_ids": torch.tensor([[10, 11, 12, 20, 21], [30, 31, 32, 33, 0]]),
+                "input_lengths": torch.tensor([5, 4]),
+                "sample_mask": torch.tensor([1.0, 0.5]),
+            }
+        )
+        w._fetch = MagicMock(return_value=data)
+        meta = KVBatchMeta(
+            partition_id="train",
+            task_name="train",
+            sample_ids=["s0", "s1"],
+            sequence_lengths=[5, 4],
+            extra_info={
+                PACKED_ATTENTION_SEGMENT_LENGTHS: [[3, 2], [4]],
+                PACKED_ATTENTION_SELECTED_SEGMENTS: [(1, 0), (0, 1)],
+            },
+        )
+
+        w.train_microbatch_presharded(meta=meta)
+
+        trained = w.calls[-1][1]
+        assert torch.equal(trained["input_lengths"], torch.tensor([4, 2]))
+        assert torch.equal(
+            trained["input_ids"],
+            torch.tensor([[30, 31, 32, 33], [20, 21, 0, 0]]),
+        )
+
     def test_finish_tags_replica_leader(self):
         leader = _SplitStubWorker(is_leader=True)
         twin = _SplitStubWorker(is_leader=False)
@@ -115,7 +152,11 @@ class TestPreshardedWrappers:
 def _make_tq_policy() -> tuple[TQPolicy, MagicMock]:
     """Bare TQPolicy with the attributes the split fan-out touches."""
     p = object.__new__(TQPolicy)
-    p.cfg = {"train_global_batch_size": 8, "train_micro_batch_size": 2}
+    p.cfg = {
+        "train_global_batch_size": 8,
+        "train_micro_batch_size": 2,
+        "megatron_cfg": {"enabled": True},
+    }
     p._router_replay_enabled = False
     p.flops_tracker = None
     wg = MagicMock()
@@ -215,3 +256,88 @@ class TestTQPolicySplitFanout:
             "abort_train_step_presharded"
         )
         mock_ray.get.assert_called_once_with(["f0", "f1"])
+
+
+class TestTQPolicyExactCallPacking:
+    @staticmethod
+    def _packed_meta() -> KVBatchMeta:
+        return KVBatchMeta(
+            partition_id="train",
+            task_name="train",
+            sample_ids=["s0", "s1"],
+            fields=list(DP_TRAIN_FIELDS),
+            sequence_lengths=[5, 4],
+            extra_info={PACKED_ATTENTION_SEGMENT_LENGTHS: [[3, 2], [4]]},
+        )
+
+    def test_logprob_dispatch_reorders_calls_and_writes_logical_rows(self):
+        p, wg = _make_tq_policy()
+        meta = self._packed_meta()
+        p.write_to_dataplane = MagicMock()
+        # DP-concatenated call order is [call 2, call 0, call 1].
+        wg.get_all_worker_results.return_value = [
+            BatchedDataDict({"logprobs": torch.tensor([[30.0, 31.0, 32.0, 33.0]])}),
+            BatchedDataDict(
+                {
+                    "logprobs": torch.tensor(
+                        [
+                            [10.0, 11.0, 12.0],
+                            [20.0, 21.0, 0.0],
+                        ]
+                    )
+                }
+            ),
+        ]
+        with (
+            patch.object(TQPolicy, "_stamp_pad_seqlen"),
+            patch.object(TQPolicy, "_packing_args", return_value=(None, None)),
+            patch(
+                "nemo_rl.models.policy.tq_policy.shard_meta_for_dp",
+                return_value=([meta, meta], [2, 0, 1]),
+            ),
+        ):
+            p.get_logprobs_from_meta(meta)
+
+        fields = p.write_to_dataplane.call_args.kwargs["fields"]
+        assert torch.equal(
+            fields["prev_logprobs"],
+            torch.tensor(
+                [
+                    [10.0, 11.0, 12.0, 20.0, 21.0],
+                    [30.0, 31.0, 32.0, 33.0, 0.0],
+                ]
+            ),
+        )
+
+    def test_sync_train_counts_physical_calls_but_steps_logical_rollouts(self):
+        p, wg = _make_tq_policy()
+        meta = self._packed_meta()
+        wg.get_all_worker_results.return_value = [
+            {
+                "global_loss": torch.tensor(1.0),
+                "grad_norm": torch.tensor(2.0),
+                "all_mb_metrics": {},
+            }
+        ]
+        loss_fn = MagicMock()
+        with (
+            patch.object(TQPolicy, "_stamp_pad_seqlen"),
+            patch.object(TQPolicy, "_packing_args", return_value=(None, None)),
+            patch(
+                "nemo_rl.models.policy.tq_policy.shard_meta_for_dp",
+                return_value=([meta, meta], None),
+            ) as mock_shard,
+        ):
+            p.train_from_meta(meta, loss_fn=loss_fn, gbs=2, mbs=1)
+
+        assert mock_shard.call_args.kwargs["batch_size"] == 2
+        common_kwargs = wg.run_all_workers_sharded_data.call_args.kwargs[
+            "common_kwargs"
+        ]
+        assert common_kwargs == {
+            "loss_fn": loss_fn,
+            "eval_mode": False,
+            "gbs": 3,
+            "mbs": 1,
+            "scheduler_step_increment": 2,
+        }

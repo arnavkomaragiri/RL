@@ -30,6 +30,7 @@ class Completion:
     env_extras: Optional[dict[str, Any]]
     truncated: bool
     reward: float
+    training_message_logs: Optional[list[LLMMessageLogType | VLMMessageLogType]] = None
 
 
 @dataclass

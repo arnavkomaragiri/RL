@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import torch
 
+from nemo_rl.data.packed_rollouts import PACKED_ATTENTION_SEGMENT_LENGTHS
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
 
@@ -190,3 +191,58 @@ def test_record_to_train_batch_backfills_routes_for_failed_completion() -> None:
     _, fields, _ = pack_payload(train_batch, weight_version=3, group_id="group")
     assert "routed_experts" in fields
     assert list(fields["routed_experts"].unbind())[1].shape == (2, 2, 2)
+
+
+def test_record_to_train_batch_preserves_exact_call_boundaries() -> None:
+    call_1 = [
+        {"role": "user", "content": "p", "token_ids": torch.tensor([10, 11])},
+        {
+            "role": "assistant",
+            "content": "a1",
+            "token_ids": torch.tensor([20, 21]),
+            "generation_logprobs": torch.tensor([-0.1, -0.2]),
+        },
+    ]
+    call_2 = [
+        {
+            "role": "user",
+            "content": "p+a1+tool",
+            "token_ids": torch.tensor([30, 31, 32]),
+        },
+        {
+            "role": "assistant",
+            "content": "a2",
+            "token_ids": torch.tensor([40, 41]),
+            "generation_logprobs": torch.tensor([-0.3, -0.4]),
+        },
+    ]
+    completion = Completion(
+        message_log=call_2,
+        env_extras=None,
+        truncated=False,
+        reward=1.0,
+        training_message_logs=[call_1, call_2],
+    )
+
+    train_batch = record_to_train_batch(
+        _record([completion]),
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+    )
+
+    assert train_batch[PACKED_ATTENTION_SEGMENT_LENGTHS] == [[4, 5]]
+    assert train_batch["input_lengths"].tolist() == [9]
+    assert train_batch["input_ids"][0, :9].tolist() == [
+        10,
+        11,
+        20,
+        21,
+        30,
+        31,
+        32,
+        40,
+        41,
+    ]
+    assert int(train_batch["token_mask"].sum().item()) == 4
+
+    _, fields, _ = pack_payload(train_batch, weight_version=0, group_id="group")
+    assert PACKED_ATTENTION_SEGMENT_LENGTHS not in fields

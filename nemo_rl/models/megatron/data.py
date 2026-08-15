@@ -298,7 +298,6 @@ def process_microbatch(
 
             # Get sequence lengths and context parallel size
             seq_lengths = data_dict[seq_length_key]
-
             if delegate_pack_to_model:
                 has_mtp_loss_mask = "mtp_loss_mask" in data_dict
                 assert not has_mtp_loss_mask or delegate_mtp_loss_mask_to_model, (

@@ -570,6 +570,12 @@ class AsyncNemoGymRolloutImpl:
             [m for m in result["message_log"] if m["role"] == "assistant"],
             "generation_logprobs",
         )
+        for message_log in result.get("training_message_logs", []):
+            _tensorize_by_key(message_log, "token_ids")
+            _tensorize_by_key(
+                [m for m in message_log if m["role"] == "assistant"],
+                "generation_logprobs",
+            )
 
         # Calculate truncation.
         truncated = (
@@ -588,6 +594,7 @@ class AsyncNemoGymRolloutImpl:
             env_extras=result["full_result"],
             truncated=truncated,
             reward=float(result["full_result"]["reward"]),
+            training_message_logs=result.get("training_message_logs"),
         )
 
     def _compute_rollout_metrics(

@@ -551,6 +551,8 @@ class TestTokenCaptureMetrics:
         assert got["token_capture/rebuilt_fraction"] == 1.0
         assert got["token_capture/delivered_fraction_mean"] == 1.0
         assert got["token_capture/calls_per_rollout_mean"] == 5.0
+        assert got["token_capture/retokenized_boundaries"] == 0.0
+        assert got["token_capture/retokenized_tokens_masked"] == 0.0
         assert got["token_capture/masked_rollouts"] == 0.0
 
     def test_surfaces_partial_delivery(self):

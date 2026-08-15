@@ -35,6 +35,8 @@ env:
   nemo_gym:
     # Four concurrent rollouts request 1 CPU and 2 GiB in aggregate.
     num_samples_in_parallel: 4
+    observability_enabled: ${oc.decode:${oc.env:NEMO_GYM_MODEL_CALL_DIAGNOSTICS,false}}
+    model_call_capture_dir: ${oc.env:NEMO_GYM_MODEL_CALL_CAPTURE_DIR,${oc.env:RAY_TMPDIR,/tmp}/ng_model_calls_bbh_harbor_async_smoke}
     config_paths:
       - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
       - nemo_gym/sandbox/providers/opensandbox/configs/opensandbox.yaml
@@ -42,7 +44,8 @@ env:
       - responses_api_agents/gym_harbor_agent/configs/harbor_agent_opensandbox.yaml
     token_id_capture:
       enabled: true
-      dir: ${oc.env:RAY_TMPDIR,/tmp}/ng_tokcap_bbh_harbor_async_smoke
+      dir: ${oc.env:NEMO_GYM_TOKEN_CAPTURE_DIR,${oc.env:RAY_TMPDIR,/tmp}/ng_tokcap_bbh_harbor_async_smoke}
+      retain_consumed: ${oc.decode:${oc.env:NEMO_GYM_TOKEN_CAPTURE_RETAIN_CONSUMED,false}}
     # Remove the SWE-specific agent registration inherited by the base recipe.
     single_step_tool_use_with_argument_comparison_swe: null
 

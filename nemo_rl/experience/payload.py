@@ -21,6 +21,7 @@ import numpy as np
 import torch
 from tensordict import TensorDict
 
+from nemo_rl.data.packed_rollouts import PACKED_ATTENTION_SEGMENT_LENGTHS
 from nemo_rl.data_plane.codec import pack_jagged_fields
 from nemo_rl.data_plane.column_io import TOKEN_ALIGNED_FIELDS
 from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
@@ -46,6 +47,7 @@ def record_to_train_batch(
     # Lazy imports: grpo and llm_message_utils transitively pull
     # experience.rollouts, so importing at module top risks a cycle.
     from nemo_rl.algorithms.grpo import (
+        _use_exact_nemo_gym_call_sequences,
         add_grpo_token_loss_masks_and_generation_logprobs,
         extract_initial_prompt_messages,
     )
@@ -56,7 +58,22 @@ def record_to_train_batch(
     n = len(completions)
     assert n > 0, "PromptGroupRecord has no completions"
 
-    message_logs = [c.message_log for c in completions]
+    rollout_batch = BatchedDataDict[Any](
+        {"message_log": [c.message_log for c in completions]}
+    )
+    exact_call_logs = [c.training_message_logs for c in completions]
+    if any(call_logs is not None for call_logs in exact_call_logs):
+        if any(call_logs is None for call_logs in exact_call_logs):
+            raise ValueError(
+                "exact NeMo-Gym call metadata must be present for every completion "
+                "in a prompt group"
+            )
+        rollout_batch["training_message_logs"] = [
+            call_logs for call_logs in exact_call_logs if call_logs is not None
+        ]
+        _use_exact_nemo_gym_call_sequences(rollout_batch)
+
+    message_logs = rollout_batch["message_log"]
     prompt_token_count = sum(len(m["token_ids"]) for m in record.prompt)
     prompt_lengths = torch.full((n,), prompt_token_count, dtype=torch.long)
 
@@ -93,6 +110,10 @@ def record_to_train_batch(
     }
     if ROUTED_EXPERTS_FIELD in flat:
         train_data[ROUTED_EXPERTS_FIELD] = flat[ROUTED_EXPERTS_FIELD]
+    if PACKED_ATTENTION_SEGMENT_LENGTHS in rollout_batch:
+        train_data[PACKED_ATTENTION_SEGMENT_LENGTHS] = rollout_batch[
+            PACKED_ATTENTION_SEGMENT_LENGTHS
+        ]
     return BatchedDataDict[Any](train_data)
 
 

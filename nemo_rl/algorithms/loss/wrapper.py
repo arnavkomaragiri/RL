@@ -46,7 +46,6 @@ class SequencePackingLossWrapper:
             vocab_parallel_rank: Vocab parallel rank.
             vocab_parallel_group: Vocab parallel group.
             context_parallel_group: Context parallel group.
-
             vocab_parallel_rank, vocab_parallel_group, context_parallel_group are only used for megatron policy worker.
 
         Returns:

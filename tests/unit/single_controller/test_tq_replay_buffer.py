@@ -24,6 +24,7 @@ import torch
 
 import nemo_rl.algorithms.async_utils.replay_buffer as _replay_buffer_module
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
+from nemo_rl.data.packed_rollouts import PACKED_ATTENTION_SEGMENT_LENGTHS
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.interfaces import PromptGroupRecord
@@ -259,6 +260,35 @@ class TestTQReplayBufferReserveCommit:
         assert dp.put_calls == []
         assert dp.depth() == 0
         assert buf.ready_list == [False]
+
+    def test_commit_carries_exact_call_layout_in_meta(self, monkeypatch):
+        def _packed_train_batch(
+            record: PromptGroupRecord, *, pad_value_dict: Any
+        ) -> BatchedDataDict[Any]:
+            batch = _stub_record_to_train_batch(record, pad_value_dict=pad_value_dict)
+            batch[PACKED_ATTENTION_SEGMENT_LENGTHS] = [[1, 2], [3]]
+            return batch
+
+        monkeypatch.setattr(
+            _replay_buffer_module,
+            "record_to_train_batch",
+            _packed_train_batch,
+        )
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        group_id = buf.reserve(weight_version=3)
+
+        meta = _run(
+            buf.commit(
+                group_id,
+                _make_record(),
+                start_weight_version=3,
+                end_weight_version=3,
+            )
+        )
+
+        assert meta.extra_info[PACKED_ATTENTION_SEGMENT_LENGTHS] == [[1, 2], [3]]
+        assert PACKED_ATTENTION_SEGMENT_LENGTHS not in dp.put_calls[0]["fields"]
 
     def test_commit_raises_for_unknown_group_id(self):
         dp = FakeDataPlaneClient()

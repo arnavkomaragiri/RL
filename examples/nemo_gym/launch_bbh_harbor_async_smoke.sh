@@ -15,7 +15,7 @@ CONTAINER_REPO_LOCATION=${CONTAINER_REPO_LOCATION:-/opt/nemo-rl}
 CONTAINER=${CONTAINER:-}
 SLURM_ACCOUNT=${SLURM_ACCOUNT:-}
 SLURM_PARTITION=${SLURM_PARTITION:-batch}
-WALLTIME=${WALLTIME:-02:00:00}
+WALLTIME=${WALLTIME:-00:20:00}
 NUM_NODES=${NUM_NODES:-4}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 NUM_GENERATION_NODES=${NUM_GENERATION_NODES:-2}
@@ -29,7 +29,22 @@ RUN_ROOT=${RUN_ROOT:-${REPO_LOCATION}/results/${EXP_NAME}}
 HARBOR_JOBS_DIR=${HARBOR_JOBS_DIR:-${RUN_ROOT}/harbor-jobs}
 NRL_MEGATRON_CHECKPOINT_DIR=${NRL_MEGATRON_CHECKPOINT_DIR:-${RUN_ROOT}/megatron-checkpoints}
 NEMO_GYM_VENV_DIR=${NEMO_GYM_VENV_DIR:-${RUN_ROOT}/nemo-gym-venvs}
-RECIPE=${RECIPE:-examples/configs/recipes/llm/grpo-qwen3-30ba3b-thinking-4n8g-megatron-cp2-r3-async-gym-harbor-bbh-smoke.yaml}
+TOKEN_CAPTURE_DIAGNOSTICS=${TOKEN_CAPTURE_DIAGNOSTICS:-false}
+USE_TRANSFER_QUEUE=${USE_TRANSFER_QUEUE:-false}
+NEMO_GYM_TOKEN_CAPTURE_RETAIN_CONSUMED=${NEMO_GYM_TOKEN_CAPTURE_RETAIN_CONSUMED:-${TOKEN_CAPTURE_DIAGNOSTICS}}
+NEMO_GYM_MODEL_CALL_DIAGNOSTICS=${NEMO_GYM_MODEL_CALL_DIAGNOSTICS:-${TOKEN_CAPTURE_DIAGNOSTICS}}
+if [[ "${NEMO_GYM_TOKEN_CAPTURE_RETAIN_CONSUMED}" == "true" ]]; then
+    NEMO_GYM_TOKEN_CAPTURE_DIR=${NEMO_GYM_TOKEN_CAPTURE_DIR:-${RUN_ROOT}/token-captures}
+fi
+if [[ "${NEMO_GYM_MODEL_CALL_DIAGNOSTICS}" == "true" ]]; then
+    NEMO_GYM_MODEL_CALL_CAPTURE_DIR=${NEMO_GYM_MODEL_CALL_CAPTURE_DIR:-${RUN_ROOT}/model-call-captures}
+fi
+if [[ "${USE_TRANSFER_QUEUE}" == "true" ]]; then
+    DEFAULT_RECIPE=examples/configs/recipes/llm/grpo-qwen3-30ba3b-thinking-4n8g-megatron-cp2-r3-async-gym-harbor-bbh-smoke-tq-simple.yaml
+else
+    DEFAULT_RECIPE=examples/configs/recipes/llm/grpo-qwen3-30ba3b-thinking-4n8g-megatron-cp2-r3-async-gym-harbor-bbh-smoke.yaml
+fi
+RECIPE=${RECIPE:-${DEFAULT_RECIPE}}
 MODEL_PATH=${MODEL_PATH:-}
 
 HARBOR_DATASET_PATH=${HARBOR_DATASET_PATH:-}
@@ -45,8 +60,11 @@ HARBOR_SANDBOX_PROBE_TIMEOUT_S=${HARBOR_SANDBOX_PROBE_TIMEOUT_S:-180}
 HARBOR_SANDBOX_PROBE_DEADLINE_S=${HARBOR_SANDBOX_PROBE_DEADLINE_S:-240}
 HARBOR_SANDBOX_PROBE_STABLE_COUNT=${HARBOR_SANDBOX_PROBE_STABLE_COUNT:-1}
 HARBOR_SANDBOX_PROBE_STABLE_DELAY_S=${HARBOR_SANDBOX_PROBE_STABLE_DELAY_S:-0}
+HARBOR_SANDBOX_VOLUMES=${HARBOR_SANDBOX_VOLUMES:-[]}
+HARBOR_ENVIRONMENT_UPLOAD_EXCLUDES=${HARBOR_ENVIRONMENT_UPLOAD_EXCLUDES:-[]}
 OPENSANDBOX_PROTOCOL=${OPENSANDBOX_PROTOCOL:-http}
 OPENSANDBOX_USE_SERVER_PROXY=${OPENSANDBOX_USE_SERVER_PROXY:-true}
+OPENSANDBOX_REQUEST_TIMEOUT_S=${OPENSANDBOX_REQUEST_TIMEOUT_S:-1200}
 RUBRIC_MODEL=${RUBRIC_MODEL:-openai/nvidia/zai-org/glm-5.2}
 RUBRIC_MODEL_API_BASE=${RUBRIC_MODEL_API_BASE:-https://inference-api.nvidia.com/v1}
 RUBRIC_MODEL_API_KEY=${RUBRIC_MODEL_API_KEY:-${NVINF_API_KEY:-}}
@@ -132,6 +150,27 @@ case "${OPENSANDBOX_USE_SERVER_PROXY}" in
         exit 2
         ;;
 esac
+case "${NEMO_GYM_TOKEN_CAPTURE_RETAIN_CONSUMED}" in
+    true|false) ;;
+    *)
+        echo "NEMO_GYM_TOKEN_CAPTURE_RETAIN_CONSUMED must be true or false." >&2
+        exit 2
+        ;;
+esac
+case "${NEMO_GYM_MODEL_CALL_DIAGNOSTICS}" in
+    true|false) ;;
+    *)
+        echo "NEMO_GYM_MODEL_CALL_DIAGNOSTICS must be true or false." >&2
+        exit 2
+        ;;
+esac
+case "${USE_TRANSFER_QUEUE}" in
+    true|false) ;;
+    *)
+        echo "USE_TRANSFER_QUEUE must be true or false." >&2
+        exit 2
+        ;;
+esac
 
 if (( NUM_GENERATION_NODES < 1 || NUM_GENERATION_NODES >= NUM_NODES )); then
     echo "NUM_GENERATION_NODES must be between 1 and NUM_NODES-1." >&2
@@ -148,8 +187,21 @@ export HARBOR_IMAGE_OVERRIDE HARBOR_SANDBOX_ENTRYPOINT
 export HARBOR_SANDBOX_PROBE_COMMAND HARBOR_SANDBOX_PROBE_EXPECTED_STDOUT
 export HARBOR_SANDBOX_PROBE_TIMEOUT_S HARBOR_SANDBOX_PROBE_DEADLINE_S
 export HARBOR_SANDBOX_PROBE_STABLE_COUNT HARBOR_SANDBOX_PROBE_STABLE_DELAY_S
+export HARBOR_SANDBOX_VOLUMES HARBOR_ENVIRONMENT_UPLOAD_EXCLUDES
 export OPENSANDBOX_DOMAIN OPENSANDBOX_API_KEY
-export OPENSANDBOX_PROTOCOL OPENSANDBOX_USE_SERVER_PROXY
+export OPENSANDBOX_PROTOCOL OPENSANDBOX_USE_SERVER_PROXY OPENSANDBOX_REQUEST_TIMEOUT_S
+export NEMO_GYM_TOKEN_CAPTURE_RETAIN_CONSUMED
+export NEMO_GYM_MODEL_CALL_DIAGNOSTICS
+if [[ -n "${NEMO_GYM_TOKEN_CAPTURE_DIR:-}" ]]; then
+    export NEMO_GYM_TOKEN_CAPTURE_DIR
+else
+    unset NEMO_GYM_TOKEN_CAPTURE_DIR
+fi
+if [[ -n "${NEMO_GYM_MODEL_CALL_CAPTURE_DIR:-}" ]]; then
+    export NEMO_GYM_MODEL_CALL_CAPTURE_DIR
+else
+    unset NEMO_GYM_MODEL_CALL_CAPTURE_DIR
+fi
 if [[ -n "${OPENSANDBOX_CA_BUNDLE:-}" ]]; then
     export OPENSANDBOX_CA_BUNDLE
 else
@@ -166,6 +218,12 @@ mkdir -p \
     "${HARBOR_JOBS_DIR}" \
     "${NEMO_GYM_VENV_DIR}" \
     "${NRL_MEGATRON_CHECKPOINT_DIR}"
+if [[ -n "${NEMO_GYM_TOKEN_CAPTURE_DIR:-}" ]]; then
+    mkdir -p "${NEMO_GYM_TOKEN_CAPTURE_DIR}"
+fi
+if [[ -n "${NEMO_GYM_MODEL_CALL_CAPTURE_DIR:-}" ]]; then
+    mkdir -p "${NEMO_GYM_MODEL_CALL_CAPTURE_DIR}"
+fi
 
 read -r -d '' COMMAND <<EOF || true
 set -euo pipefail
@@ -197,6 +255,7 @@ echo "Run name:             ${EXP_NAME}"
 echo "Container:            ${CONTAINER}"
 echo "Container source:     ${REPO_LOCATION} -> ${CONTAINER_REPO_LOCATION}"
 echo "Recipe:               ${RECIPE}"
+echo "TransferQueue:         ${USE_TRANSFER_QUEUE}"
 echo "Model:                ${MODEL_PATH}"
 echo "Nodes/GPUs:            ${NUM_NODES} x ${GPUS_PER_NODE}"
 echo "Train/generation:      $((NUM_NODES - NUM_GENERATION_NODES)) / ${NUM_GENERATION_NODES} nodes"
@@ -204,6 +263,7 @@ echo "Rollouts:              ${NUM_PROMPTS_PER_STEP} x ${NUM_GENERATIONS_PER_PRO
 echo "Partition/account:     ${SLURM_PARTITION} / ${SLURM_ACCOUNT}"
 echo "OpenSandbox endpoint:  ${OPENSANDBOX_PROTOCOL}://${OPENSANDBOX_DOMAIN}"
 echo "OpenSandbox proxy:     ${OPENSANDBOX_USE_SERVER_PROXY}"
+echo "OpenSandbox timeout:   ${OPENSANDBOX_REQUEST_TIMEOUT_S}s/request"
 echo "OpenSandbox API key:   set (value suppressed)"
 echo "OpenSandbox CA bundle: ${OPENSANDBOX_CA_BUNDLE:-system trust store}"
 echo "Rubric model:          ${RUBRIC_MODEL}"
@@ -212,6 +272,16 @@ echo "Rubric API key:        set (value suppressed)"
 echo "Dataset:               ${HARBOR_DATASET_PATH}"
 echo "Sandbox image:         ${HARBOR_IMAGE_OVERRIDE}"
 echo "Sandbox prewarm:       ${HARBOR_SANDBOX_PROBE_COMMAND}"
+if [[ "${HARBOR_SANDBOX_VOLUMES}" == "[]" ]]; then
+    echo "Sandbox volumes:       none"
+else
+    echo "Sandbox volumes:       configured (value suppressed)"
+fi
+echo "Upload excludes:       ${HARBOR_ENVIRONMENT_UPLOAD_EXCLUDES}"
+echo "Capture diagnostics:   ${NEMO_GYM_TOKEN_CAPTURE_RETAIN_CONSUMED}"
+echo "Capture directory:     ${NEMO_GYM_TOKEN_CAPTURE_DIR:-node-local temporary store}"
+echo "Request diagnostics:   ${NEMO_GYM_MODEL_CALL_DIAGNOSTICS}"
+echo "Request directory:     ${NEMO_GYM_MODEL_CALL_CAPTURE_DIR:-node-local temporary store}"
 echo "Run root:              ${RUN_ROOT}"
 echo "Harbor jobs:           ${HARBOR_JOBS_DIR}"
 echo "Megatron cache:        ${NRL_MEGATRON_CHECKPOINT_DIR}"

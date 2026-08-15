@@ -34,6 +34,11 @@ import torch
 FetchPolicy = Literal["auto", "independent", "leader_broadcast"]
 
 from nemo_rl.data.llm_message_utils import attach_message_log_view
+from nemo_rl.data.packed_rollouts import (
+    PACKED_ATTENTION_SEGMENT_LENGTHS,
+    PACKED_ATTENTION_SELECTED_SEGMENTS,
+    expand_selected_packed_attention_segments,
+)
 from nemo_rl.data_plane.schema import (
     ELEM_COUNTS_PER_GB,
     GLOBAL_FORWARD_PAD_SEQLEN,
@@ -361,6 +366,28 @@ class TQWorkerMixin:
             return data
         return self._apply_packing_prep(data)
 
+    def _expand_packed_attention_from_meta(
+        self,
+        data: BatchedDataDict[Any],
+        meta: "KVBatchMeta",
+    ) -> BatchedDataDict[Any]:
+        """Expand fetched logical rollouts into calls selected for this DP rank."""
+        extra = meta.extra_info or {}
+        segment_lengths = extra.get(PACKED_ATTENTION_SEGMENT_LENGTHS)
+        selected_segments = extra.get(PACKED_ATTENTION_SELECTED_SEGMENTS)
+        if segment_lengths is None and selected_segments is None:
+            return data
+        if segment_lengths is None or selected_segments is None:
+            raise ValueError(
+                "packed attention preshard metadata requires both segment lengths "
+                "and selected segments"
+            )
+        return expand_selected_packed_attention_segments(
+            data,
+            segment_lengths=segment_lengths,
+            selected_segments=selected_segments,
+        )
+
     def _local_coords(self) -> dict[str, int]:
         """This worker's (axis -> local-rank) mapping.
 
@@ -459,16 +486,23 @@ class TQWorkerMixin:
         eval_mode: bool = False,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        scheduler_step_increment: Optional[int] = None,
     ) -> dict[str, Any]:
         """Per-rank training entrypoint. Fetch → packing prep → delegate."""
         data = self._fetch(meta)
+        data = self._expand_packed_attention_from_meta(data, meta)
         data = self._attach_or_repack_pack_metadata(data, meta)
+        train_kwargs: dict[str, Any] = {
+            "loss_fn": loss_fn,
+            "eval_mode": eval_mode,
+            "gbs": gbs,
+            "mbs": mbs,
+        }
+        if scheduler_step_increment is not None:
+            train_kwargs["scheduler_step_increment"] = scheduler_step_increment
         return self.train(  # type: ignore[attr-defined]
             data,
-            loss_fn=loss_fn,
-            eval_mode=eval_mode,
-            gbs=gbs,
-            mbs=mbs,
+            **train_kwargs,
         )
 
     @wrap_with_nvtx_name("policy_worker/get_logprobs_presharded")
@@ -476,22 +510,23 @@ class TQWorkerMixin:
         self,
         meta: "KVBatchMeta",
         micro_batch_size: Optional[int] = None,
-    ) -> None:
+    ) -> Optional[BatchedDataDict[Any]]:
         """Per-rank logprob entrypoint. Fetch → packing prep → run → write back.
 
-        Returns ``None`` — the per-token tensor is committed to TQ via
-        :meth:`_write_back_result_field` under ``prev_logprobs``.
-        Callers fetch it through :meth:`TQPolicy.read_from_dataplane` —
-        skipping the Ray plasma roundtrip on the (B, S) tensor.
-        ``del result`` drops the local reference before returning so the
-        worker doesn't carry the tensor into the next dispatch.
+        Unpacked results are committed directly to TQ and return ``None``.
+        Packed results return physical call rows to the driver, which restores
+        their logical rollout rows before the single TQ write.
         """
         data = self._fetch(meta)
+        packed = PACKED_ATTENTION_SELECTED_SEGMENTS in (meta.extra_info or {})
+        data = self._expand_packed_attention_from_meta(data, meta)
         data = self._attach_or_repack_pack_metadata(data, meta)
         result: BatchedDataDict[Any] = self.get_logprobs(  # type: ignore[attr-defined]
             data=data,
             micro_batch_size=micro_batch_size,
         )
+        if packed:
+            return result.to("cpu")
         self._write_back_result_field(
             meta,
             result,
@@ -499,24 +534,29 @@ class TQWorkerMixin:
             tq_field="prev_logprobs",
         )
         del result
+        return None
 
     @wrap_with_nvtx_name("policy_worker/get_reference_policy_logprobs_presharded")
     def get_reference_policy_logprobs_presharded(
         self,
         meta: "KVBatchMeta",
         micro_batch_size: Optional[int] = None,
-    ) -> None:
+    ) -> Optional[BatchedDataDict[Any]]:
         """Per-rank reference-policy logprob entrypoint.
 
         See :meth:`get_logprobs_presharded` for the contract. Tensor
         lives in TQ under ``reference_policy_logprobs``.
         """
         data = self._fetch(meta)
+        packed = PACKED_ATTENTION_SELECTED_SEGMENTS in (meta.extra_info or {})
+        data = self._expand_packed_attention_from_meta(data, meta)
         data = self._attach_or_repack_pack_metadata(data, meta)
         result: BatchedDataDict[Any] = self.get_reference_policy_logprobs(  # type: ignore[attr-defined]
             data=data,
             micro_batch_size=micro_batch_size,
         )
+        if packed:
+            return result.to("cpu")
         self._write_back_result_field(
             meta,
             result,
@@ -524,6 +564,7 @@ class TQWorkerMixin:
             tq_field="reference_policy_logprobs",
         )
         del result
+        return None
 
     # ── split-API entrypoints (SC async path) ──────────────────────────────
     #
@@ -569,6 +610,7 @@ class TQWorkerMixin:
         ``finish_train_step_presharded``.
         """
         data = self._fetch(meta)
+        data = self._expand_packed_attention_from_meta(data, meta)
         data = self._attach_or_repack_pack_metadata(data, meta)
         self.train_microbatch(  # type: ignore[attr-defined]
             data=data,

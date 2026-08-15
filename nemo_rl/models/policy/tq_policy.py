@@ -31,13 +31,19 @@ from __future__ import annotations
 
 import warnings
 from collections import defaultdict
+from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import replace
 from typing import Any, Optional
 
 import ray
+import torch
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.data.packed_rollouts import (
+    PACKED_ATTENTION_SEGMENT_LENGTHS,
+    reassemble_packed_attention_segments,
+)
 from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta, build_data_plane_client
 from nemo_rl.data_plane.column_io import read_columns, round_up, write_columns
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
@@ -75,10 +81,53 @@ def _aggregate_train_results(results: list[dict[str, Any]]) -> dict[str, Any]:
     return out
 
 
-# Logprob results land in TQ directly via the worker-side
-# ``_write_back_result_field`` leader path; the per-rank Ray return is
-# always None (see :meth:`TQWorkerMixin.get_logprobs_presharded`). The
-# dispatcher only waits for completion — no aggregation needed.
+def _model_sequence_lengths(meta: KVBatchMeta) -> list[int]:
+    """Return physical model-call lengths, or logical lengths when unpacked."""
+    segment_lengths = (meta.extra_info or {}).get(PACKED_ATTENTION_SEGMENT_LENGTHS)
+    if segment_lengths is not None:
+        return [length for row in segment_lengths for length in row]
+    return list(meta.sequence_lengths or [])
+
+
+def _concatenate_packed_logprob_results(
+    results: list[Any],
+    *,
+    result_key: str,
+) -> BatchedDataDict[Any]:
+    """Pad rank-local call rows to one width and concatenate in dispatch order."""
+    tensors: list[torch.Tensor] = []
+    for result in results:
+        if not isinstance(result, Mapping) or result_key not in result:
+            raise RuntimeError(
+                "packed logprob worker result must contain "
+                f"{result_key!r}, got {type(result).__name__}"
+            )
+        tensor = result[result_key]
+        if not isinstance(tensor, torch.Tensor) or tensor.ndim < 2:
+            raise TypeError(
+                f"packed logprob result {result_key!r} must be a rank-2+ tensor"
+            )
+        tensors.append(tensor)
+    if not tensors:
+        raise RuntimeError("packed logprob dispatch returned no worker results")
+
+    max_sequence_length = max(tensor.shape[1] for tensor in tensors)
+    padded: list[torch.Tensor] = []
+    for tensor in tensors:
+        if tensor.shape[1] == max_sequence_length:
+            padded.append(tensor)
+            continue
+        output = tensor.new_zeros(
+            (tensor.shape[0], max_sequence_length, *tensor.shape[2:])
+        )
+        output[:, : tensor.shape[1]] = tensor
+        padded.append(output)
+    return BatchedDataDict[Any]({result_key: torch.cat(padded, dim=0)})
+
+
+# Unpacked logprob results land in TQ directly from each worker leader. Packed
+# results return per-call tensors to the driver so calls split across DP ranks
+# can be reassembled into one logical rollout row before the TQ write.
 
 
 class TQPolicy(Policy):
@@ -231,12 +280,16 @@ class TQPolicy(Policy):
         no driver-side knowledge of ``sequence_length_round``.
         """
         self._stamp_pad_seqlen(meta)
-        return read_columns(
+        data = read_columns(
             self.dp_client,
             meta,
             select_fields=select_fields,
             pad_value_dict=pad_value_dict,
         )
+        segment_lengths = (meta.extra_info or {}).get(PACKED_ATTENTION_SEGMENT_LENGTHS)
+        if segment_lengths is not None:
+            data[PACKED_ATTENTION_SEGMENT_LENGTHS] = segment_lengths
+        return data
 
     def write_to_dataplane(self, meta: KVBatchMeta, fields: dict[str, Any]) -> None:
         """Write driver-computed columns to the data plane (TQ)."""
@@ -277,15 +330,17 @@ class TQPolicy(Policy):
         timer: Optional[Timer],
         common_kwargs: dict[str, Any],
         include_router_replay: bool = False,
+        result_key: str,
+        tq_field: str,
     ) -> None:
         """Shared body of get_logprobs_from_meta / get_reference_policy_logprobs_from_meta.
 
         Logprob workers need only LP_SEED_FIELDS — narrow the meta's
         field list so ``_fetch`` doesn't pull rollout-only payload (e.g.
         multimodal). The same shape is used for both prev_lp and ref_lp.
-        Workers compute the per-token tensor and commit it to TQ via the
-        leader-rank ``_write_back_result_field``; the Ray return is
-        always None, so this dispatcher just waits for completion.
+        Unpacked workers commit their per-token tensor directly to TQ. Packed
+        workers return physical call rows; this dispatcher restores call order,
+        reassembles logical rollout rows, and performs the single TQ write.
         """
         self._stamp_pad_seqlen(meta)
         spa, dba = self._packing_args("logprob_mb_tokens")
@@ -298,7 +353,7 @@ class TQPolicy(Policy):
             task_name=task_name,
         )
         with timer.time(f"{timer_prefix}/shard_meta") if timer else nullcontext():
-            metas, _ = shard_meta_for_dp(
+            metas, unsorted_indices = shard_meta_for_dp(
                 lp_meta,
                 dp_world=self.sharding_annotations.get_axis_size("data_parallel"),
                 batch_size=None,
@@ -322,8 +377,27 @@ class TQPolicy(Policy):
                 ],
                 common_kwargs=common_kwargs,
             )
-        # Wait for completion; per-rank returns are None.
-        self.worker_group.get_all_worker_results(futures)
+        worker_results = self.worker_group.get_all_worker_results(futures)
+        segment_lengths = (meta.extra_info or {}).get(PACKED_ATTENTION_SEGMENT_LENGTHS)
+        if segment_lengths is None:
+            return
+
+        packed_results = _concatenate_packed_logprob_results(
+            worker_results,
+            result_key=result_key,
+        )
+        if unsorted_indices is not None:
+            packed_results.reorder_data(unsorted_indices)
+        if not meta.sequence_lengths:
+            raise ValueError(
+                "packed attention logprob dispatch requires sequence_lengths"
+            )
+        reassembled = reassemble_packed_attention_segments(
+            packed_results[result_key],
+            segment_lengths,
+            output_sequence_length=max(meta.sequence_lengths),
+        )
+        self.write_to_dataplane(meta, fields={tq_field: reassembled})
 
     def get_logprobs_from_meta(
         self,
@@ -339,6 +413,8 @@ class TQPolicy(Policy):
             timer=timer,
             common_kwargs={"micro_batch_size": micro_batch_size},
             include_router_replay=True,
+            result_key="logprobs",
+            tq_field="prev_logprobs",
         )
 
     def get_reference_policy_logprobs_from_meta(
@@ -354,6 +430,8 @@ class TQPolicy(Policy):
             timer_prefix="get_reference_policy_logprobs",
             timer=timer,
             common_kwargs={"micro_batch_size": micro_batch_size},
+            result_key="reference_logprobs",
+            tq_field="reference_policy_logprobs",
         )
 
     def train_from_meta(
@@ -390,6 +468,19 @@ class TQPolicy(Policy):
         """
         batch_size = gbs or self.cfg["train_global_batch_size"]
         micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
+        segment_lengths = (meta.extra_info or {}).get(PACKED_ATTENTION_SEGMENT_LENGTHS)
+        worker_batch_size = (
+            sum(len(row) for row in segment_lengths)
+            if segment_lengths is not None
+            else batch_size
+        )
+        if segment_lengths is not None and not self.cfg.get("megatron_cfg", {}).get(
+            "enabled", False
+        ):
+            raise NotImplementedError(
+                "independent model-call packing currently requires the Megatron "
+                "policy backend"
+            )
 
         self._stamp_pad_seqlen(meta)
         spa, dba = self._packing_args("train_mb_tokens")
@@ -415,8 +506,7 @@ class TQPolicy(Policy):
 
         if self.flops_tracker is not None:
             self.flops_tracker.reset()
-            for m in dp_metas:
-                self.flops_tracker.track_batch(list(m.sequence_lengths or []))
+            self.flops_tracker.track_batch(_model_sequence_lengths(meta))
 
         with (
             timer.time("policy_training/submit_training_futures")
@@ -440,8 +530,11 @@ class TQPolicy(Policy):
                 common_kwargs={
                     "loss_fn": loss_fn,
                     "eval_mode": eval_mode,
-                    "gbs": batch_size,
+                    "gbs": worker_batch_size,
                     "mbs": micro_batch_size,
+                    "scheduler_step_increment": batch_size
+                    if segment_lengths is not None
+                    else None,
                 },
             )
         results = self.worker_group.get_all_worker_results(futures)
@@ -519,6 +612,14 @@ class TQPolicy(Policy):
         the workers' open-step state and surface once via
         :meth:`finish_train_step`.
         """
+        segment_lengths = (meta.extra_info or {}).get(PACKED_ATTENTION_SEGMENT_LENGTHS)
+        if segment_lengths is not None and not self.cfg.get("megatron_cfg", {}).get(
+            "enabled", False
+        ):
+            raise NotImplementedError(
+                "independent model-call packing currently requires the Megatron "
+                "policy backend"
+            )
         self._stamp_pad_seqlen(meta)
         spa, dba = self._packing_args("train_mb_tokens")
         train_meta = replace(
@@ -538,8 +639,7 @@ class TQPolicy(Policy):
             )
 
         if self.flops_tracker is not None:
-            for m in dp_metas:
-                self.flops_tracker.track_batch(list(m.sequence_lengths or []))
+            self.flops_tracker.track_batch(_model_sequence_lengths(meta))
 
         with (
             timer.time("policy_training/submit_microbatch_futures")

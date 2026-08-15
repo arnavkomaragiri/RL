@@ -29,11 +29,19 @@ from __future__ import annotations
 
 import torch
 
+from nemo_rl.data.packed_rollouts import (
+    PACKED_ATTENTION_SEGMENT_LENGTHS,
+    PACKED_ATTENTION_SELECTED_SEGMENTS,
+)
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data_plane.column_io import kv_first_write, read_columns
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
-from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
+from nemo_rl.data_plane.schema import (
+    DP_TRAIN_FIELDS,
+    MICRO_BATCH_INDICES,
+    MICRO_BATCH_LENGTHS,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 from ._rollout_shapes import (
@@ -142,9 +150,87 @@ def test_shard_meta_for_dp_unsorted_round_trip():
         return
     # Build a tensor whose row i is i; permute via dispatch order; reorder back.
     flat = [k for m in metas for k in m.sample_ids]
-    aggregated = torch.tensor([_meta(n).sample_ids.index(k) for k in flat])
-    restored = aggregated[torch.tensor(unsorted)]
-    assert restored.tolist() == list(range(n))
+    aggregated = BatchedDataDict(
+        {"row": torch.tensor([_meta(n).sample_ids.index(k) for k in flat])}
+    )
+    aggregated.reorder_data(unsorted)
+    assert aggregated["row"].tolist() == list(range(n))
+
+
+def test_sequence_packed_meta_reorders_worker_rows_with_public_api():
+    meta = KVBatchMeta(
+        partition_id="train",
+        task_name="prev_lp",
+        sample_ids=["s0", "s1", "s2", "s3"],
+        sequence_lengths=[1, 4, 2, 3],
+    )
+    metas, unsorted = shard_meta_for_dp(
+        meta,
+        dp_world=2,
+        sequence_packing_args={
+            "algorithm": "modified_first_fit_decreasing",
+            "input_key": "input_ids",
+            "input_lengths_key": "input_lengths",
+            "max_tokens_per_microbatch": 5,
+            "sequence_length_pad_multiple": 1,
+        },
+    )
+
+    dispatched = [
+        meta.sample_ids.index(key) for rank in metas for key in rank.sample_ids
+    ]
+    aggregated = BatchedDataDict({"row": torch.tensor(dispatched)})
+    if unsorted is not None:
+        aggregated.reorder_data(unsorted)
+    assert aggregated["row"].tolist() == [0, 1, 2, 3]
+
+
+def test_shard_meta_for_dp_balances_exact_calls_and_preserves_logical_keys():
+    meta = KVBatchMeta(
+        partition_id="train",
+        task_name="train",
+        sample_ids=["rollout-0", "rollout-1"],
+        fields=list(DP_TRAIN_FIELDS),
+        sequence_lengths=[5, 4],
+        extra_info={PACKED_ATTENTION_SEGMENT_LENGTHS: [[3, 2], [4]]},
+        tags=[{"reward": 1.0}, {"reward": 2.0}],
+    )
+    metas, unsorted = shard_meta_for_dp(
+        meta,
+        dp_world=2,
+        batch_size=2,
+        sequence_packing_args={
+            "algorithm": "modified_first_fit_decreasing",
+            "input_key": "input_ids",
+            "input_lengths_key": "input_lengths",
+            "max_tokens_per_microbatch": 5,
+            "sequence_length_pad_multiple": 1,
+        },
+    )
+
+    call_offsets = {"rollout-0": 0, "rollout-1": 2}
+    dispatched_calls = []
+    for rank_meta in metas:
+        assert len(rank_meta.sample_ids) == len(set(rank_meta.sample_ids))
+        assert len(rank_meta.extra_info[PACKED_ATTENTION_SEGMENT_LENGTHS]) == len(
+            rank_meta.sample_ids
+        )
+        assert MICRO_BATCH_INDICES in rank_meta.extra_info
+        assert MICRO_BATCH_LENGTHS in rank_meta.extra_info
+        for local_row, segment in rank_meta.extra_info[
+            PACKED_ATTENTION_SELECTED_SEGMENTS
+        ]:
+            dispatched_calls.append(
+                call_offsets[rank_meta.sample_ids[local_row]] + segment
+            )
+
+    assert sorted(dispatched_calls) == [0, 1, 2]
+    if unsorted is None:
+        assert dispatched_calls == [0, 1, 2]
+    else:
+        aggregated = BatchedDataDict({"call": torch.tensor(dispatched_calls)})
+        aggregated.reorder_data(unsorted)
+        assert aggregated["call"].tolist() == [0, 1, 2]
 
 
 # ── meta utility helpers ──────────────────────────────────────────────
@@ -164,6 +250,26 @@ def test_kvbatchmeta_concat_joins_keys_and_seqlens():
     j = m1.concat(m2)
     assert j.sample_ids == ["k0", "k1", "k2", "k3", "k4", "k5"]
     assert j.sequence_lengths == [10, 11, 12, 13, 14, 15]
+
+
+def test_kvbatchmeta_transforms_keep_exact_call_layout_aligned():
+    meta = KVBatchMeta(
+        partition_id="train",
+        task_name="train",
+        sample_ids=["a", "b", "c"],
+        sequence_lengths=[5, 4, 6],
+        extra_info={PACKED_ATTENTION_SEGMENT_LENGTHS: [[3, 2], [4], [1, 5]]},
+    )
+
+    subset = meta.subset([2, 0])
+    assert subset.extra_info[PACKED_ATTENTION_SEGMENT_LENGTHS] == [[1, 5], [3, 2]]
+
+    joined = meta.slice(0, 1).concat(meta.slice(1, 3))
+    assert joined.extra_info[PACKED_ATTENTION_SEGMENT_LENGTHS] == [
+        [3, 2],
+        [4],
+        [1, 5],
+    ]
 
 
 def test_kvbatchmeta_slice_takes_range():

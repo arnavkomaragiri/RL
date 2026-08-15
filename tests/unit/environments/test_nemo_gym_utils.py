@@ -55,6 +55,8 @@ from nemo_rl.environments.nemo_gym import (
             True,
             False,
         ),
+        ({"type": "message", "content": None}, False, False),
+        ({"type": "reasoning", "summary": None}, False, False),
     ],
 )
 def test_detect_invalid_tool_call_and_malformed_thinking(

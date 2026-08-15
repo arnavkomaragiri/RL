@@ -41,6 +41,8 @@ from typing import Any, Callable, Literal, NotRequired, Sequence, TypedDict
 
 from tensordict import TensorDict
 
+from nemo_rl.data.packed_rollouts import PACKED_ATTENTION_SEGMENT_LENGTHS
+
 
 class DataPlaneConfig(TypedDict):
     """Feature-gated config; defaults to disabled.
@@ -179,7 +181,7 @@ class KVBatchMeta:
 
     def subset(self, indices: "Sequence[int]") -> "KVBatchMeta":
         """Return a new meta with only the rows at ``indices`` (any order)."""
-        return self._replace(
+        out = self._replace(
             sample_ids=[self.sample_ids[i] for i in indices],
             sequence_lengths=(
                 [self.sequence_lengths[i] for i in indices]
@@ -188,24 +190,27 @@ class KVBatchMeta:
             ),
             tags=([self.tags[i] for i in indices] if self.tags is not None else None),
         )
+        segment_lengths = self.extra_info.get(PACKED_ATTENTION_SEGMENT_LENGTHS)
+        if segment_lengths is not None:
+            if len(segment_lengths) != self.size:
+                raise ValueError(
+                    f"{PACKED_ATTENTION_SEGMENT_LENGTHS} must align with "
+                    f"sample_ids: {len(segment_lengths)} != {self.size}"
+                )
+            out.extra_info[PACKED_ATTENTION_SEGMENT_LENGTHS] = [
+                segment_lengths[i] for i in indices
+            ]
+        return out
 
     def slice(self, start: int, stop: int) -> "KVBatchMeta":
         """Return a new meta with rows in the contiguous range ``[start, stop)``."""
-        return self._replace(
-            sample_ids=self.sample_ids[start:stop],
-            sequence_lengths=(
-                self.sequence_lengths[start:stop]
-                if self.sequence_lengths is not None
-                else None
-            ),
-            tags=self.tags[start:stop] if self.tags is not None else None,
-        )
+        return self.subset(range(start, stop))
 
     def concat(self, *others: "KVBatchMeta") -> "KVBatchMeta":
         """Append ``others`` to ``self``. All metas must share ``partition_id``."""
         if any(o.partition_id != self.partition_id for o in others):
             raise ValueError("KVBatchMeta.concat: partition_ids must match")
-        all_m = (self, *others)
+        all_m: tuple[KVBatchMeta, ...] = (self, *others)
         sample_ids = [k for m in all_m for k in m.sample_ids]
         all_have_lens = all(m.sequence_lengths is not None for m in all_m)
         seq_lens = (
@@ -215,9 +220,30 @@ class KVBatchMeta:
         )
         all_have_tags = all(m.tags is not None for m in all_m)
         tags = [t for m in all_m for t in (m.tags or [])] if all_have_tags else None
-        return self._replace(
-            sample_ids=sample_ids, sequence_lengths=seq_lens, tags=tags
-        )
+        out = self._replace(sample_ids=sample_ids, sequence_lengths=seq_lens, tags=tags)
+        packed_layouts = [
+            m.extra_info.get(PACKED_ATTENTION_SEGMENT_LENGTHS) for m in all_m
+        ]
+        if any(layout is not None for layout in packed_layouts):
+            merged_layout = []
+            for index, m in enumerate(all_m):
+                layout: Any = packed_layouts[index]
+                if layout is None:
+                    sequence_lengths = m.sequence_lengths
+                    if sequence_lengths is None:
+                        raise ValueError(
+                            "cannot merge packed attention metadata with a meta "
+                            "that has no sequence_lengths"
+                        )
+                    layout = [[int(length)] for length in sequence_lengths]
+                if len(layout) != m.size:
+                    raise ValueError(
+                        f"{PACKED_ATTENTION_SEGMENT_LENGTHS} must align with "
+                        f"sample_ids: {len(layout)} != {m.size}"
+                    )
+                merged_layout.extend(layout)
+            out.extra_info[PACKED_ATTENTION_SEGMENT_LENGTHS] = merged_layout
+        return out
 
     def drop(self, indices: "Sequence[int]") -> "KVBatchMeta | None":
         """Complement of :meth:`subset`. Returns ``None`` when all rows are dropped."""

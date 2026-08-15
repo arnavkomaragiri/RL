@@ -23,6 +23,7 @@ from typing import Any, Iterable, Optional
 import ray
 
 from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
+from nemo_rl.data.packed_rollouts import PACKED_ATTENTION_SEGMENT_LENGTHS
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
 from nemo_rl.experience.interfaces import PromptGroupRecord
@@ -750,6 +751,15 @@ class TQReplayBuffer:
                 sample_ids=list(sample_ids),
                 fields=list(fields.keys()),
                 sequence_lengths=[int(s) for s in lengths.tolist()],
+                extra_info=(
+                    {
+                        PACKED_ATTENTION_SEGMENT_LENGTHS: train_batch[
+                            PACKED_ATTENTION_SEGMENT_LENGTHS
+                        ]
+                    }
+                    if PACKED_ATTENTION_SEGMENT_LENGTHS in train_batch
+                    else {}
+                ),
                 tags=[dict(t) for t in tags],
             )
 

@@ -27,6 +27,11 @@ from typing import Any, Optional
 
 import torch
 
+from nemo_rl.data.packed_rollouts import (
+    PACKED_ATTENTION_SEGMENT_LENGTHS,
+    PACKED_ATTENTION_SELECTED_SEGMENTS,
+    validate_packed_attention_segment_lengths,
+)
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.schema import (
     ELEM_COUNTS_PER_GB,
@@ -69,8 +74,7 @@ def shard_meta_for_dp(
 
     Returns:
         ``(per_rank_metas, unsorted_indices)``. ``unsorted_indices`` is
-        the inverse permutation that maps DP-rank-order outputs back to
-        original ``meta.sample_ids`` order (feed to
+        the original row index for every output in DP-rank order (feed to
         ``BatchedDataDict.reorder_data`` post-aggregation); ``None`` if
         no reorder occurred.
     """
@@ -88,7 +92,29 @@ def shard_meta_for_dp(
             "Pass at most one of sequence_packing_args / dynamic_batching_args."
         )
 
-    seq_lens = list(meta.sequence_lengths)
+    logical_seq_lens = list(meta.sequence_lengths)
+    packed_segment_lengths = meta.extra_info.get(PACKED_ATTENTION_SEGMENT_LENGTHS)
+    call_parents: list[int] | None = None
+    call_segment_indices: list[int] | None = None
+    if packed_segment_lengths is not None:
+        validate_packed_attention_segment_lengths(
+            packed_segment_lengths, logical_seq_lens
+        )
+        if dynamic_batching_args is not None:
+            raise NotImplementedError(
+                "packed attention metadata is not supported with dynamic batching; "
+                "use sequence packing"
+            )
+        call_parents = []
+        call_segment_indices = []
+        seq_lens = []
+        for parent_index, row_segments in enumerate(packed_segment_lengths):
+            for segment_index, segment_length in enumerate(row_segments):
+                call_parents.append(parent_index)
+                call_segment_indices.append(segment_index)
+                seq_lens.append(segment_length)
+    else:
+        seq_lens = logical_seq_lens
     # Skeleton BatchedDataDict — `shard_by_batch_size` only needs
     # input_ids (placeholder), input_lengths (real), sample_mask (ones).
     # ``meta_idx`` lets us recover which original meta index each shard row
@@ -109,10 +135,10 @@ def shard_meta_for_dp(
         input_ids_seqlen = int(dynamic_batching_args["max_tokens_per_microbatch"])
     skeleton = BatchedDataDict(
         {
-            INPUT_IDS: torch.zeros(n, input_ids_seqlen, dtype=torch.int64),
+            INPUT_IDS: torch.zeros(len(seq_lens), input_ids_seqlen, dtype=torch.int64),
             INPUT_LENGTHS: torch.tensor(seq_lens, dtype=torch.int64),
-            SAMPLE_MASK: torch.ones(n, dtype=torch.float32),
-            META_IDX: torch.arange(n, dtype=torch.int64),
+            SAMPLE_MASK: torch.ones(len(seq_lens), dtype=torch.float32),
+            META_IDX: torch.arange(len(seq_lens), dtype=torch.int64),
         }
     )
 
@@ -126,9 +152,16 @@ def shard_meta_for_dp(
     elif sequence_packing_args is not None:
         sharded, _ = skeleton.shard_by_batch_size(
             dp_world,
-            batch_size=batch_size,
+            batch_size=None if packed_segment_lengths is not None else batch_size,
+            allow_uneven_shards=packed_segment_lengths is not None,
             # pyrefly: ignore  # bad-argument-type
             sequence_packing_args=sequence_packing_args,
+        )
+    elif packed_segment_lengths is not None:
+        sharded = skeleton.shard_by_batch_size(
+            dp_world,
+            batch_size=None,
+            allow_uneven_shards=True,
         )
     else:
         sharded = skeleton.shard_by_batch_size(dp_world, batch_size=batch_size)
@@ -140,9 +173,38 @@ def shard_meta_for_dp(
         # pyrefly: ignore  # no-matching-overload
         idx_list: list[int] = shard[META_IDX].tolist()
         flat_idx.extend(idx_list)
-        rank_sample_ids = [meta.sample_ids[i] for i in idx_list]
-        rank_seqlens = [seq_lens[i] for i in idx_list]
         rank_extra = dict(base_extra)
+        if packed_segment_lengths is not None:
+            assert call_parents is not None and call_segment_indices is not None
+            selected_global = [
+                (call_parents[i], call_segment_indices[i]) for i in idx_list
+            ]
+            parent_indices = list(
+                dict.fromkeys(parent for parent, _ in selected_global)
+            )
+            parent_to_local = {
+                parent: local for local, parent in enumerate(parent_indices)
+            }
+            rank_sample_ids = [meta.sample_ids[i] for i in parent_indices]
+            rank_seqlens = [logical_seq_lens[i] for i in parent_indices]
+            rank_extra[PACKED_ATTENTION_SEGMENT_LENGTHS] = [
+                packed_segment_lengths[i] for i in parent_indices
+            ]
+            rank_extra[PACKED_ATTENTION_SELECTED_SEGMENTS] = [
+                (parent_to_local[parent], segment)
+                for parent, segment in selected_global
+            ]
+            rank_tags = (
+                [meta.tags[i] for i in parent_indices]
+                if meta.tags is not None
+                else None
+            )
+        else:
+            rank_sample_ids = [meta.sample_ids[i] for i in idx_list]
+            rank_seqlens = [seq_lens[i] for i in idx_list]
+            rank_tags = (
+                [meta.tags[i] for i in idx_list] if meta.tags is not None else None
+            )
         # Per-shard packing metadata — set by ``shard_by_batch_size`` when
         # sequence_packing or dynamic_batching is enabled. Workers'
         # *_presharded paths look these up off ``meta.extra_info`` to avoid
@@ -166,17 +228,16 @@ def shard_meta_for_dp(
                 fields=meta.fields,
                 sequence_lengths=rank_seqlens,
                 extra_info=rank_extra,
+                tags=rank_tags,
             )
         )
 
-    # Build inverse permutation: unsorted[orig_idx] = position_in_aggregated.
-    # When workers' results are concatenated in DP-rank order, row `j` of
-    # the aggregate corresponds to original index `flat_idx[j]`. To restore
-    # original meta.sample_ids order, the caller does aggregated.reorder_data(
-    # unsorted_indices) — same contract as `_shard_for_logprob`.
+    # When worker results are concatenated in DP-rank order, aggregate row
+    # ``j`` corresponds to original row ``flat_idx[j]``. ``reorder_data``
+    # sorts positions by these original indices, matching the contract of
+    # ``BatchedDataDict.shard_by_batch_size``.
     unsorted: Optional[list[int]] = None
-    if flat_idx != list(range(n)):
-        unsorted = [0] * n
-        for new_pos, old_idx in enumerate(flat_idx):
-            unsorted[old_idx] = new_pos
+    result_count = len(seq_lens)
+    if flat_idx != list(range(result_count)):
+        unsorted = flat_idx
     return out, unsorted

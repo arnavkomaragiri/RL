@@ -1,0 +1,29 @@
+# TransferQueue variant of the one-step BBH Harbor/OpenSandbox smoke test.
+defaults: ./grpo-qwen3-30ba3b-thinking-4n8g-megatron-cp2-r3-async-gym-harbor-bbh-smoke.yaml
+
+grpo:
+  # Keep the async Gym/vLLM rollout engine, but use the synchronous TQ trainer.
+  async_grpo:
+    enabled: false
+    in_flight_weight_updates: false
+  # The TQ trainer does not yet reconstruct message-level spans on the driver.
+  invalid_tool_call_advantage: null
+  malformed_thinking_advantage: null
+
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: simple
+  storage_capacity: 1000000
+  num_storage_units: 2
+  claim_meta_poll_interval_s: 0.5
+  global_segment_size: 549755813888
+  local_buffer_size: 68719476736
+
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-thinking-harbor-bbh-async-smoke-tq-simple
+
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-thinking-harbor-bbh-async-smoke-tq-simple
+  wandb:
+    name: grpo-qwen3-30ba3b-thinking-harbor-bbh-async-smoke-tq-simple

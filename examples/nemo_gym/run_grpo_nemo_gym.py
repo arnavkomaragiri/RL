@@ -66,6 +66,16 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     return args, overrides
 
 
+def _select_sync_trainer(master_config: MasterConfig):
+    """Select the legacy or TransferQueue synchronous GRPO trainer."""
+    dp_cfg = master_config.data_plane or {}
+    if dp_cfg.get("enabled", False):
+        from nemo_rl.algorithms.grpo_sync import grpo_train_sync
+
+        return grpo_train_sync
+    return grpo_train
+
+
 # These types are directly imported from grpo_train since if something about the architecture changes we want to immediately fail.
 def collect_trajectories(
     policy: ColocatablePolicyInterface,
@@ -317,10 +327,12 @@ The validation set you pass in will directly be used for validation with no addi
             alias_to_group_alias=alias_to_group_alias,
         )
     else:
-        print("🚀 Running synchronous GRPO training")
+        trainer = _select_sync_trainer(master_config)
+        trainer_name = "TransferQueue" if trainer is not grpo_train else "legacy"
+        print(f"🚀 Running synchronous GRPO training ({trainer_name})")
 
         # Run standard GRPO training
-        grpo_train(
+        trainer(
             policy,
             policy_generation,
             dataloader,

@@ -1497,7 +1497,8 @@ def _tensorize_by_key(message_logs: list, key: str):
         return
 
     for m in message_logs:
-        m[key] = torch.tensor(m[key])
+        if not torch.is_tensor(m[key]):
+            m[key] = torch.tensor(m[key])
 
 
 @dataclass
@@ -2056,6 +2057,12 @@ def _tensorize_nemo_gym_result(result: dict) -> None:
         ],
         "generation_logprobs",
     )
+    for message_log in result.get("training_message_logs", []):
+        _tensorize_by_key(message_log, "token_ids")
+        _tensorize_by_key(
+            [message for message in message_log if message["role"] == "assistant"],
+            "generation_logprobs",
+        )
 
 
 async def run_async_nemo_gym_rollout(
@@ -2523,6 +2530,12 @@ def _postprocess_single_nemo_gym_group(
         {
             "agent_ref": [r["agent_ref"] for r in results],
             "message_log": [r["message_log"] for r in results],
+            # One list of exact model-call sequences per logical rollout. GRPO
+            # keeps the outer rollout row for reward/advantage grouping and only
+            # concatenates these calls when constructing policy inputs.
+            "training_message_logs": [
+                r.get("training_message_logs", [r["message_log"]]) for r in results
+            ],
             # length is used downstream for mean_prompt_length
             "length": torch.tensor(
                 [len(r["input_message_log"][0]["token_ids"]) for r in results]

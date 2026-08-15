@@ -73,6 +73,10 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
+from nemo_rl.data.packed_rollouts import (
+    PACKED_ATTENTION_SEGMENT_LENGTHS,
+    validate_packed_attention_segment_lengths,
+)
 from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -2037,10 +2041,40 @@ def _build_async_grpo_train_data(
         }
     )
     _preserve_router_replay_routed_experts(train_data, flat_messages, policy_config)
+    if PACKED_ATTENTION_SEGMENT_LENGTHS in repeated_batch:
+        segment_lengths = repeated_batch[PACKED_ATTENTION_SEGMENT_LENGTHS]
+        validate_packed_attention_segment_lengths(segment_lengths, input_lengths)
+        train_data[PACKED_ATTENTION_SEGMENT_LENGTHS] = segment_lengths
     # update multimodal data unconditionally
     extra_multimodal_data = flat_messages.get_multimodal_dict(as_tensors=False)
     train_data.update(extra_multimodal_data)
     return train_data
+
+
+def _use_exact_nemo_gym_call_sequences(repeated_batch: BatchedDataDict) -> None:
+    """Concatenate exact calls per rollout and retain their attention boundaries."""
+    training_message_logs = repeated_batch.get("training_message_logs")
+    if training_message_logs is None:
+        return
+
+    combined_message_logs = []
+    segment_lengths = []
+    for rollout_calls in training_message_logs:
+        if not rollout_calls:
+            raise ValueError("NeMo-Gym produced no exact training calls for a rollout")
+        combined = []
+        lengths = []
+        for call in rollout_calls:
+            length = sum(len(message["token_ids"]) for message in call)
+            if length <= 0:
+                raise ValueError("NeMo-Gym produced an empty exact training call")
+            combined.extend(call)
+            lengths.append(length)
+        combined_message_logs.append(combined)
+        segment_lengths.append(lengths)
+
+    repeated_batch["message_log"] = combined_message_logs
+    repeated_batch[PACKED_ATTENTION_SEGMENT_LENGTHS] = segment_lengths
 
 
 def _apply_mask_sample_filter(repeated_batch: BatchedDataDict[DatumSpec]) -> int:
@@ -3047,6 +3081,7 @@ def grpo_train(
                     del std
 
                 with timer.time("data_processing"):
+                    _use_exact_nemo_gym_call_sequences(repeated_batch)
                     use_overlong_filtering = master_config.grpo.overlong_filtering
                     if use_overlong_filtering:
                         loss_multiplier = repeated_batch["loss_multiplier"].clone()
@@ -3085,6 +3120,14 @@ def grpo_train(
                             "sample_mask": repeated_batch["loss_multiplier"],
                         }
                     )
+                    if PACKED_ATTENTION_SEGMENT_LENGTHS in repeated_batch:
+                        segment_lengths = repeated_batch[
+                            PACKED_ATTENTION_SEGMENT_LENGTHS
+                        ]
+                        validate_packed_attention_segment_lengths(
+                            segment_lengths, input_lengths
+                        )
+                        train_data[PACKED_ATTENTION_SEGMENT_LENGTHS] = segment_lengths
                     # this will be mini-batched inside the policy, so maintain the packed multimodal structure
                     # This is also used to populate part of the downstream logprob calculation data
                     extra_multimodal_data = flat_messages.get_multimodal_dict(
@@ -4541,6 +4584,7 @@ def async_grpo_train(
 
                 # Prepare training data (same as sync version)
                 with timer.time("data_processing"):
+                    _use_exact_nemo_gym_call_sequences(repeated_batch)
                     # Apply overlong filtering - mask out truncated sequences from loss computation
                     with timer.time("overlong_filter"):
                         use_overlong_filtering = master_config.grpo.overlong_filtering

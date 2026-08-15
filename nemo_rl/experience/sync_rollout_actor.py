@@ -43,6 +43,7 @@ import numpy as np
 import ray
 import torch
 
+from nemo_rl.data.packed_rollouts import PACKED_ATTENTION_SEGMENT_LENGTHS
 from nemo_rl.data_plane.column_io import kv_first_write
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
@@ -214,6 +215,7 @@ class SyncRolloutActor:
         from nemo_rl.algorithms.grpo import (
             _should_use_async_rollouts,
             _should_use_nemo_gym,
+            _use_exact_nemo_gym_call_sequences,
         )
         from nemo_rl.algorithms.utils import get_gdpo_reward_component_keys
         from nemo_rl.data.llm_message_utils import (
@@ -282,8 +284,20 @@ class SyncRolloutActor:
         # Flatten message_log → bulk tensors + extract original prompt ids.
         # GRPO masks only generated assistant turns, even if the dataset
         # prompt itself contains assistant messages as conversation history.
+        message_logs_for_training = fb["message_log"]
+        packed_segment_lengths = None
+        if partition_id == "train" and "training_message_logs" in fb:
+            exact_batch = BatchedDataDict[Any](
+                {
+                    "message_log": list(fb["message_log"]),
+                    "training_message_logs": fb["training_message_logs"],
+                }
+            )
+            _use_exact_nemo_gym_call_sequences(exact_batch)
+            message_logs_for_training = exact_batch["message_log"]
+            packed_segment_lengths = exact_batch[PACKED_ATTENTION_SEGMENT_LENGTHS]
         flat, input_lengths, prompt_flat = _flatten_rollout_message_log_for_tq(
-            fb["message_log"],
+            message_logs_for_training,
             fb["length"],
             pad_token_id=self.tokenizer.pad_token_id,
             make_sequence_length_divisible_by=cfg.policy[
@@ -335,7 +349,11 @@ class SyncRolloutActor:
         # decomposed fields above (per-row pickle of dict-with-tensors
         # would smuggle aliased views into the wire).
         for k, v in fb.items():
-            if isinstance(v, torch.Tensor) or k in bulk_batch or k == "message_log":
+            if (
+                isinstance(v, torch.Tensor)
+                or k in bulk_batch
+                or k in {"message_log", "training_message_logs"}
+            ):
                 continue
             bulk_batch[k] = (
                 v
@@ -397,12 +415,15 @@ class SyncRolloutActor:
         uids = [str(uuid.uuid4()) for _ in range(n_prompts)]
         sample_ids = [f"{uid}_g{i}" for uid in uids for i in range(n_per_prompt)]
         trace_rollout_payload(keys=sample_ids, data=bulk_batch)
+        extra_info = {"rollout_metrics": rollout_metrics}
+        if packed_segment_lengths is not None:
+            extra_info[PACKED_ATTENTION_SEGMENT_LENGTHS] = packed_segment_lengths
         meta = kv_first_write(
             bulk_batch,
             sample_ids=sample_ids,
             dp_client=self._dp_client,
             partition_id=partition_id,
-            extra_info={"rollout_metrics": rollout_metrics},
+            extra_info=extra_info,
             task_name=partition_id,
             pad_to_multiple=int(
                 cfg.policy.get("make_sequence_length_divisible_by") or 1
