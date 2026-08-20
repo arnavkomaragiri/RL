@@ -1214,6 +1214,244 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
     assert rollout_results[-1].rollout_metrics["timing/rollout/total"] == 4.0
 
 
+def test_run_async_nemo_gym_rollout_omits_failed_prompt_group():
+    class _ReadyRef:
+        def __init__(self, value):
+            self.value = value
+
+        def __await__(self):
+            async def _resolve():
+                return self.value
+
+            return _resolve().__await__()
+
+    class _AsyncStream:
+        def __init__(self, values):
+            self.values = iter(values)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self.values)
+            except StopIteration as error:
+                raise StopAsyncIteration from error
+
+    failure = rollouts_mod.NemoGymRolloutFailure(
+        failure_class="harbor_failed",
+        error="sandbox upload failed",
+        full_result={"reward": 0.0},
+    )
+
+    class _RunRolloutsRemote:
+        def options(self, *, num_returns):
+            assert num_returns == "streaming"
+            return self
+
+        def remote(self, rows, tokenizer, timer_prefix):
+            del rows, tokenizer, timer_prefix
+            return _AsyncStream(
+                [
+                    _ReadyRef((0, failure, None)),
+                    _ReadyRef((1, failure, {"timing/remote": 1.0})),
+                ]
+            )
+
+    rows = [
+        {
+            "agent_ref": {"name": "agent"},
+            "responses_create_params": {},
+            "_ng_task_index": 10,
+        }
+        for _ in range(2)
+    ]
+    input_batch = BatchedDataDict(
+        {
+            "extra_env_info": rows,
+            "message_log": [[{"role": "user", "content": "prompt"}]] * 2,
+            "loss_multiplier": torch.ones(2),
+        }
+    )
+
+    async def _collect():
+        return [
+            result
+            async for result in run_async_nemo_gym_rollout(
+                policy_generation=type(
+                    "_PolicyGeneration",
+                    (),
+                    {"cfg": {"vllm_cfg": {"max_model_len": 128}}},
+                )(),
+                input_batch=input_batch,
+                tokenizer=None,
+                task_to_env={
+                    "nemo_gym": type(
+                        "_Environment",
+                        (),
+                        {"run_rollouts": _RunRolloutsRemote()},
+                    )()
+                },
+                generation_config={
+                    "stop_strings": [],
+                    "stop_token_ids": [],
+                    "top_k": None,
+                    "temperature": 1.0,
+                    "top_p": 1.0,
+                    "val_temperature": 1.0,
+                    "val_top_p": 1.0,
+                    "val_top_k": None,
+                    "max_new_tokens": 32,
+                },
+                num_generations=2,
+                log_full_result_tables=False,
+            )
+        ]
+
+    assert asyncio.run(_collect()) == []
+
+
+def test_run_async_nemo_gym_rollout_retries_only_failed_row(monkeypatch):
+    class _ReadyRef:
+        def __init__(self, value):
+            self.value = value
+
+        def __await__(self):
+            async def _resolve():
+                return self.value
+
+            return _resolve().__await__()
+
+    class _AsyncStream:
+        def __init__(self, values):
+            self.values = iter(values)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self.values)
+            except StopIteration as error:
+                raise StopAsyncIteration from error
+
+    failure = rollouts_mod.NemoGymRolloutFailure(
+        failure_class="sandbox_lifecycle_reset",
+        error="command state disappeared",
+        full_result={"reward": 0.0},
+    )
+    calls = []
+
+    def successful_result(rowidx):
+        return {
+            "rowidx": rowidx,
+            "input_message_log": [{"role": "user", "token_ids": [1]}],
+            "message_log": [
+                {
+                    "role": "assistant",
+                    "token_ids": [rowidx + 2],
+                    "generation_logprobs": [0.0],
+                }
+            ],
+        }
+
+    class _RunRolloutsRemote:
+        def options(self, *, num_returns):
+            assert num_returns == "streaming"
+            return self
+
+        def remote(self, rows, tokenizer, timer_prefix):
+            del tokenizer, timer_prefix
+            row_indices = [row["_rowidx"] for row in rows]
+            calls.append(row_indices)
+            if len(calls) == 1:
+                return _AsyncStream(
+                    [
+                        _ReadyRef((0, successful_result(0), None)),
+                        _ReadyRef((1, failure, None)),
+                    ]
+                )
+            assert row_indices == [1]
+            return _AsyncStream(
+                [_ReadyRef((1, successful_result(1), {"timing/remote": 1.0}))]
+            )
+
+    rows = [
+        {
+            "agent_ref": {"name": "agent"},
+            "responses_create_params": {},
+            "_ng_task_index": 10,
+        }
+        for _ in range(2)
+    ]
+    input_batch = BatchedDataDict(
+        {
+            "extra_env_info": rows,
+            "message_log": [[{"role": "user", "content": "prompt"}]] * 2,
+            "loss_multiplier": torch.ones(2),
+        }
+    )
+
+    def _postprocess_group(**kwargs):
+        assert [result["rowidx"] for result in kwargs["results"]] == [0, 1]
+        return rollouts_mod.NemoGymRolloutResult(
+            input_ids=torch.empty(0),
+            final_batch=kwargs["input_batch"],
+            rollout_metrics={},
+            task_index=10,
+        )
+
+    async def _no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(
+        rollouts_mod, "_postprocess_single_nemo_gym_group", _postprocess_group
+    )
+    monkeypatch.setattr(rollouts_mod.asyncio, "sleep", _no_sleep)
+
+    async def _collect():
+        return [
+            result
+            async for result in run_async_nemo_gym_rollout(
+                policy_generation=type(
+                    "_PolicyGeneration",
+                    (),
+                    {"cfg": {"vllm_cfg": {"max_model_len": 128}}},
+                )(),
+                input_batch=input_batch,
+                tokenizer=None,
+                task_to_env={
+                    "nemo_gym": type(
+                        "_Environment",
+                        (),
+                        {"run_rollouts": _RunRolloutsRemote()},
+                    )()
+                },
+                generation_config={
+                    "stop_strings": [],
+                    "stop_token_ids": [],
+                    "top_k": None,
+                    "temperature": 1.0,
+                    "top_p": 1.0,
+                    "val_temperature": 1.0,
+                    "val_top_p": 1.0,
+                    "val_top_k": None,
+                    "max_new_tokens": 32,
+                },
+                num_generations=2,
+                log_full_result_tables=False,
+                max_row_retries=1,
+            )
+        ]
+
+    results = asyncio.run(_collect())
+
+    assert calls == [[0, 1], [1]]
+    assert len(results) == 1
+    assert results[0].rollout_metrics["nemo_gym/row_retries_launched"] == 1.0
+    assert results[0].rollout_metrics["nemo_gym/row_retries_exhausted"] == 0.0
+
+
 def test_prepare_nemo_gym_rows_stamps_task_relative_rollout_indices():
     rows = [
         {
@@ -1264,6 +1502,30 @@ def test_nemo_gym_stream_accumulator_validates_rows_and_completion():
         ).add(2, {"row": 2})
 
 
+def test_nemo_gym_stream_accumulator_isolates_failed_prompt_group():
+    accumulator = rollouts_mod._NemoGymStreamAccumulator(
+        rows=[
+            {"agent_ref": {"name": "agent"}},
+            {"agent_ref": {"name": "agent"}},
+            {"agent_ref": {"name": "agent"}},
+            {"agent_ref": {"name": "agent"}},
+        ],
+        num_generations=2,
+        allow_mixed_agents=False,
+    )
+
+    assert accumulator.add(0, {"row": 0}) is None
+    accumulator.add_failure(1)
+    assert accumulator.add(2, {"row": 2}) is None
+    completed = accumulator.add(3, {"row": 3})
+
+    assert accumulator.has_failures
+    assert completed is not None
+    assert completed.group_index == 1
+    assert completed.results == [{"row": 2}, {"row": 3}]
+    accumulator.finish()
+
+
 def test_nemo_gym_stream_accumulator_rejects_mixed_agent_group():
     accumulator = rollouts_mod._NemoGymStreamAccumulator(
         rows=[
@@ -1286,7 +1548,7 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
         {"agent_ref": {"name": "agent"}, "_ng_task_index": 42},
     ]
     results = []
-    for reward in (1.0, 2.0):
+    for index, reward in enumerate((1.0, 2.0)):
         input_message = {
             "role": "user",
             "content": "prompt",
@@ -1304,7 +1566,11 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
                         "generation_logprobs": torch.tensor([-0.1]),
                     },
                 ],
-                "full_result": {"reward": reward},
+                "full_result": {
+                    "reward": reward,
+                    "policy_honeypot_accessed": index == 1,
+                    "policy_honeypot_access_event_count": index * 3,
+                },
             }
         )
 
@@ -1325,6 +1591,11 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
 
     assert rollout_result.task_index == 42
     assert rollout_result.final_batch["total_reward"].tolist() == [1.0, 2.0]
+    assert rollout_result.rollout_metrics["agent/policy_honeypot_accessed/mean"] == 0.5
+    assert (
+        rollout_result.rollout_metrics["agent/policy_honeypot_access_event_count/mean"]
+        == 1.5
+    )
     assert (
         "agent/full_result" in rollout_result.rollout_metrics
     ) is log_full_result_tables

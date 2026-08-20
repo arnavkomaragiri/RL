@@ -18,6 +18,7 @@ import sys
 import uuid
 from collections import Counter
 from collections.abc import AsyncGenerator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, NotRequired, Optional, TypedDict
 
@@ -64,6 +65,16 @@ DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
     "</function_call>",
 ]
 DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
+DEFAULT_MAX_ROLLOUT_RETRIES = 3
+
+
+@dataclass(frozen=True, kw_only=True)
+class NemoGymRolloutFailure:
+    """A row-level Gym failure that must not terminate the rollout stream."""
+
+    failure_class: str
+    error: str | None
+    full_result: dict[str, Any]
 
 
 def _has_nan_generation_logprobs(result: dict) -> bool:
@@ -125,6 +136,7 @@ class NemoGymConfig(TypedDict):
     # Forwarded from policy.tokenizer.use_fastokens so rollout actors patch their
     # tokenizer consistently with the driver. Defaults to off when absent.
     use_fastokens: NotRequired[bool]
+    max_rollout_retries: NotRequired[int]
     # Multimodal fields (populated by `setup_nemo_gym_config` when VLM is enabled).
     tokenizer_config: NotRequired[
         Optional[TokenizerConfig]
@@ -546,7 +558,7 @@ Depending on your data shape, you may want to change these values."""
         nemo_gym_examples: list[dict],
         tokenizer: PreTrainedTokenizerBase,
         timer_prefix: str,
-    ) -> AsyncGenerator[tuple[int, dict, dict | None], None]:
+    ) -> AsyncGenerator[tuple[int, dict | NemoGymRolloutFailure, dict | None], None]:
         """Stream postprocessed rollouts as NeMo-Gym tasks complete."""
         if not nemo_gym_examples:
             raise ValueError("NeMo-Gym rollout batch must not be empty")
@@ -571,6 +583,7 @@ Depending on your data shape, you may want to change these values."""
         # stamp the correlation id; without one an external harness's model calls reach the model
         # server uncorrelated (no /ng-rollout prefix) and nothing is captured.
         from nemo_gym.global_config import ROLLOUT_ID_KEY_NAME
+        from nemo_gym.rollout_collection import NG_FAILURE_CLASS_KEY
         from nemo_gym.token_id_capture import (
             TokenIdCaptureConfig,
             TokenCaptureStore,
@@ -632,6 +645,7 @@ Depending on your data shape, you may want to change these values."""
         rebuilt_rollouts = 0
         unbuilt_rollouts = 0
         masked_rollouts = 0
+        failure_counts: Counter[str] = Counter()
 
         num_results = 0
         for task in nemo_gym_result_iterator:
@@ -670,11 +684,29 @@ Depending on your data shape, you may want to change these values."""
                         unbuilt_rollouts += 1
 
             with timer.time(label=f"{timer_prefix}/postprocess_results"):
-                nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
-                    nemo_gym_result, tokenizer
-                )
-                if _has_nan_generation_logprobs(nemo_rl_result):
-                    raise RuntimeError("Generation logprobs contain NaN")
+                failure_class = nemo_gym_result.get(NG_FAILURE_CLASS_KEY)
+                if failure_class is not None:
+                    failure_counts[str(failure_class)] += 1
+                    nemo_rl_result: dict | NemoGymRolloutFailure = (
+                        NemoGymRolloutFailure(
+                            failure_class=str(failure_class),
+                            error=nemo_gym_result.get("error"),
+                            full_result=nemo_gym_result,
+                        )
+                    )
+                    print(
+                        "NeMo-Gym rollout row failed: "
+                        f"rowidx={nemo_gym_row['_rowidx']} "
+                        f"failure_class={failure_class!r} "
+                        f"error={nemo_gym_result.get('error')!r}",
+                        file=sys.stderr,
+                    )
+                else:
+                    nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
+                        nemo_gym_result, tokenizer
+                    )
+                    if _has_nan_generation_logprobs(nemo_rl_result):
+                        raise RuntimeError("Generation logprobs contain NaN")
 
             num_results += 1
             timing_metrics = None
@@ -695,6 +727,13 @@ Depending on your data shape, you may want to change these values."""
                         masked_rollouts,
                     )
                 )
+                timing_metrics[f"{timer_prefix}/failed_rows"] = float(
+                    sum(failure_counts.values())
+                )
+                for failure_class, count in failure_counts.items():
+                    timing_metrics[f"{timer_prefix}/failure_class/{failure_class}"] = (
+                        float(count)
+                    )
 
             agent_name = nemo_gym_row["agent_ref"]["name"]
             counts_left[agent_name] -= 1
@@ -727,9 +766,7 @@ Depending on your data shape, you may want to change these values."""
         # Responses payload. Convert those calls separately; concatenating their
         # message logs happens later, together with explicit attention boundaries.
         training_message_logs = []
-        for training_response in nemo_gym_result.get(
-            "_ng_training_responses", []
-        ):
+        for training_response in nemo_gym_result.get("_ng_training_responses", []):
             call_result = self._postprocess_nemo_gym_to_nemo_rl_result(
                 {
                     "response": training_response,
@@ -1043,6 +1080,7 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
     # sampling_overrides). The vLLM generation worker asserts requests match this config, so
     # pinning here is required, not optional, for captured rollouts to stay on-policy.
     nemo_gym_cfg = config.env["nemo_gym"]
+    nemo_gym_cfg.setdefault("max_rollout_retries", DEFAULT_MAX_ROLLOUT_RETRIES)
     nemo_gym_cfg["policy_generation_temperature"] = generation_config["temperature"]
     nemo_gym_cfg["policy_generation_top_p"] = generation_config["top_p"]
 

@@ -19,7 +19,7 @@ import concurrent.futures
 import threading as _threading
 import time
 from collections import defaultdict
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from typing import Any, Optional, cast
 
 import ray
@@ -32,6 +32,7 @@ from nemo_rl.algorithms.opd import resolve_reference_aliases, teacher_seq_pad_mu
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.nemo_gym import DEFAULT_MAX_ROLLOUT_RETRIES
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
@@ -45,7 +46,7 @@ from nemo_rl.utils.logger import should_log_nemo_gym_full_result_tables
 from nemo_rl.utils.timer import ThreadSafeTimer
 
 TokenizerType = PreTrainedTokenizerBase
-_MAX_NEMO_GYM_STREAM_RETRIES = 3
+_MAX_NEMO_GYM_STREAM_RETRIES = 1
 _NEMO_GYM_RETRY_DELAY_BASE_SECONDS = 1.0
 _REPLAY_BUFFER_MAX_BACKOFF_SECONDS = 0.5
 
@@ -113,9 +114,17 @@ class AsyncTrajectoryCollector:
         self._generation_limit_cleared = _threading.Event()
         self._generation_limit_cleared.set()  # Start in cleared state
 
+        # Batch workers remain concurrent, but environment submissions pass
+        # through this chronological ticket gate. A ticket advances only after
+        # the current worker has issued its backend call.
+        self._dispatch_condition = _threading.Condition()
+        self._next_dispatch_sequence = 0
+        self._issued_dispatch_sequence = 0
+        self._finished_dispatch_sequences: set[int] = set()
+
         # Track threads
         self._inflight_threads: set[_threading.Thread] = set()
-        self._threads_lock: _threading.Lock = _threading.Lock()
+        self._threads_lock = _threading.Lock()
 
         # Simple lock to prevent race conditions when checking/spawning workers
         self._generation_check_lock: _threading.Lock = _threading.Lock()
@@ -430,31 +439,18 @@ class AsyncTrajectoryCollector:
                 self._stamp_nemo_gym_task_indices(rollout_batch)
             repeated_batch = rollout_batch.repeat_interleave(num_generations)
 
-            def _run_rollout_batch() -> None:
-                asyncio.run(
-                    self._run_rollout_batch_worker(
-                        repeated_batch=repeated_batch,
-                        generation_weight_version=generation_weight_version,
-                        target_weight_version=reserved_target,
-                        num_generations=num_generations,
-                        use_nemo_gym=use_nemo_gym,
-                    )
-                )
-
-            worker = _threading.Thread(target=_run_rollout_batch, daemon=True)
-            try:
-                with self._threads_lock:
-                    self._inflight_threads.add(worker)
-                worker.start()
-                worker_started = True
-            except Exception:
-                with self._threads_lock:
-                    self._inflight_threads.discard(worker)
-                raise
+            self._submit_rollout_batch(
+                repeated_batch=repeated_batch,
+                generation_weight_version=generation_weight_version,
+                target_weight_version=reserved_target,
+                num_generations=num_generations,
+                use_nemo_gym=use_nemo_gym,
+            )
+            worker_started = True
 
             backend = "NeMo-Gym" if use_nemo_gym else "native"
             print(
-                f"📊 Started one {backend} batch worker for "
+                f"📊 Submitted one {backend} batch for "
                 f"{num_prompts_to_generate} prompt groups at "
                 f"target_weight={reserved_target}"
             )
@@ -572,11 +568,8 @@ class AsyncTrajectoryCollector:
         start_time = time.time()
 
         while True:
+            self._cleanup_finished_threads()
             with self._threads_lock:
-                finished = {t for t in self._inflight_threads if not t.is_alive()}
-                for t in finished:
-                    self._inflight_threads.remove(t)
-
                 pending_count = len(self._inflight_threads)
 
             if pending_count == 0:
@@ -609,11 +602,65 @@ class AsyncTrajectoryCollector:
         """Get collector-side rollout state for checkpointing."""
         return {NEXT_NEMO_GYM_TASK_INDEX_KEY: self._next_nemo_gym_task_index}
 
+    def _submit_rollout_batch(
+        self,
+        *,
+        repeated_batch: BatchedDataDict[DatumSpec],
+        generation_weight_version: int,
+        target_weight_version: int,
+        num_generations: int,
+        use_nemo_gym: bool,
+    ) -> None:
+        """Start one worker whose environment submission has a FIFO ticket."""
+        with self._dispatch_condition:
+            dispatch_sequence = self._issued_dispatch_sequence
+            self._issued_dispatch_sequence += 1
+
+        def _run_rollout_batch() -> None:
+            self._wait_for_dispatch_turn(dispatch_sequence)
+            asyncio.run(
+                self._run_rollout_batch_worker(
+                    repeated_batch=repeated_batch,
+                    generation_weight_version=generation_weight_version,
+                    target_weight_version=target_weight_version,
+                    num_generations=num_generations,
+                    use_nemo_gym=use_nemo_gym,
+                    dispatch_sequence=dispatch_sequence,
+                )
+            )
+
+        worker = _threading.Thread(target=_run_rollout_batch, daemon=True)
+        try:
+            with self._threads_lock:
+                self._inflight_threads.add(worker)
+            worker.start()
+        except Exception:
+            with self._threads_lock:
+                self._inflight_threads.discard(worker)
+            self._finish_dispatch_sequence(dispatch_sequence)
+            raise
+
+    def _wait_for_dispatch_turn(self, dispatch_sequence: int) -> None:
+        with self._dispatch_condition:
+            self._dispatch_condition.wait_for(
+                lambda: dispatch_sequence == self._next_dispatch_sequence
+            )
+
+    def _finish_dispatch_sequence(self, dispatch_sequence: int) -> None:
+        """Advance past a submitted or cancelled chronological ticket."""
+        with self._dispatch_condition:
+            self._finished_dispatch_sequences.add(dispatch_sequence)
+            while self._next_dispatch_sequence in self._finished_dispatch_sequences:
+                self._finished_dispatch_sequences.remove(self._next_dispatch_sequence)
+                self._next_dispatch_sequence += 1
+            self._dispatch_condition.notify_all()
+
     def _cleanup_finished_threads(self) -> None:
         with self._threads_lock:
-            finished = {t for t in self._inflight_threads if not t.is_alive()}
-            for t in finished:
-                self._inflight_threads.remove(t)
+            finished = {
+                thread for thread in self._inflight_threads if not thread.is_alive()
+            }
+            self._inflight_threads.difference_update(finished)
 
     def _release_target(self, target_weight_version: int) -> None:
         """Release the reservation owned by a completed batch worker."""
@@ -741,6 +788,7 @@ class AsyncTrajectoryCollector:
         num_generations: int,
         use_nemo_gym: bool,
         task_index_to_group_index: dict[int, int],
+        on_dispatched: Callable[[], None],
     ) -> AsyncGenerator[RolloutGroupResult, None]:
         """Yield prompt groups from either backend through one result type."""
         if use_nemo_gym:
@@ -758,6 +806,14 @@ class AsyncTrajectoryCollector:
                 "stop_token_ids": None,
                 "stop_strings": None,
             }
+            nemo_gym_config = self.master_config.env.get("nemo_gym", {})
+            max_row_retries = int(
+                nemo_gym_config.get("max_rollout_retries", DEFAULT_MAX_ROLLOUT_RETRIES)
+            )
+            if max_row_retries < 0:
+                raise ValueError(
+                    "env.nemo_gym.max_rollout_retries must be non-negative"
+                )
             async for rollout_result in run_async_nemo_gym_rollout(
                 policy_generation=self.policy_generation,
                 input_batch=repeated_batch,
@@ -777,6 +833,8 @@ class AsyncTrajectoryCollector:
                 mask_env_flagged_samples=should_mask_flagged_samples(
                     self.master_config.env
                 ),
+                on_dispatched=on_dispatched,
+                max_row_retries=max_row_retries,
             ):
                 task_index = rollout_result.task_index
                 if task_index is None:
@@ -801,6 +859,7 @@ class AsyncTrajectoryCollector:
             num_generations=num_generations,
             max_rollout_turns=self.master_config.grpo.max_rollout_turns,
             greedy=False,
+            on_dispatched=on_dispatched,
         ):
             yield rollout_result
 
@@ -811,9 +870,20 @@ class AsyncTrajectoryCollector:
         target_weight_version: int,
         num_generations: int,
         use_nemo_gym: bool,
+        dispatch_sequence: int | None = None,
     ) -> None:
         """Own one target reservation while collecting its rollout batch."""
         worker_start = time.perf_counter()
+        dispatched = False
+
+        def on_dispatched() -> None:
+            nonlocal dispatched
+            if dispatched:
+                return
+            dispatched = True
+            if dispatch_sequence is not None:
+                self._finish_dispatch_sequence(dispatch_sequence)
+
         try:
             await self._collect_rollout_batch(
                 repeated_batch=repeated_batch,
@@ -821,6 +891,7 @@ class AsyncTrajectoryCollector:
                 target_weight_version=target_weight_version,
                 num_generations=num_generations,
                 use_nemo_gym=use_nemo_gym,
+                on_dispatched=on_dispatched,
             )
         except Exception as error:
             self._efficiency_timer.record(
@@ -835,6 +906,7 @@ class AsyncTrajectoryCollector:
 
             traceback.print_exc()
         finally:
+            on_dispatched()
             self._release_target(target_weight_version)
             with self._threads_lock:
                 self._inflight_threads.discard(_threading.current_thread())
@@ -972,6 +1044,7 @@ class AsyncTrajectoryCollector:
         target_weight_version: int,
         num_generations: int,
         use_nemo_gym: bool,
+        on_dispatched: Callable[[], None] = lambda: None,
     ) -> None:
         """Run one backend batch and enqueue every completed prompt group."""
         collection_started_at = time.perf_counter()
@@ -990,15 +1063,30 @@ class AsyncTrajectoryCollector:
         last_error: Exception | None = None
         max_attempts = 1 + (_MAX_NEMO_GYM_STREAM_RETRIES if use_nemo_gym else 0)
         for attempt in range(1, max_attempts + 1):
+            pending_before_attempt = expected_group_indices - buffered_group_indices
+            row_indices = [
+                row_index
+                for group_index in sorted(pending_before_attempt)
+                for row_index in range(
+                    group_index * num_generations,
+                    (group_index + 1) * num_generations,
+                )
+            ]
+            attempt_batch = (
+                repeated_batch.select_indices(row_indices)
+                if use_nemo_gym
+                else repeated_batch
+            )
             push_tasks: list[asyncio.Task[None]] = []
             scheduled_group_indices: set[int] = set()
             stream_error: Exception | None = None
             try:
                 async for rollout_result in self._iter_rollout_groups(
-                    repeated_batch=repeated_batch,
+                    repeated_batch=attempt_batch,
                     num_generations=num_generations,
                     use_nemo_gym=use_nemo_gym,
                     task_index_to_group_index=task_index_to_group_index,
+                    on_dispatched=on_dispatched,
                 ):
                     group_index = rollout_result.group_index
                     if group_index not in expected_group_indices:
@@ -1051,7 +1139,7 @@ class AsyncTrajectoryCollector:
             retry_delay = _NEMO_GYM_RETRY_DELAY_BASE_SECONDS * (2 ** (attempt - 1))
             print(
                 "❌ NeMo-Gym batch did not complete prompt groups "
-                f"{sorted(pending_group_indices)}; retrying in "
+                f"{sorted(pending_group_indices)}; retrying only those groups in "
                 f"{retry_delay:.1f}s "
                 f"(attempt {attempt + 1}/{max_attempts})"
             )

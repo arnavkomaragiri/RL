@@ -1403,6 +1403,38 @@ class TestAsyncTrajectoryCollector:
 
         assert target_weight not in collector._generating_targets
 
+    def test_rollout_dispatch_gate_starts_batches_in_submission_order(self):
+        """Concurrent batches issue backend work in FIFO target order."""
+        collector = self.create_local_collector()
+        started_targets: list[int] = []
+        all_started = threading.Event()
+        release = threading.Event()
+
+        async def capture_batch(**kwargs):
+            started_targets.append(kwargs["target_weight_version"])
+            kwargs["on_dispatched"]()
+            if len(started_targets) == 3:
+                all_started.set()
+            while not release.is_set():
+                await asyncio.sleep(0.001)
+
+        collector._collect_rollout_batch = capture_batch
+        batch = self.create_mock_batch(size=1)
+        for target_weight in (0, 1, 2):
+            collector._submit_rollout_batch(
+                repeated_batch=batch,
+                generation_weight_version=0,
+                target_weight_version=target_weight,
+                num_generations=1,
+                use_nemo_gym=(target_weight % 2 == 0),
+            )
+
+        assert all_started.wait(timeout=1.0)
+        assert started_targets == [0, 1, 2]
+
+        release.set()
+        collector.wait_for_pending_generations()
+
     def test_process_batch_releases_target_when_worker_start_fails(self, monkeypatch):
         """Test start failures do not leave a target reserved forever."""
 
@@ -1426,16 +1458,6 @@ class TestAsyncTrajectoryCollector:
             def repeat_interleave(self, repeats):
                 return self
 
-        class FailingThread:
-            def __init__(self, *args, **kwargs):
-                pass
-
-            def start(self):
-                raise RuntimeError("thread start failed")
-
-            def is_alive(self):
-                return False
-
         target_weight = 5
         collector = self.create_local_collector(replay_buffer=FakeReplayBuffer())
         collector.running = True
@@ -1445,15 +1467,14 @@ class TestAsyncTrajectoryCollector:
             return target_weight
 
         collector._get_next_target_for_generation = reserve_target
-        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
-        monkeypatch.setattr(
-            trajectory_collector_mod._threading,
-            "Thread",
-            FailingThread,
+        collector._submit_rollout_batch = mock.Mock(
+            side_effect=RuntimeError("dispatch submission failed")
         )
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
 
         collector._process_batch(FakeBatch())
 
+        collector._submit_rollout_batch.assert_called_once()
         assert target_weight not in collector._generating_targets
 
     def test_process_batch_gap_fill_spawns_only_needed(self, monkeypatch):
@@ -1471,20 +1492,6 @@ class TestAsyncTrajectoryCollector:
                 # Batch has 2 prompts, but only 1 more trajectory is needed.
                 self.get_trajectories_needed = RemoteMethod(1)
 
-        started = []
-
-        class RecordingThread:
-            def __init__(self, *, target, daemon):
-                assert daemon
-                self.target = target
-
-            def start(self):
-                started.append(self)
-                self.target()
-
-            def is_alive(self):
-                return False
-
         target_weight = 7
         collector = self.create_local_collector(replay_buffer=FakeReplayBuffer())
         collector.running = True
@@ -1495,21 +1502,16 @@ class TestAsyncTrajectoryCollector:
 
         captured = {}
 
-        async def capture_batch(**kwargs):
+        def capture_batch(**kwargs):
             captured.update(kwargs)
             collector._release_target(target_weight)
 
         collector._get_next_target_for_generation = reserve_target
-        collector._run_rollout_batch_worker = capture_batch
+        collector._submit_rollout_batch = capture_batch
         monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
-        monkeypatch.setattr(
-            trajectory_collector_mod._threading, "Thread", RecordingThread
-        )
 
         collector._process_batch(self.create_mock_batch(size=2))
 
-        # Only one worker spawned even though the batch holds 2 prompts.
-        assert len(started) == 1
         assert captured["repeated_batch"].size == 3
         assert captured["use_nemo_gym"] is False
         assert target_weight not in collector._generating_targets
@@ -1524,20 +1526,6 @@ class TestAsyncTrajectoryCollector:
         class FakeReplayBuffer:
             get_trajectories_needed = RemoteMethod()
 
-        started_threads = []
-
-        class RecordingThread:
-            def __init__(self, *, target, daemon):
-                assert daemon
-                self.target = target
-
-            def start(self):
-                started_threads.append(self)
-                self.target()
-
-            def is_alive(self):
-                return False
-
         target_weight = 9
         collector = self.create_local_collector(
             replay_buffer=FakeReplayBuffer(), next_nemo_gym_task_index=37
@@ -1549,21 +1537,17 @@ class TestAsyncTrajectoryCollector:
             collector._generating_targets.add(target_weight)
             return target_weight
 
-        async def capture_batch(**kwargs):
+        def capture_batch(**kwargs):
             captured.update(kwargs)
             collector._release_target(target_weight)
 
         collector._get_next_target_for_generation = reserve_target
-        collector._run_rollout_batch_worker = capture_batch
+        collector._submit_rollout_batch = capture_batch
         monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
         monkeypatch.setattr(grpo_mod, "_should_use_nemo_gym", lambda config: True)
-        monkeypatch.setattr(
-            trajectory_collector_mod._threading, "Thread", RecordingThread
-        )
 
         collector._process_batch(self.create_mock_batch(size=2))
 
-        assert len(started_threads) == 1
         assert captured["use_nemo_gym"] is True
         assert captured["num_generations"] == 3
         assert captured["repeated_batch"].size == 6
@@ -1584,20 +1568,6 @@ class TestAsyncTrajectoryCollector:
         class FakeReplayBuffer:
             get_trajectories_needed = RemoteMethod()
 
-        started_threads = []
-
-        class RecordingThread:
-            def __init__(self, *, target, daemon):
-                assert daemon
-                self.target = target
-
-            def start(self):
-                started_threads.append(self)
-                self.target()
-
-            def is_alive(self):
-                return False
-
         target_weight = 11
         collector = self.create_local_collector(replay_buffer=FakeReplayBuffer())
         collector.running = True
@@ -1608,21 +1578,17 @@ class TestAsyncTrajectoryCollector:
 
         captured = {}
 
-        async def capture_batch(**kwargs):
+        def capture_batch(**kwargs):
             captured.update(kwargs)
             collector._release_target(target_weight)
 
         collector._get_next_target_for_generation = reserve_target
-        collector._run_rollout_batch_worker = capture_batch
+        collector._submit_rollout_batch = capture_batch
         monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
         monkeypatch.setattr(grpo_mod, "_should_use_nemo_gym", lambda config: False)
-        monkeypatch.setattr(
-            trajectory_collector_mod._threading, "Thread", RecordingThread
-        )
 
         collector._process_batch(self.create_mock_batch(size=2))
 
-        assert len(started_threads) == 1
         assert captured["repeated_batch"].size == 6
         assert captured["num_generations"] == 3
         assert captured["use_nemo_gym"] is False
@@ -1815,9 +1781,16 @@ class TestAsyncTrajectoryCollector:
             assert kwargs["generation_config"]["stop_strings"] is None
             assert kwargs["log_full_result_tables"] is False
             rollout_calls += 1
-            yield _rollout_result(7)
+            task_indices = {
+                row["_ng_task_index"] for row in kwargs["input_batch"]["extra_env_info"]
+            }
             if rollout_calls == 1:
+                assert task_indices == {7, 8}
+                yield _rollout_result(7)
                 raise RuntimeError("transient stream failure")
+
+            assert task_indices == {8}
+            assert kwargs["input_batch"].size == 2
             yield _rollout_result(8)
 
         async def no_sleep(delay):

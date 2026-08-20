@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import json
 import time
 from copy import deepcopy
@@ -30,6 +31,7 @@ from nemo_rl.environments.nemo_gym import (
     _token_capture_metrics,
     NemoGym,
     NemoGymConfig,
+    NemoGymRolloutFailure,
     build_reward_component_columns,
     extract_reward_components,
     setup_nemo_gym_config,
@@ -62,6 +64,51 @@ def test_extract_reward_components():
     )
     assert components == {"correctness": 1.0, "format": 0.5}
     assert all(isinstance(v, float) for v in components.values())
+
+
+def test_run_rollouts_streams_structured_gym_failure_without_postprocessing():
+    row = {
+        "agent_ref": {"name": "agent"},
+        "responses_create_params": {"input": []},
+        "_rowidx": 0,
+    }
+    failure_result = {
+        "_ng_failure_class": "harbor_failed",
+        "error": "sandbox upload failed",
+        "reward": 0.0,
+    }
+
+    class _RolloutCollection:
+        def run_examples(self, examples, head_server_config):
+            assert examples == [row]
+            assert head_server_config is None
+
+            async def _result():
+                return row, failure_result
+
+            return [_result()]
+
+    class _Actor:
+        cfg = {"initial_global_config_dict": {}}
+        head_server_config = None
+        rch = _RolloutCollection()
+
+    async def _collect():
+        method = NemoGym.__ray_metadata__.modified_class.run_rollouts
+        return [
+            result async for result in method(_Actor(), [row], None, "timing/rollout")
+        ]
+
+    outputs = asyncio.run(_collect())
+
+    assert len(outputs) == 1
+    row_index, result, timing_metrics = outputs[0]
+    assert row_index == 0
+    assert isinstance(result, NemoGymRolloutFailure)
+    assert result.failure_class == "harbor_failed"
+    assert result.error == "sandbox upload failed"
+    assert result.full_result == failure_result
+    assert timing_metrics is not None
 
 
 def test_build_reward_component_columns():
