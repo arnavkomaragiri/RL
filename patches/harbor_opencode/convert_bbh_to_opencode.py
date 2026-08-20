@@ -56,29 +56,82 @@ RUBRIC_ADDITIONS = {
     ),
 }
 
+RUBRIC_TEXT_CORRECTIONS = {
+    "03db3687-1fcf-4c5c-8a2e-f779d7eb3cf0": {
+        "1 ponit: builds the weighted graph network object with residues as nodes "
+        "and contact frequencies as edge weights.": (
+            "1 point: Builds the weighted graph network object with residues as nodes "
+            "and contact frequencies as edge weights."
+        ),
+    },
+}
 
-def rubric_point_total(rubric: Any) -> int:
+# Source metadata corrections for rubrics whose declared maximum does not match
+# the itemized allocations after known text corrections and additions.
+RUBRIC_MAX_POINT_CORRECTIONS = {
+    "03db3687-1fcf-4c5c-8a2e-f779d7eb3cf0": 12,
+    "75adb693-e3d5-4f23-bd1d-d2341e209d66": 17,
+}
+
+RUBRIC_POINT_PATTERNS = (
+    re.compile(
+        r"^\s*(?:[*\-\u2022]\s*)?(?:\d+[.)]\s*)?(?:\*\*)?"
+        r"(\d+)\s*(?:points?|pts?)(?:\*\*)?\s*:",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^\s*(?:[*\-\u2022]\s*)?(?:\d+[.)]\s*)?.*?"
+        r"(?:\(\s*|[\-\u2013\u2014]\s*)(\d+)\s*(?:points?|pts?)\s*\)?\s*(?::|$)",
+        re.IGNORECASE,
+    ),
+)
+
+
+def rubric_item_points(rubric: Any) -> list[int]:
     if not isinstance(rubric, str) or not rubric.strip():
         raise ValueError("task has no rubric")
-    points = []
+    point_groups: list[list[int]] = [[] for _ in RUBRIC_POINT_PATTERNS]
     for line in rubric.splitlines():
-        match = re.match(r"\s*[*-]?\s*(\d+)\s+points?\s*:", line, re.IGNORECASE)
-        if match:
-            points.append(int(match.group(1)))
-    if not points:
+        for index, pattern in enumerate(RUBRIC_POINT_PATTERNS):
+            if match := pattern.match(line):
+                point_groups[index].append(int(match.group(1)))
+                break
+    populated_groups = [points for points in point_groups if points]
+    if not populated_groups:
         raise ValueError("rubric has no itemized point values")
-    return sum(points)
+    totals = {sum(points) for points in populated_groups}
+    if len(totals) != 1:
+        raise ValueError(
+            "rubric mixes incompatible prefix and heading point allocations: "
+            f"{sorted(totals)}"
+        )
+    # Some source rubrics repeat each allocation in a section heading and its
+    # nested bullet items. Prefer the finer prefix allocations when present;
+    # equal group totals describe the same score once.
+    return point_groups[0] or populated_groups[0]
+
+
+def rubric_point_total(rubric: Any) -> int:
+    return sum(rubric_item_points(rubric))
 
 
 def calibrate_rubric(task: dict[str, Any]) -> None:
     task_id = str(task.get("id", ""))
+    rubric = str(task.get("rubric", ""))
+    for original, replacement in RUBRIC_TEXT_CORRECTIONS.get(task_id, {}).items():
+        rubric = rubric.replace(original, replacement)
+    task["rubric"] = rubric
     addition = RUBRIC_ADDITIONS.get(task_id)
     if addition:
-        rubric = str(task.get("rubric", "")).rstrip()
+        rubric = rubric.rstrip()
         if addition not in rubric:
             task["rubric"] = f"{rubric}\n{addition}"
+    if task_id in RUBRIC_MAX_POINT_CORRECTIONS:
+        task["max_points"] = RUBRIC_MAX_POINT_CORRECTIONS[task_id]
     maximum = task.get("max_points")
-    total = rubric_point_total(task.get("rubric"))
+    item_points = rubric_item_points(task.get("rubric"))
+    task["rubric_item_points"] = item_points
+    total = sum(item_points)
     if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum != total:
         raise ValueError(
             f"rubric points do not match max_points for {task_id}: "
@@ -195,7 +248,11 @@ def render_judge_instruction(task: dict[str, Any]) -> str:
     return template
 
 
-def task_toml(source_config: dict[str, Any], task_id: str) -> str:
+def task_toml(
+    source_config: dict[str, Any],
+    *,
+    task_id: str,
+) -> str:
     environment = source_config.get("environment", {})
     agent = source_config.get("agent", {})
     image = environment.get("docker_image")
@@ -230,7 +287,11 @@ name = "rollout"
 """
 
 
-def write_task(source: Path, destination: Path, data_mode: str) -> None:
+def write_task(
+    source: Path,
+    destination: Path,
+    data_mode: str,
+) -> None:
     task_id = source.name.removeprefix(SOURCE_PREFIX)
     hidden = read_jsonl_record(source / "environment" / "task.jsonl")
     if str(hidden.get("id", "")) != task_id:
@@ -273,7 +334,27 @@ def write_task(source: Path, destination: Path, data_mode: str) -> None:
     (tests_dir / "task.json").write_text(
         json.dumps(hidden, indent=2, ensure_ascii=False) + "\n"
     )
-    (destination / "task.toml").write_text(task_toml(source_config, task_id))
+    (destination / "task.toml").write_text(
+        task_toml(
+            source_config,
+            task_id=task_id,
+        )
+    )
+
+
+def set_separate_verifier_environment(path: Path) -> None:
+    task_toml_path = path / "task.toml"
+    updated, replacements = re.subn(
+        r'(?m)^environment_mode = "(?:same|separate)"$',
+        'environment_mode = "separate"',
+        task_toml_path.read_text(),
+    )
+    if replacements != 1:
+        raise ValueError(
+            f"expected exactly one verifier environment_mode in {task_toml_path}, "
+            f"found {replacements}"
+        )
+    task_toml_path.write_text(updated)
 
 
 def refresh_task(path: Path) -> None:
@@ -289,6 +370,7 @@ def refresh_task(path: Path) -> None:
     (path / "steps" / "rollout" / "instruction.md").write_text(render_instruction(task))
     (tests_dir / "judge_instruction.md").write_text(render_judge_instruction(task))
     task_path.write_text(json.dumps(task, indent=2, ensure_ascii=False) + "\n")
+    set_separate_verifier_environment(path)
     validate_task(path)
 
 
@@ -315,8 +397,16 @@ def validate_task(path: Path) -> None:
         raise ValueError(f"MCP server remains configured in {path}")
     if "env" in config.get("environment", {}):
         raise ValueError(f"verifier credentials remain in policy environment: {path}")
+    if config.get("verifier", {}).get("environment_mode") != "separate":
+        raise ValueError(f"agentic verifier must use a separate environment in {path}")
     task = json.loads((path / "steps" / "rollout" / "tests" / "task.json").read_text())
-    total = rubric_point_total(task.get("rubric"))
+    item_points = rubric_item_points(task.get("rubric"))
+    if task.get("rubric_item_points") != item_points:
+        raise ValueError(
+            f"generated rubric_item_points do not match rubric in {path}: "
+            f"parsed={item_points}, stored={task.get('rubric_item_points')!r}"
+        )
+    total = sum(item_points)
     if total != task.get("max_points"):
         raise ValueError(
             f"generated rubric points do not match max_points in {path}: "
@@ -376,7 +466,11 @@ def main() -> int:
                     f"output exists (pass --overwrite): {destination}"
                 )
             shutil.rmtree(destination)
-        write_task(source, destination, args.data_mode)
+        write_task(
+            source,
+            destination,
+            args.data_mode,
+        )
         validate_task(destination)
         print(f"[{index}/{len(tasks)}] {source.name} -> {destination.name}")
 

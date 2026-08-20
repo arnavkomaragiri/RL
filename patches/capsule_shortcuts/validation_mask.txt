@@ -1,0 +1,6 @@
+# Capsule data cannot satisfy the generated task protocol.
+0923d260-fe1b-4fb4-4398-79edf546e584  # Missing genotype count matrix and metadata.
+1d54e4a7-8b0f-4224-bd31-efcfded0d46c  # Missing genomic and RNA-seq reads required by the protocol.
+a02b761a-02b6-46b5-9d5e-2964d5a74960  # Missing the required acute/chronic T-cell screen data.
+d37acffb-d802-4ce0-8caa-66f50667367a  # Has DE results, but no count matrix or sample metadata.
+40cbef03-b5c3-4448-b00f-0ba2965dea9b  # Has aggregate proteomics results, but no sample-level abundances.

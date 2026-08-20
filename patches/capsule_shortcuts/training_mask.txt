@@ -1,0 +1,12 @@
+# Capsules blocked until raw replacement data or rewritten tasks are available.
+# The all-copy 00f0346f protocol does not reproduce the expected direction;
+# a significant negative result requires an unstated complete-case filter.
+00f0346f-e1a0-4dde-9337-c7a912ad2b0b
+96df8728-b367-45b8-b5e2-ed6e9ee0d56f
+d4ec7768-d0de-4a4f-aae9-a7c16aa7dfaf
+6bfe94ee-e184-44df-abe2-d00cce381143
+42ae1fe4-e8fc-4328-973f-d67f2cd36906
+12eae66c-61bb-4b94-a537-300b1720f8de
+92b42904-3685-4139-b034-b694ff8e48f6
+bddcbae2-add1-4891-9ea0-9bc87ced9b83
+79843673-7806-4dd7-a946-36fd44988b91

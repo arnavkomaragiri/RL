@@ -35,6 +35,7 @@ class ScoreSolutionTest(unittest.TestCase):
         (self.app / "data" / "input.csv").write_bytes(contents)
         self.task = {
             "rubric": "* 1 point: Reproducible result.",
+            "rubric_item_points": [1],
             "max_points": 1,
             "input_file_manifest": [
                 {
@@ -81,6 +82,37 @@ class ScoreSolutionTest(unittest.TestCase):
         self.assertTrue(evaluation["submission"]["valid"])
         self.assertEqual(evaluation["submission"]["analysis_source"], [])
         self.assertEqual(evaluation["submission"]["generated_artifacts"], [])
+
+    def test_structured_rubric_points_do_not_parse_rubric_prose(self) -> None:
+        (self.app / "REPORT.md").write_text("# Result\n")
+        self.task["rubric"] = "Evaluate the result thoroughly."
+        (self.tests / "task.json").write_text(json.dumps(self.task))
+
+        result = self.scorer.score_solution(self.arguments())
+
+        self.assertEqual(result["reward"], 1.0)
+
+    def test_legacy_rubric_parser_accepts_converter_formats(self) -> None:
+        cases = (
+            ("* 1 point: Result.", [1]),
+            ("- **2 points**: Result.\n- **3 pts**: Conclusion.", [2, 3]),
+            ("1.\t1 point: Result.\n2. 2 points: Conclusion.", [1, 2]),
+            ("\u2022\t1 point: Result.\n\u2022 4 points: Conclusion.", [1, 4]),
+            ("Data preprocessing (2 pts)\nConclusion \u2013 3 points", [2, 3]),
+        )
+        for rubric, expected in cases:
+            with self.subTest(rubric=rubric):
+                self.assertEqual(self.scorer.rubric_item_points(rubric), expected)
+
+    def test_legacy_task_uses_rubric_parser_fallback(self) -> None:
+        (self.app / "REPORT.md").write_text("# Result\n")
+        del self.task["rubric_item_points"]
+        self.task["rubric"] = "- **1 point**: Reproducible result."
+        (self.tests / "task.json").write_text(json.dumps(self.task))
+
+        result = self.scorer.score_solution(self.arguments())
+
+        self.assertEqual(result["reward"], 1.0)
 
     def test_policy_integrity_failure_is_terminal_zero(self) -> None:
         result = self.scorer.score_solution(self.arguments())

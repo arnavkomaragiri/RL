@@ -13,11 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Minimal MCP/CLI score sink for the artifact-analysis judge agent."""
+"""Minimal MCP score sink for the artifact-analysis judge agent."""
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
 import os
@@ -67,6 +66,18 @@ EXCLUDED_PARTS = {
     "node_modules",
     "venv",
 }
+RUBRIC_POINT_PATTERNS = (
+    re.compile(
+        r"^\s*(?:[*\-\u2022]\s*)?(?:\d+[.)]\s*)?(?:\*\*)?"
+        r"(\d+)\s*(?:points?|pts?)(?:\*\*)?\s*:",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^\s*(?:[*\-\u2022]\s*)?(?:\d+[.)]\s*)?.*?"
+        r"(?:\(\s*|[\-\u2013\u2014]\s*)(\d+)\s*(?:points?|pts?)\s*\)?\s*(?::|$)",
+        re.IGNORECASE,
+    ),
+)
 
 
 class InvalidSubmissionError(ValueError):
@@ -122,14 +133,40 @@ def is_document(path: Path) -> bool:
 def rubric_item_points(rubric: Any) -> list[int]:
     if not isinstance(rubric, str) or not rubric.strip():
         raise ValueError("hidden task metadata has no rubric")
-    points = []
+    point_groups: list[list[int]] = [[] for _ in RUBRIC_POINT_PATTERNS]
     for line in rubric.splitlines():
-        match = re.match(r"\s*[*-]?\s*(\d+)\s+points?\s*:", line, re.IGNORECASE)
-        if match:
-            points.append(int(match.group(1)))
-    if not points:
+        for index, pattern in enumerate(RUBRIC_POINT_PATTERNS):
+            if match := pattern.match(line):
+                point_groups[index].append(int(match.group(1)))
+                break
+    populated_groups = [points for points in point_groups if points]
+    if not populated_groups:
         raise ValueError("rubric has no itemized point values")
-    return points
+    totals = {sum(points) for points in populated_groups}
+    if len(totals) != 1:
+        raise ValueError(
+            "rubric mixes incompatible prefix and heading point allocations: "
+            f"{sorted(totals)}"
+        )
+    return point_groups[0] or populated_groups[0]
+
+
+def task_rubric_item_points(task: dict[str, Any]) -> list[int]:
+    item_points = task.get("rubric_item_points")
+    if item_points is None:
+        return rubric_item_points(task.get("rubric"))
+    if (
+        not isinstance(item_points, list)
+        or not item_points
+        or any(
+            isinstance(points, bool) or not isinstance(points, int) or points <= 0
+            for points in item_points
+        )
+    ):
+        raise ValueError(
+            "hidden rubric_item_points must be a non-empty list of positive integers"
+        )
+    return item_points
 
 
 def validate_input_inventory(task: dict[str, Any]) -> list[str]:
@@ -256,7 +293,7 @@ def score_solution(arguments: dict[str, Any]) -> dict[str, Any]:
     if REWARD_PATH.exists():
         raise ValueError("score_solution has already been called successfully")
     task = json.loads(TASK_PATH.read_text())
-    item_maxima = rubric_item_points(task.get("rubric"))
+    item_maxima = task_rubric_item_points(task)
     if sum(item_maxima) != task.get("max_points"):
         raise ValueError("hidden rubric points do not match max_points")
     score, assessment = validate_assessment(arguments, item_maxima)
@@ -386,12 +423,6 @@ def serve_mcp() -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--submit-json", type=Path)
-    args = parser.parse_args()
-    if args.submit_json is not None:
-        print(json.dumps(score_solution(json.loads(args.submit_json.read_text()))))
-        return
     serve_mcp()
 
 
