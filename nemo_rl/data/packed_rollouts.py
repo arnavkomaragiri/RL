@@ -73,6 +73,8 @@ def validate_packed_attention_segment_lengths(
 def split_tensor_at_packed_attention_segments(
     tensor: torch.Tensor,
     segment_lengths: Sequence[Sequence[int]],
+    *,
+    output_sequence_length: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Split ``[rollout, token, ...]`` rows into padded per-call tensor rows."""
     segments: list[torch.Tensor] = []
@@ -88,6 +90,13 @@ def split_tensor_at_packed_attention_segments(
         raise ValueError("packed attention metadata produced no segments")
 
     max_length = max(lengths)
+    if output_sequence_length is not None:
+        if output_sequence_length < max_length:
+            raise ValueError(
+                "packed attention output_sequence_length cannot truncate calls: "
+                f"requested={output_sequence_length}, longest_call={max_length}"
+            )
+        max_length = output_sequence_length
     output = tensor.new_zeros((len(segments), max_length, *tensor.shape[2:]))
     for index, segment in enumerate(segments):
         output[index, : segment.shape[0]] = segment
@@ -96,6 +105,8 @@ def split_tensor_at_packed_attention_segments(
 
 def expand_batched_data_for_packed_attention(
     data: BatchedDataDict[Any],
+    *,
+    output_sequence_length: int | None = None,
 ) -> tuple[BatchedDataDict[Any], PackedAttentionLayout | None]:
     """Expand logical rollout rows into independently packable model-call rows."""
     if PACKED_ATTENTION_SEGMENT_LENGTHS not in data:
@@ -136,7 +147,9 @@ def expand_batched_data_for_packed_attention(
                 )
             elif value.ndim > 1 and value.shape[1] == input_ids.shape[1]:
                 expanded[key], _ = split_tensor_at_packed_attention_segments(
-                    value, segment_lengths
+                    value,
+                    segment_lengths,
+                    output_sequence_length=output_sequence_length,
                 )
             else:
                 expanded[key] = value.index_select(
@@ -155,8 +168,10 @@ def expand_selected_packed_attention_segments(
     data: BatchedDataDict[Any],
     segment_lengths: Sequence[Sequence[int]],
     selected_segments: Sequence[tuple[int, int]],
+    *,
+    output_sequence_length: int | None = None,
 ) -> BatchedDataDict[Any]:
-    """Expand logical rows, then retain selected ``(row, segment)`` calls.
+    """Materialize selected ``(row, segment)`` calls from logical rows.
 
     TQ presharding can place calls from one logical rollout on different DP
     ranks. Each rank fetches the owning logical rows once, expands them into
@@ -171,18 +186,20 @@ def expand_selected_packed_attention_segments(
     Returns:
         A batch containing one independently attended row per selected call.
     """
-    with_metadata = BatchedDataDict[Any](dict(data.items()))
-    with_metadata[PACKED_ATTENTION_SEGMENT_LENGTHS] = segment_lengths
-    expanded, layout = expand_batched_data_for_packed_attention(with_metadata)
-    assert layout is not None
+    if "input_ids" not in data or "input_lengths" not in data:
+        raise ValueError(
+            f"{PACKED_ATTENTION_SEGMENT_LENGTHS} requires input_ids and input_lengths"
+        )
+    input_ids = data["input_ids"]
+    if not torch.is_tensor(input_ids) or input_ids.ndim < 2:
+        raise ValueError("packed attention requires tensor input_ids with shape [B, S]")
+    input_ids_is_jagged = bool(input_ids.is_nested)
+    input_row_lengths = (
+        input_ids.offsets().diff() if input_ids_is_jagged else None
+    )
+    validate_packed_attention_segment_lengths(segment_lengths, data["input_lengths"])
 
-    row_offsets: list[int] = []
-    offset = 0
-    for row_segments in segment_lengths:
-        row_offsets.append(offset)
-        offset += len(row_segments)
-
-    selected_indices = []
+    selected: list[tuple[int, int, int]] = []
     for row_index, segment_index in selected_segments:
         if not 0 <= row_index < len(segment_lengths):
             raise ValueError(
@@ -193,11 +210,73 @@ def expand_selected_packed_attention_segments(
                 "packed attention selected segment is out of range: "
                 f"row={row_index}, segment={segment_index}"
             )
-        selected_indices.append(row_offsets[row_index] + segment_index)
+        length = segment_lengths[row_index][segment_index]
+        offset = sum(segment_lengths[row_index][:segment_index])
+        selected.append((row_index, offset, length))
 
-    if not selected_indices:
+    if not selected:
         raise ValueError("packed attention preshard selected no model calls")
-    return expanded.select_indices(selected_indices)
+
+    selected_lengths = [length for _, _, length in selected]
+    max_length = max(selected_lengths)
+    if output_sequence_length is not None:
+        if output_sequence_length < max_length:
+            raise ValueError(
+                "packed attention output_sequence_length cannot truncate calls: "
+                f"requested={output_sequence_length}, longest_call={max_length}"
+            )
+        max_length = output_sequence_length
+    parent_rows = torch.tensor([row for row, _, _ in selected], device=input_ids.device)
+
+    expanded = BatchedDataDict[Any]()
+    for key, value in data.items():
+        if isinstance(value, PackedTensor):
+            raise NotImplementedError(
+                "independent model-call packing does not yet support multimodal data"
+            )
+        if torch.is_tensor(value):
+            if key == "input_lengths":
+                expanded[key] = torch.tensor(
+                    selected_lengths,
+                    dtype=value.dtype,
+                    device=value.device,
+                )
+            elif value.is_nested:
+                value_row_lengths = value.offsets().diff()
+                if input_row_lengths is None or not torch.equal(
+                    value_row_lengths.cpu(), input_row_lengths.cpu()
+                ):
+                    raise ValueError(
+                        "jagged packed-attention fields must have the same row "
+                        f"lengths as input_ids; field={key!r}"
+                    )
+                values = value.values()
+                offsets = value.offsets()
+                output = values.new_zeros(
+                    (len(selected), max_length, *values.shape[1:])
+                )
+                for index, (row, offset, length) in enumerate(selected):
+                    row_start = int(offsets[row].item())
+                    output[index, :length] = values[
+                        row_start + offset : row_start + offset + length
+                    ]
+                expanded[key] = output
+            elif (
+                not input_ids_is_jagged
+                and value.ndim > 1
+                and value.shape[1] == input_ids.shape[1]
+            ):
+                output = value.new_zeros(
+                    (len(selected), max_length, *value.shape[2:])
+                )
+                for index, (row, offset, length) in enumerate(selected):
+                    output[index, :length] = value[row, offset : offset + length]
+                expanded[key] = output
+            else:
+                expanded[key] = value.index_select(0, parent_rows.to(value.device))
+        else:
+            expanded[key] = [value[row] for row, _, _ in selected]
+    return expanded
 
 
 def reassemble_packed_attention_segments(

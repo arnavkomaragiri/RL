@@ -348,6 +348,10 @@ class MegatronConfig(TypedDict):
     num_layers_in_last_pipeline_stage: int | None
     context_parallel_size: int
     pipeline_dtype: str
+    # Dtype for materialized inter-chunk Mamba SSM states during training.
+    # Valid values are "float32", "bfloat16", and "float16"; null follows
+    # the model activation dtype.
+    mamba_training_ssm_states_dtype: NotRequired[str | None]
     sequence_parallel: bool
     freeze_moe_router: bool
     expert_tensor_parallel_size: int
@@ -432,6 +436,8 @@ class MegatronConfig(TypedDict):
     mtp_num_layers: NotRequired[int]
     # MTP loss weight added to the main next-token loss (0.0 disables the MTP loss contribution).
     mtp_loss_scaling_factor: NotRequired[float]
+    # When True, retain MTP checkpoint parameters but skip and freeze the MTP training loss path.
+    disable_mtp_loss: NotRequired[bool]
     # When True, repeat a single MTP layer mtp_num_layers times instead of using distinct layers.
     mtp_use_repeated_layer: NotRequired[bool]
     # When True, detach MTP heads from the main model so MTP loss does not affect main-model gradients.

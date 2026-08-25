@@ -2263,10 +2263,21 @@ async def run_async_nemo_gym_rollout(
                 rollout_gen = nemo_gym_environment.run_rollouts.options(
                     num_returns="streaming"
                 ).remote(rows, tokenizer, timer_prefix)
-                if notify_dispatched and on_dispatched is not None:
-                    on_dispatched()
+                dispatch_notified = False
                 async for future in rollout_gen:
                     rowidx, result, timing_metrics = await future
+                    if (
+                        notify_dispatched
+                        and not dispatch_notified
+                        and on_dispatched is not None
+                    ):
+                        # The actor materializes the entire request set before it
+                        # can return a row. Releasing the FIFO gate here prevents
+                        # a later target from racing ahead during Gym admission
+                        # while still allowing both target batches to execute in
+                        # parallel after the first completion.
+                        on_dispatched()
+                        dispatch_notified = True
                     if rowidx not in row_indices:
                         raise ValueError(
                             f"NeMo-Gym retry attempt {attempt_id} returned unexpected "

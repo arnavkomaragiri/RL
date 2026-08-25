@@ -29,6 +29,7 @@ import json
 import tempfile
 import uuid
 from copy import deepcopy
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -38,7 +39,13 @@ from nemo_rl.data.datasets.response_datasets import NemoGymDataset
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
+from nemo_rl.environments.nemo_gym import NemoGymRolloutFailure
+from nemo_rl.experience.interfaces import (
+    Completion,
+    NEMO_GYM_ROLLOUT_INDEX_KEY,
+    NEMO_GYM_TASK_INDEX_KEY,
+    PromptGroupRecord,
+)
 from nemo_rl.experience.rollout_manager import (
     AsyncNemoGymRolloutImpl,
     RolloutManager,
@@ -47,6 +54,7 @@ from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
 )
+from nemo_rl.utils.timer import Timer
 
 # Fixtures shared with the heavyweight rollout tests.
 from tests.unit.environments.test_nemo_gym import (
@@ -325,20 +333,179 @@ def test_rollout_manager_forwards_mask_env_flagged_samples():
     assert manager._impl._mask_env_flagged_samples is False
 
 
-def _nemo_gym_impl(mask_env_flagged_samples):
+def _nemo_gym_impl(
+    mask_env_flagged_samples,
+    num_generations=1,
+    *,
+    task_to_env=None,
+    max_rollout_retries=0,
+):
     return AsyncNemoGymRolloutImpl(
         tokenizer=None,
-        task_to_env={},
-        num_generations_per_prompt=1,
+        task_to_env=task_to_env or {},
+        num_generations_per_prompt=num_generations,
         max_seq_len=100,
         max_rollout_turns=1,
         generation_config={
             "stop_strings": None,
             "stop_token_ids": None,
             "top_k": None,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "max_new_tokens": 100,
         },
         mask_env_flagged_samples=mask_env_flagged_samples,
+        max_rollout_retries=max_rollout_retries,
     )
+
+
+def test_nemo_gym_inputs_stamp_group_and_rollout_indices():
+    impl = _nemo_gym_impl(True, num_generations=3)
+    input_sample = {
+        "extra_env_info": {"responses_create_params": {}},
+    }
+
+    first_group = impl._build_inputs(input_sample)
+    second_group = impl._build_inputs(input_sample)
+
+    assert [row[NEMO_GYM_TASK_INDEX_KEY] for row in first_group] == [0, 0, 0]
+    assert [row[NEMO_GYM_TASK_INDEX_KEY] for row in second_group] == [1, 1, 1]
+    assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in first_group] == [0, 1, 2]
+    assert [row["_rowidx"] for row in first_group] == [0, 1, 2]
+
+
+class _ReadyResultRef:
+    def __init__(self, value):
+        self._value = value
+
+    def __await__(self):
+        async def _resolve():
+            return self._value
+
+        return _resolve().__await__()
+
+
+class _AsyncResultStream:
+    def __init__(self, values):
+        self._values = iter(values)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return _ReadyResultRef(next(self._values))
+        except StopIteration as error:
+            raise StopAsyncIteration from error
+
+
+class _ScriptedRunRollouts:
+    def __init__(self, attempts):
+        self._attempts = iter(attempts)
+        self.row_indices_by_call: list[list[int]] = []
+
+    def options(self, *, num_returns):
+        assert num_returns == "streaming"
+        return self
+
+    def remote(self, rows, tokenizer, timer_prefix):
+        del tokenizer, timer_prefix
+        self.row_indices_by_call.append([row["_rowidx"] for row in rows])
+        return _AsyncResultStream(next(self._attempts))
+
+
+def _successful_nemo_gym_result(rowidx: int) -> dict:
+    return {
+        "input_message_log": [{"role": "user", "token_ids": [1]}],
+        "message_log": [
+            {
+                "role": "assistant",
+                "token_ids": [rowidx + 2],
+                "generation_logprobs": [0.0],
+            }
+        ],
+        "full_result": {"reward": float(rowidx)},
+    }
+
+
+def _nemo_gym_retry_inputs() -> list[dict]:
+    return [{"_rowidx": rowidx, "agent_ref": {"name": "agent"}} for rowidx in range(2)]
+
+
+def test_nemo_gym_prompt_manager_retries_only_failed_rows(monkeypatch):
+    failure = NemoGymRolloutFailure(
+        failure_class="harbor_failed",
+        error="judge did not score",
+        full_result={"reward": 0.0},
+    )
+    run_rollouts = _ScriptedRunRollouts(
+        [
+            [
+                (0, _successful_nemo_gym_result(0), None),
+                (1, failure, {"timing/remote": 1.0}),
+            ],
+            [(1, _successful_nemo_gym_result(1), {"timing/retry": 2.0})],
+        ]
+    )
+    sleep_calls: list[int] = []
+
+    async def record_sleep(delay_seconds):
+        sleep_calls.append(delay_seconds)
+
+    monkeypatch.setattr(
+        "nemo_rl.experience.rollout_manager.asyncio.sleep", record_sleep
+    )
+    impl = _nemo_gym_impl(
+        True,
+        num_generations=2,
+        task_to_env={"nemo_gym": SimpleNamespace(run_rollouts=run_rollouts)},
+        max_rollout_retries=1,
+    )
+
+    completions, _, metrics = asyncio.run(
+        impl._run_rollouts(_nemo_gym_retry_inputs(), Timer(), "timing/rollout")
+    )
+
+    assert run_rollouts.row_indices_by_call == [[0, 1], [1]]
+    assert sleep_calls == [1]
+    assert [completion.reward for completion in completions] == [0.0, 1.0]
+    assert metrics["nemo_gym/row_retries_launched"] == 1.0
+    assert metrics["nemo_gym/row_retries_exhausted"] == 0.0
+    assert metrics["nemo_gym/stream_errors"] == 0.0
+    assert metrics["timing/remote"] == 1.0
+    assert metrics["timing/retry"] == 2.0
+
+
+def test_nemo_gym_prompt_manager_reports_exhausted_row_retry(monkeypatch):
+    failure = NemoGymRolloutFailure(
+        failure_class="harbor_failed",
+        error="judge did not score",
+        full_result={"reward": 0.0},
+    )
+    run_rollouts = _ScriptedRunRollouts([[(0, failure, None)], [(0, failure, None)]])
+
+    async def no_sleep(_delay_seconds):
+        return None
+
+    monkeypatch.setattr("nemo_rl.experience.rollout_manager.asyncio.sleep", no_sleep)
+    impl = _nemo_gym_impl(
+        True,
+        task_to_env={"nemo_gym": SimpleNamespace(run_rollouts=run_rollouts)},
+        max_rollout_retries=1,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "prompt group exhausted fresh-sandbox retries; "
+            "rowidx=0: harbor_failed: judge did not score"
+        ),
+    ):
+        asyncio.run(
+            impl._run_rollouts([_nemo_gym_retry_inputs()[0]], Timer(), "timing/rollout")
+        )
+
+    assert run_rollouts.row_indices_by_call == [[0], [0]]
 
 
 def _mask_gate_result():

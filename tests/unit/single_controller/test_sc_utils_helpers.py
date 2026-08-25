@@ -160,6 +160,48 @@ class TestReduceAdvantagePumpMetrics:
     def test_all_empty_inputs_returns_empty_dict(self) -> None:
         assert reduce_advantage_pump_metrics([], [], []) == {}
 
+    def test_sequence_logprob_metrics_are_weighted_across_admissions(self) -> None:
+        out = reduce_advantage_pump_metrics(
+            rewards=[],
+            masked_advantages=[],
+            sequence_lengths=[],
+            seq_logprob_error_records=[
+                {
+                    "max_seq_mult_prob_error": 4.0,
+                    "mean_seq_mult_prob_error": 2.0,
+                    "min_seq_mult_prob_error": 1.0,
+                    "max_seq_mult_prob_error_after_mask": 2.0,
+                    "mean_seq_mult_prob_error_after_mask": 1.5,
+                    "min_seq_mult_prob_error_after_mask": 1.0,
+                    "num_masked_seqs": 1.0,
+                    "masked_correct_pct": 1.0,
+                    "_num_valid_seqs_before_mask": 2.0,
+                    "_num_valid_seqs_after_mask": 1.0,
+                    "_num_masked_correct": 1.0,
+                },
+                {
+                    "max_seq_mult_prob_error": 3.0,
+                    "mean_seq_mult_prob_error": 1.0,
+                    "min_seq_mult_prob_error": 0.5,
+                    "max_seq_mult_prob_error_after_mask": 3.0,
+                    "mean_seq_mult_prob_error_after_mask": 2.0,
+                    "min_seq_mult_prob_error_after_mask": 0.5,
+                    "num_masked_seqs": 2.0,
+                    "masked_correct_pct": 0.5,
+                    "_num_valid_seqs_before_mask": 6.0,
+                    "_num_valid_seqs_after_mask": 3.0,
+                    "_num_masked_correct": 1.0,
+                },
+            ],
+        )
+
+        assert out["max_seq_mult_prob_error"] == 4.0
+        assert out["mean_seq_mult_prob_error"] == pytest.approx(1.25)
+        assert out["min_seq_mult_prob_error"] == 0.5
+        assert out["mean_seq_mult_prob_error_after_mask"] == pytest.approx(1.875)
+        assert out["num_masked_seqs_by_logprob_error"] == 3.0
+        assert out["masked_correct_pct"] == pytest.approx(2.0 / 3.0)
+
 
 class TestFieldsForPut:
     def test_no_sequence_lengths_packs_contiguous(self) -> None:

@@ -24,8 +24,14 @@ from wandb import Table
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.environments.nemo_gym import NemoGymRolloutFailure
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
+from nemo_rl.experience.interfaces import (
+    Completion,
+    NEMO_GYM_ROLLOUT_INDEX_KEY,
+    NEMO_GYM_TASK_INDEX_KEY,
+    PromptGroupRecord,
+)
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.rollouts import (
     _attach_routed_experts_to_message_log_prefix,
@@ -427,6 +433,7 @@ class AsyncNemoGymRolloutImpl:
         max_rollout_turns: int,
         generation_config: GenerationConfig,
         mask_env_flagged_samples: bool = True,
+        max_rollout_retries: int = 0,
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
@@ -436,6 +443,8 @@ class AsyncNemoGymRolloutImpl:
         self._max_rollout_turns = max_rollout_turns
         self._generation_config = generation_config
         self._mask_env_flagged_samples = mask_env_flagged_samples
+        self._max_rollout_retries = max_rollout_retries
+        self._next_nemo_gym_task_index = 0
 
         self._validate_init_params()
 
@@ -482,6 +491,8 @@ class AsyncNemoGymRolloutImpl:
             "`max_rollout_turns` is not supported in NeMo-Gym path! "
             "Please set `max_rollout_turns` to 1."
         )
+        if self._max_rollout_retries < 0:
+            raise ValueError("max_rollout_retries must be non-negative")
 
     def _build_inputs(self, input_sample: DatumSpec) -> list[dict]:
         """Build N row dicts from input_sample, applying generation config params."""
@@ -503,11 +514,18 @@ class AsyncNemoGymRolloutImpl:
             else self._generation_config["max_new_tokens"]
         )
 
+        # Match the legacy collector's Gym identifiers: one task index per
+        # dispatched prompt and one rollout index per completion in its group.
+        task_index = self._next_nemo_gym_task_index
+        self._next_nemo_gym_task_index += 1
+
         # Build N rows with distinct rowidxs so run_rollouts can sort them correctly.
         rows = []
         for i in range(self._num_generations_per_prompt):
             row = copy.deepcopy(template_row)
             row["_rowidx"] = i
+            row[NEMO_GYM_TASK_INDEX_KEY] = task_index
+            row[NEMO_GYM_ROLLOUT_INDEX_KEY] = i
             rows.append(row)
         return rows
 
@@ -517,33 +535,174 @@ class AsyncNemoGymRolloutImpl:
         """Dispatch rows to NeMo-Gym; return completions, prompt, and metrics."""
         nemo_gym_env = self._task_to_env["nemo_gym"]
 
-        # Run generation and restore input order as results stream back.
+        # Run generation and restore input order as results stream back. A
+        # structured Gym failure is retried row-by-row; successful siblings are
+        # retained so one fresh sandbox does not invalidate the whole group.
         with timer.time(f"{timer_prefix}/run_rollouts"):
-            results: list[dict | None] = [None for _ in inputs]
-            received_row_indices: set[int] = set()
+            results: list[dict[str, Any] | None] = [None for _ in inputs]
+            retries_by_row = [0 for _ in inputs]
+            retries_launched = 0
+            retries_exhausted: dict[int, str] = {}
+            stream_errors = 0
             env_timing_metrics: dict[str, Any] = {}
-            async for result_ref in nemo_gym_env.run_rollouts.options(
-                num_returns="streaming"
-            ).remote(inputs, self._tokenizer, timer_prefix):
-                rowidx, result, timing_metrics = await result_ref
-                if not isinstance(rowidx, int) or not 0 <= rowidx < len(inputs):
-                    raise ValueError(
-                        f"NeMo-Gym returned invalid row index {rowidx!r} for "
-                        f"{len(inputs)} inputs"
-                    )
-                if rowidx in received_row_indices:
-                    raise ValueError(f"NeMo-Gym returned duplicate row index {rowidx}")
-                received_row_indices.add(rowidx)
-                results[rowidx] = result
-                if timing_metrics is not None:
-                    env_timing_metrics = timing_metrics
+            event_queue: asyncio.Queue[tuple[str, int, Any]] = asyncio.Queue()
+            attempt_tasks: set[asyncio.Task[None]] = set()
+            active_attempts = 0
+            next_attempt_id = 0
 
-            if any(result is None for result in results):
+            def retry_or_fail(rowidx: int, reason: str) -> None:
+                nonlocal retries_launched
+                if retries_by_row[rowidx] >= self._max_rollout_retries:
+                    retries_exhausted[rowidx] = reason
+                    return
+                retries_by_row[rowidx] += 1
+                retries_launched += 1
+                delay_seconds = 2 ** (retries_by_row[rowidx] - 1)
+                print(
+                    "NeMo-Gym prompt-group row failed; redispatching it with a "
+                    f"fresh rollout ID in {delay_seconds}s (rowidx={rowidx}, retry "
+                    f"{retries_by_row[rowidx]}/{self._max_rollout_retries}, "
+                    f"reason={reason})",
+                    flush=True,
+                )
+                schedule_attempt((rowidx,), delay_seconds=delay_seconds)
+
+            async def pump_attempt(
+                attempt_id: int,
+                row_indices: tuple[int, ...],
+                delay_seconds: float,
+            ) -> None:
+                received_row_indices: set[int] = set()
+                try:
+                    if delay_seconds:
+                        await asyncio.sleep(delay_seconds)
+                    attempt_inputs = [
+                        copy.deepcopy(inputs[rowidx]) for rowidx in row_indices
+                    ]
+                    async for result_ref in nemo_gym_env.run_rollouts.options(
+                        num_returns="streaming"
+                    ).remote(attempt_inputs, self._tokenizer, timer_prefix):
+                        rowidx, result, timing_metrics = await result_ref
+                        if not isinstance(rowidx, int) or rowidx not in row_indices:
+                            raise ValueError(
+                                f"NeMo-Gym returned invalid row index {rowidx!r}; "
+                                f"expected one of {list(row_indices)}"
+                            )
+                        if rowidx in received_row_indices:
+                            raise ValueError(
+                                f"NeMo-Gym returned duplicate row index {rowidx}"
+                            )
+                        if not isinstance(result, (dict, NemoGymRolloutFailure)):
+                            raise TypeError(
+                                "NeMo-Gym returned an unsupported rollout result "
+                                f"type: {type(result).__name__}"
+                            )
+                        received_row_indices.add(rowidx)
+                        await event_queue.put(
+                            (
+                                "row",
+                                attempt_id,
+                                (rowidx, result, timing_metrics),
+                            )
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:  # noqa: BLE001 - missing rows are retried
+                    missing = tuple(
+                        rowidx
+                        for rowidx in row_indices
+                        if rowidx not in received_row_indices
+                    )
+                    await event_queue.put(("error", attempt_id, (error, missing)))
+                else:
+                    missing = tuple(
+                        rowidx
+                        for rowidx in row_indices
+                        if rowidx not in received_row_indices
+                    )
+                    if missing:
+                        await event_queue.put(
+                            (
+                                "error",
+                                attempt_id,
+                                (
+                                    RuntimeError(
+                                        "rollout stream ended before all rows arrived"
+                                    ),
+                                    missing,
+                                ),
+                            )
+                        )
+                finally:
+                    await event_queue.put(("done", attempt_id, None))
+
+            def schedule_attempt(
+                row_indices: tuple[int, ...], *, delay_seconds: float = 0.0
+            ) -> None:
+                nonlocal active_attempts, next_attempt_id
+                attempt_id = next_attempt_id
+                next_attempt_id += 1
+                active_attempts += 1
+                task = asyncio.create_task(
+                    pump_attempt(attempt_id, row_indices, delay_seconds)
+                )
+                attempt_tasks.add(task)
+                task.add_done_callback(attempt_tasks.discard)
+
+            schedule_attempt(tuple(range(len(inputs))))
+            try:
+                while active_attempts and not retries_exhausted:
+                    event_type, _attempt_id, payload = await event_queue.get()
+                    if event_type == "done":
+                        active_attempts -= 1
+                        continue
+                    if event_type == "error":
+                        stream_error, missing_row_indices = payload
+                        stream_errors += 1
+                        for rowidx in missing_row_indices:
+                            retry_or_fail(
+                                rowidx,
+                                f"{type(stream_error).__name__}: {stream_error}",
+                            )
+                        continue
+                    if event_type != "row":
+                        raise RuntimeError(
+                            f"Unknown NeMo-Gym stream event {event_type!r}"
+                        )
+
+                    rowidx, result, timing_metrics = payload
+                    if timing_metrics is not None:
+                        env_timing_metrics.update(timing_metrics)
+                    if isinstance(result, NemoGymRolloutFailure):
+                        retry_or_fail(
+                            rowidx,
+                            f"{result.failure_class}: {result.error or '<no error>'}",
+                        )
+                    else:
+                        results[rowidx] = result
+            finally:
+                for task in attempt_tasks:
+                    task.cancel()
+                if attempt_tasks:
+                    await asyncio.gather(*attempt_tasks, return_exceptions=True)
+
+            if retries_exhausted:
+                failures = ", ".join(
+                    f"rowidx={rowidx}: {reason}"
+                    for rowidx, reason in sorted(retries_exhausted.items())
+                )
                 raise RuntimeError(
-                    "NeMo-Gym rollout stream ended before all rows arrived"
+                    f"NeMo-Gym prompt group exhausted fresh-sandbox retries; {failures}"
                 )
 
-            completed_results = [result for result in results if result is not None]
+            completed_results: list[dict[str, Any]] = []
+            for rowidx, result in enumerate(results):
+                if result is None:
+                    raise RuntimeError(
+                        "NeMo-Gym rollout stream ended without a terminal result "
+                        f"for rowidx={rowidx}"
+                    )
+                completed_results.append(result)
             # All N rollouts share the same input prompt; tensorize one copy.
             prompt_message_log = completed_results[0]["input_message_log"]
             _tensorize_by_key(prompt_message_log, "token_ids")
@@ -559,6 +718,9 @@ class AsyncNemoGymRolloutImpl:
             )
 
         rollout_metrics.update(env_timing_metrics)
+        rollout_metrics["nemo_gym/row_retries_launched"] = float(retries_launched)
+        rollout_metrics["nemo_gym/row_retries_exhausted"] = 0.0
+        rollout_metrics["nemo_gym/stream_errors"] = float(stream_errors)
 
         return completions, prompt_message_log, rollout_metrics
 
@@ -689,6 +851,7 @@ class RolloutManager:
         generation_config: Optional[GenerationConfig] = None,
         use_nemo_gym: bool = False,
         mask_env_flagged_samples: bool = True,
+        max_rollout_retries: int = 0,
         tq_buffer: Optional[TQReplayBuffer] = None,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
@@ -716,6 +879,7 @@ class RolloutManager:
             generation_config=generation_config,
             # Only used by AsyncNemoGymRolloutImpl; AsyncRolloutImpl ignores it.
             mask_env_flagged_samples=mask_env_flagged_samples,
+            max_rollout_retries=max_rollout_retries,
         )
         self._tokenizer = tokenizer
         self._num_generations_per_prompt = num_generations_per_prompt

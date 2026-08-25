@@ -1,0 +1,119 @@
+# One-step production gate for the Harbor/OpenCode v0 integration. Four
+# trajectory versions may overlap while each optimizer step consumes 32 intact
+# G=16 prompt groups. Router replay is required for Nemotron 3.5 parity.
+defaults: ../../../nemo_gym/grpo_nanov3.yaml
+
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
+  max_num_epochs: 100
+  max_num_steps: 1
+  val_at_start: false
+  val_at_end: false
+  # SingleController does not support validation yet.
+  val_period: 0
+  overlong_filtering: false
+  async_grpo:
+    enabled: true
+    in_flight_weight_updates: true
+    max_trajectory_age_steps: 4
+
+checkpointing:
+  enabled: false
+
+data_plane: null
+
+policy:
+  model_name: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
+  tokenizer:
+    name: ${policy.model_name}
+  train_global_batch_size: 512
+  generation_batch_size: 512
+  max_total_sequence_length: 131072
+  router_replay:
+    enabled: true
+  megatron_cfg:
+    empty_unused_memory_level: 2
+    # This runtime env is scoped to the Megatron policy RayWorkerGroup; vLLM
+    # has a separate vllm_cfg.env_vars namespace and must not inherit it.
+    # Expandable segments tolerate the variable allocation sizes from packed
+    # agent trajectories without max_split_size_mb starving NCCL collectives.
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    tensor_model_parallel_size: 8
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 2
+    # The installed mamba_ssm does not expose state_dtype. Null preserves the
+    # supported MCore path while vLLM uses the checkpoint's FP32 cache dtype.
+    mamba_training_ssm_states_dtype: null
+    # Do not mix MTP next-token supervision into the policy-gradient update.
+    mtp_loss_scaling_factor: 0.0
+    # Avoid materializing the MTP vocabulary loss while preserving checkpoint topology.
+    disable_mtp_loss: true
+  generation:
+    backend: vllm
+    top_p: 1.0
+    top_k: null
+    val_top_p: ${.top_p}
+    val_top_k: ${.top_k}
+    vllm_cfg:
+      enable_prefix_caching: true
+      tensor_parallel_size: 4
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: qwen3_coder
+        reasoning_parser: nano_v3
+        default_chat_template_kwargs:
+          enable_thinking: true
+          truncate_history_thinking: false
+    vllm_kwargs:
+      mamba_ssm_cache_dtype: float32
+      mamba_cache_mode: align
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 2
+        gpus_per_node: 8
+
+data:
+  train:
+    data_path: patches/harbor_opencode/manifests/bbh_harbor_opencode_rl_v0_clean_train.jsonl
+  validation:
+    data_path: patches/harbor_opencode/manifests/bbh_harbor_opencode_rl_v0_clean_val.jsonl
+
+env:
+  should_log_nemo_gym_responses: true
+  nemo_gym:
+    skip_venv_if_present: false
+    num_samples_in_parallel: 2048
+    max_rollout_retries: 3
+    observability_enabled: ${oc.decode:${oc.env:NEMO_GYM_MODEL_CALL_DIAGNOSTICS,false}}
+    model_call_capture_dir: ${oc.env:NEMO_GYM_MODEL_CALL_CAPTURE_DIR,${oc.env:RAY_TMPDIR,/tmp}/ng_model_calls_nemotron35_harbor_stress}
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - responses_api_agents/gym_harbor_agent/configs/harbor_agent_opencode_compaction.yaml
+      - nemo_gym/sandbox/providers/opensandbox/configs/opensandbox.yaml
+      - responses_api_agents/gym_harbor_agent/configs/harbor_agent.yaml
+      - responses_api_agents/gym_harbor_agent/configs/harbor_agent_opensandbox.yaml
+      - responses_api_agents/gym_harbor_agent/configs/harbor_agent_agentic_verifier.yaml
+    token_id_capture:
+      enabled: true
+      dir: ${oc.env:NEMO_GYM_TOKEN_CAPTURE_DIR,${oc.env:RAY_TMPDIR,/tmp}/ng_tokcap_nemotron35_harbor_stress}
+      retain_consumed: ${oc.decode:${oc.env:NEMO_GYM_TOKEN_CAPTURE_RETAIN_CONSUMED,false}}
+
+logger:
+  log_dir: logs/grpo-nemotron3.5-lightning-harbor-stress-32x16-age4-r3-one-step
+  wandb_enabled: true
+  token_logprob_diagnostics:
+    enabled: true
+    max_sequences: 32
+    top_k_tokens_per_sequence: 32
+    min_abs_logprob_diff: 0.25
+    min_sequence_mult_prob_error: 1.05
+    context_tokens: 8
+  wandb:
+    project: nemo-rl-swe
+    name: grpo-nemotron3.5-lightning-harbor-stress-32x16-age4-r3-one-step
+
+cluster:
+  num_nodes: 4

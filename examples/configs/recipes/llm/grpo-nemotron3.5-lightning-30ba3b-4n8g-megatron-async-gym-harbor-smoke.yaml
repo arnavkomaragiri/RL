@@ -1,0 +1,94 @@
+# One-step async diagnostic for OpenCode through Harbor/OpenSandbox using
+# Nemotron 3.5 Lightning for policy generation and training.
+defaults: ../../../nemo_gym/grpo_nanov3.yaml
+
+grpo:
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 2
+  max_num_steps: 1
+  val_at_start: false
+  val_at_end: false
+  val_period: 1000
+  overlong_filtering: false
+  async_grpo:
+    enabled: true
+    in_flight_weight_updates: true
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/grpo-nemotron3.5-lightning-harbor-async-smoke
+
+data_plane: null
+
+policy:
+  model_name: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
+  tokenizer:
+    name: ${policy.model_name}
+  train_global_batch_size: 4
+  generation_batch_size: 4
+  megatron_cfg:
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 2
+    # This container's mamba_ssm does not expose the state_dtype argument. Keep
+    # the MCore default, which makes materialized SSM states follow BF16 activations.
+    mamba_training_ssm_states_dtype: null
+  generation:
+    backend: vllm
+    # Keep the behavior policy full-support for token-capture diagnostics.
+    # Reconstructing a hard nucleus cutoff across vLLM and Megatron can turn
+    # small backend logit differences into -inf logprobs at sampled tokens.
+    top_p: 1.0
+    val_top_p: ${.top_p}
+    vllm_cfg:
+      enable_prefix_caching: true
+      tensor_parallel_size: 4
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: qwen3_coder
+        reasoning_parser: nano_v3
+        default_chat_template_kwargs:
+          enable_thinking: true
+          truncate_history_thinking: false
+    vllm_kwargs:
+      mamba_ssm_cache_dtype: "float32"
+      mamba_cache_mode: align
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 2
+        gpus_per_node: 8
+
+data:
+  train:
+    data_path: patches/harbor_opencode/manifests/bbh_harbor_opencode_rl_v0_clean_train.jsonl
+  validation:
+    data_path: patches/harbor_opencode/manifests/bbh_harbor_opencode_rl_v0_clean_val.jsonl
+
+env:
+  should_log_nemo_gym_responses: true
+  nemo_gym:
+    skip_venv_if_present: false
+    num_samples_in_parallel: 4
+    observability_enabled: ${oc.decode:${oc.env:NEMO_GYM_MODEL_CALL_DIAGNOSTICS,false}}
+    model_call_capture_dir: ${oc.env:NEMO_GYM_MODEL_CALL_CAPTURE_DIR,${oc.env:RAY_TMPDIR,/tmp}/ng_model_calls_nemotron35_harbor_smoke}
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - responses_api_agents/gym_harbor_agent/configs/harbor_agent_opencode_compaction.yaml
+      - nemo_gym/sandbox/providers/opensandbox/configs/opensandbox.yaml
+      - responses_api_agents/gym_harbor_agent/configs/harbor_agent.yaml
+      - responses_api_agents/gym_harbor_agent/configs/harbor_agent_opensandbox.yaml
+      - responses_api_agents/gym_harbor_agent/configs/harbor_agent_agentic_verifier.yaml
+    token_id_capture:
+      enabled: true
+      dir: ${oc.env:NEMO_GYM_TOKEN_CAPTURE_DIR,${oc.env:RAY_TMPDIR,/tmp}/ng_tokcap_nemotron35_harbor_smoke}
+      retain_consumed: ${oc.decode:${oc.env:NEMO_GYM_TOKEN_CAPTURE_RETAIN_CONSUMED,false}}
+
+logger:
+  log_dir: logs/grpo-nemotron3.5-lightning-harbor-async-smoke
+  wandb_enabled: true
+  wandb:
+    project: nemo-rl-swe
+    name: grpo-nemotron3.5-lightning-harbor-async-smoke
+
+cluster:
+  num_nodes: 4

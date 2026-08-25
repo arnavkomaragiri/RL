@@ -44,6 +44,7 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmAsyncCheckpointEngineRpcMixin,
 )
 from nemo_rl.models.generation.vllm.utils import (
+    attach_generation_metadata_to_chat_response_choices,
     attach_routed_experts_to_chat_response_choices,
     format_prompt_for_vllm_generation,
     model_dump_chat_response_with_routed_experts,
@@ -98,6 +99,8 @@ class VllmAsyncGenerationWorkerImpl(
         self.server_thread = None
         self.base_url = None
         self.http_server = None
+        self._generation_weight_version = 0
+        self._kv_cache_block_metadata: dict[str, int] | None = None
 
         super().__init__(
             config,
@@ -326,6 +329,21 @@ class VllmAsyncGenerationWorkerImpl(
     async def post_init_async(self):
         if self.llm is not None:
             await self.llm.collective_rpc("bind_numa", args=tuple())
+            cache_metadata = await self.llm.collective_rpc(
+                "report_kv_cache_block_metadata", args=tuple()
+            )
+            if not cache_metadata or any(
+                item != cache_metadata[0] for item in cache_metadata[1:]
+            ):
+                raise RuntimeError(
+                    "vLLM ranks reported inconsistent KV-cache block metadata: "
+                    f"{cache_metadata}"
+                )
+            self._kv_cache_block_metadata = dict(cache_metadata[0])
+            LOGGER.info(
+                "vLLM runtime KV-cache block metadata: %s",
+                self._kv_cache_block_metadata,
+            )
         self.vllm_device_ids = await self.report_device_id_async()
         if self._mtp_load_from_disk:
             await self.llm.collective_rpc(
@@ -608,19 +626,30 @@ class VllmAsyncGenerationWorkerImpl(
                     *args,
                     **kwargs,
                 )
-                if (
-                    not worker_self._return_routed_experts_enabled()
-                    or not isinstance(response, ChatCompletionResponse)
-                    or final_res is None
-                ):
+                if not isinstance(response, ChatCompletionResponse):
                     return response
-
-                return attach_routed_experts_to_chat_response_choices(
+                if worker_self._kv_cache_block_metadata is None:
+                    raise RuntimeError(
+                        "vLLM served a request before runtime KV-cache metadata "
+                        "was collected"
+                    )
+                if worker_self._return_routed_experts_enabled():
+                    if final_res is None:
+                        raise RuntimeError(
+                            "vLLM completed a routed-expert request without a final "
+                            "engine output"
+                        )
+                    response = attach_routed_experts_to_chat_response_choices(
+                        response,
+                        final_res,
+                        device=torch.device("cpu"),
+                        logger=LOGGER,
+                        routed_experts_dtype=worker_self.routed_experts_dtype,
+                    )
+                return attach_generation_metadata_to_chat_response_choices(
                     response,
-                    final_res,
-                    device=torch.device("cpu"),
-                    logger=LOGGER,
-                    routed_experts_dtype=worker_self.routed_experts_dtype,
+                    weight_version=worker_self._generation_weight_version,
+                    kv_cache_block_metadata=worker_self._kv_cache_block_metadata,
                 )
 
         class NeMoRLOpenAIServingChat(NeMoRLOpenAIServingChatMixin, OpenAIServingChat):
@@ -1374,6 +1403,7 @@ class VllmAsyncGenerationWorkerImpl(
                     f"Error: Worker failed to update weights. Results: {worker_results}"
                 )
                 return False
+            self._generation_weight_version += 1
             return True
         except Exception as e:
             print(f"Exception during collective_rpc for weight update: {e}")
@@ -1410,6 +1440,7 @@ class VllmAsyncGenerationWorkerImpl(
                     f"Error: Worker failed to update weights. Results: {worker_results}"
                 )
                 return False
+            self._generation_weight_version += 1
             return True
         except Exception as e:
             print(f"Exception during collective_rpc for weight update: {e}")
@@ -1469,6 +1500,7 @@ class VllmAsyncGenerationWorkerImpl(
                     f"Error: Worker failed nccl_reshard_refit. Result: {worker_result}"
                 )
                 return False
+            self._generation_weight_version += 1
             return True
         except Exception as e:
             print(f"Exception during nccl_reshard_refit: {e}", flush=True)

@@ -13,14 +13,20 @@
 # limitations under the License.
 
 import asyncio
+import json
+import os
+import resource
 import statistics
 import threading as _threading
+import time
 import uuid
 from collections import Counter
 from collections.abc import Mapping
 from typing import Any, Iterable, Optional
 
+import numpy as np
 import ray
+import torch
 
 from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
 from nemo_rl.data.packed_rollouts import PACKED_ATTENTION_SEGMENT_LENGTHS
@@ -652,11 +658,16 @@ class TQReplayBuffer:
         *,
         pad_value_dict: Mapping[str, int],
         require_routed_experts: bool = False,
+        packing_memory_diagnostics: bool = False,
     ):
         self._dp_client = dp_client
         self._partition_id = partition_id
         self._pad_value_dict = dict(pad_value_dict)
         self._require_routed_experts = require_routed_experts
+        self._packing_memory_diagnostics = packing_memory_diagnostics
+        self._packing_payload_bytes_held = 0
+        self._packing_peak_payload_bytes_held = 0
+        self._packing_puts_inflight = 0
         self.meta_list: list[Optional[KVBatchMeta]] = []
         self.start_weight_list: list[int] = []
         self.end_weight_list: list[int] = []
@@ -664,6 +675,48 @@ class TQReplayBuffer:
         self.target_step_list: list[Optional[int]] = []
         self.ready_list: list[bool] = []
         self._group_ids: list[str] = []
+
+    @staticmethod
+    def _current_rss_bytes() -> int:
+        """Return this process's current RSS on Linux."""
+        try:
+            with open("/proc/self/statm", encoding="ascii") as statm:
+                resident_pages = int(statm.read().split()[1])
+            return resident_pages * os.sysconf("SC_PAGE_SIZE")
+        except (OSError, ValueError, IndexError):
+            return 0
+
+    @staticmethod
+    def _peak_rss_bytes() -> int:
+        """Return this process's lifetime peak RSS on Linux."""
+        return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024
+
+    @staticmethod
+    def _tensor_field_bytes(data: Mapping[str, Any]) -> dict[str, int]:
+        """Return logical tensor bytes by top-level field."""
+        field_bytes: dict[str, int] = {}
+        for name, value in data.items():
+            if isinstance(value, torch.Tensor):
+                tensor = value.values() if value.is_nested else value
+                field_bytes[str(name)] = tensor.numel() * tensor.element_size()
+            elif isinstance(value, np.ndarray) and value.dtype != object:
+                field_bytes[str(name)] = int(value.nbytes)
+        return field_bytes
+
+    def _emit_packing_memory(self, stage: str, group_id: str, **metrics: Any) -> None:
+        if not self._packing_memory_diagnostics:
+            return
+        event = {
+            "stage": stage,
+            "group_id": group_id,
+            "rss_bytes": self._current_rss_bytes(),
+            "peak_rss_bytes": self._peak_rss_bytes(),
+            "payload_bytes_held": self._packing_payload_bytes_held,
+            "peak_payload_bytes_held": self._packing_peak_payload_bytes_held,
+            "puts_inflight": self._packing_puts_inflight,
+            **metrics,
+        }
+        print(f"tq_packing_memory: {json.dumps(event, sort_keys=True)}", flush=True)
 
     def reserve(
         self,
@@ -722,19 +775,65 @@ class TQReplayBuffer:
                 f"commit called with unknown group_id={group_id!r}; "
                 f"reserve() must precede commit() (or the slot was already removed)"
             )
+        self._emit_packing_memory(
+            "start", group_id, num_completions=len(record.completions)
+        )
+        tensorize_start = time.perf_counter()
         train_batch = record_to_train_batch(record, pad_value_dict=self._pad_value_dict)
+        dense_field_bytes = self._tensor_field_bytes(train_batch)
+        dense_bytes = sum(dense_field_bytes.values())
+        lengths = train_batch["input_lengths"]
+        valid_tokens = int(lengths.sum().item())
+        padded_tokens = int(train_batch["input_ids"].numel())
+        self._emit_packing_memory(
+            "tensorized",
+            group_id,
+            wall_ms=(time.perf_counter() - tensorize_start) * 1000.0,
+            logical_bytes=dense_bytes,
+            field_bytes=dense_field_bytes,
+            valid_tokens=valid_tokens,
+            padded_tokens=padded_tokens,
+            padding_fraction=(
+                1.0 - (valid_tokens / padded_tokens) if padded_tokens else 0.0
+            ),
+        )
+
+        pack_start = time.perf_counter()
         sample_ids, fields, tags = pack_payload(
             train_batch, weight_version=start_weight_version, group_id=group_id
         )
-        if self._require_routed_experts and ROUTED_EXPERTS_FIELD not in fields:
-            raise RuntimeError(
-                "policy.router_replay.enabled=true requires routed_experts in "
-                "the SingleController rollout payload, but payload packing did "
-                "not produce that field. Check vLLM routed-expert capture and "
-                "the async message-log flattening path."
-            )
-        trace_rollout_payload(keys=sample_ids, data=train_batch)
+        packed_field_bytes = self._tensor_field_bytes(fields)
+        packed_bytes = sum(packed_field_bytes.values())
+        transient_payload_bytes = dense_bytes + packed_bytes
+        self._packing_payload_bytes_held += transient_payload_bytes
+        self._packing_peak_payload_bytes_held = max(
+            self._packing_peak_payload_bytes_held,
+            self._packing_payload_bytes_held,
+        )
+        self._emit_packing_memory(
+            "packed",
+            group_id,
+            wall_ms=(time.perf_counter() - pack_start) * 1000.0,
+            logical_bytes=packed_bytes,
+            field_bytes=packed_field_bytes,
+            packed_to_dense_ratio=(packed_bytes / dense_bytes if dense_bytes else 0.0),
+            transient_payload_bytes=transient_payload_bytes,
+        )
+
+        put_attempted = False
+        put_start = 0.0
         try:
+            if self._require_routed_experts and ROUTED_EXPERTS_FIELD not in fields:
+                raise RuntimeError(
+                    "policy.router_replay.enabled=true requires routed_experts in "
+                    "the SingleController rollout payload, but payload packing did "
+                    "not produce that field. Check vLLM routed-expert capture and "
+                    "the async message-log flattening path."
+                )
+            trace_rollout_payload(keys=sample_ids, data=train_batch)
+            self._packing_puts_inflight += 1
+            put_attempted = True
+            put_start = time.perf_counter()
             await self._call_dp(
                 "put_samples",
                 sample_ids=sample_ids,
@@ -742,9 +841,16 @@ class TQReplayBuffer:
                 fields=fields,
                 tags=tags,
             )
+            dp_snapshot = getattr(self._dp_client, "snapshot", None)
+            self._emit_packing_memory(
+                "put_complete",
+                group_id,
+                wall_ms=(time.perf_counter() - put_start) * 1000.0,
+                packed_bytes=packed_bytes,
+                data_plane=(dp_snapshot() if callable(dp_snapshot) else None),
+            )
 
             # mirrors kv_first_write
-            lengths = train_batch["input_lengths"]
             meta = KVBatchMeta(
                 partition_id=self._partition_id,
                 task_name="train",
@@ -769,22 +875,39 @@ class TQReplayBuffer:
             self.ready_list[idx] = True
             return meta
         except BaseException as commit_error:
+            self._emit_packing_memory(
+                "error",
+                group_id,
+                wall_ms=(
+                    (time.perf_counter() - put_start) * 1000.0
+                    if put_attempted
+                    else 0.0
+                ),
+                error_type=type(commit_error).__name__,
+            )
             # put_samples may have written rows before raising. Roll back by the
             # deterministic IDs known here; the caller removes the reserved slot.
-            try:
-                await self._call_dp(
-                    "clear_samples",
-                    sample_ids=list(sample_ids),
-                    partition_id=self._partition_id,
-                )
-            except BaseException as rollback_error:
-                if isinstance(commit_error, asyncio.CancelledError):
-                    raise commit_error from rollback_error
-                raise BaseExceptionGroup(
-                    f"commit and rollback both failed for group_id={group_id!r}",
-                    [commit_error, rollback_error],
-                )
+            if put_attempted:
+                try:
+                    await self._call_dp(
+                        "clear_samples",
+                        sample_ids=list(sample_ids),
+                        partition_id=self._partition_id,
+                    )
+                except BaseException as rollback_error:
+                    if isinstance(commit_error, asyncio.CancelledError):
+                        raise commit_error from rollback_error
+                    raise BaseExceptionGroup(
+                        f"commit and rollback both failed for group_id={group_id!r}",
+                        [commit_error, rollback_error],
+                    )
             raise
+        finally:
+            if put_attempted:
+                self._packing_puts_inflight -= 1
+            self._packing_payload_bytes_held -= transient_payload_bytes
+            del fields, train_batch
+            self._emit_packing_memory("cleanup", group_id)
 
     async def remove_group(self, group_id: str, *, remove_in_dp: bool = False) -> int:
         """Remove the live slot identified by ``group_id``.

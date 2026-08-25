@@ -53,7 +53,10 @@ from nemo_rl.data.utils import setup_response_data
 from nemo_rl.data_plane import DataPlaneClient, build_data_plane_client
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
+from nemo_rl.environments.nemo_gym import (
+    DEFAULT_MAX_ROLLOUT_RETRIES,
+    spinup_nemo_gym_actor,
+)
 from nemo_rl.experience.rollout_manager import RolloutManager
 from nemo_rl.experience.rollouts import should_mask_flagged_samples
 from nemo_rl.models.generation.interfaces import (
@@ -365,6 +368,19 @@ def setup_single_controller(
     """
     validate_single_controller_config(master_config)
 
+    # Match the legacy GRPO setup: a zero KL coefficient means no reference
+    # state is loaded, so the train pump must not schedule reference logprobs.
+    if (
+        master_config.loss_fn.reference_policy_kl_penalty == 0
+        and not master_config.grpo.skip_reference_policy_logprobs_calculation
+    ):
+        master_config.grpo.skip_reference_policy_logprobs_calculation = True
+        print(
+            "Auto-enabling `grpo.skip_reference_policy_logprobs_calculation=True` "
+            "because `loss_fn.reference_policy_kl_penalty == 0` "
+            "(reference model is not loaded)."
+        )
+
     # short names for config sections
     grpo_config = master_config.grpo
     dp_config = master_config.data_plane
@@ -587,6 +603,11 @@ def setup_single_controller(
         partition_id=partition_id,
         pad_value_dict={"token_ids": pad_id, "input_ids": pad_id},
         require_routed_experts=router_replay_enabled(policy_config),
+        packing_memory_diagnostics=bool(
+            (dp_config.get("observability") or {}).get(
+                "packing_memory_enabled", False
+            )
+        ),
     )
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
@@ -598,6 +619,11 @@ def setup_single_controller(
         generation_config=generation_config,
         use_nemo_gym=use_nemo_gym,
         mask_env_flagged_samples=should_mask_flagged_samples(master_config.env),
+        max_rollout_retries=int(
+            master_config.env.get("nemo_gym", {}).get(
+                "max_rollout_retries", DEFAULT_MAX_ROLLOUT_RETRIES
+            )
+        ),
         tq_buffer=tq_buffer,
     )
 

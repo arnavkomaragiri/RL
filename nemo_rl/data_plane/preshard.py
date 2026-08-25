@@ -23,6 +23,7 @@ first cross-DP collective.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
@@ -35,6 +36,7 @@ from nemo_rl.data.packed_rollouts import (
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.schema import (
     ELEM_COUNTS_PER_GB,
+    GLOBAL_FORWARD_PAD_SEQLEN,
     INPUT_IDS,
     INPUT_LENGTHS,
     META_IDX,
@@ -43,6 +45,148 @@ from nemo_rl.data_plane.schema import (
     SAMPLE_MASK,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+
+@dataclass(frozen=True)
+class PackedAttentionCallMeta:
+    """Physical-call control-plane view of logical TQ rollout rows."""
+
+    sequence_lengths: list[int]
+    parent_indices: list[int]
+    segment_indices: list[int]
+
+
+def expand_meta_for_packed_attention(
+    meta: KVBatchMeta,
+) -> PackedAttentionCallMeta | None:
+    """Expand packed rollout metadata into legacy-equivalent call descriptors.
+
+    The payload stays in TQ under logical rollout IDs. This pure metadata view
+    is the expansion boundary used by the generic DP sharder; workers later
+    materialize only the physical calls assigned to their rank.
+    """
+    packed_segment_lengths = meta.extra_info.get(PACKED_ATTENTION_SEGMENT_LENGTHS)
+    if packed_segment_lengths is None:
+        return None
+    if meta.sequence_lengths is None:
+        raise ValueError(
+            "packed attention metadata requires meta.sequence_lengths"
+        )
+    validate_packed_attention_segment_lengths(
+        packed_segment_lengths, meta.sequence_lengths
+    )
+
+    sequence_lengths: list[int] = []
+    parent_indices: list[int] = []
+    segment_indices: list[int] = []
+    for parent_index, row_segments in enumerate(packed_segment_lengths):
+        for segment_index, segment_length in enumerate(row_segments):
+            sequence_lengths.append(segment_length)
+            parent_indices.append(parent_index)
+            segment_indices.append(segment_index)
+    return PackedAttentionCallMeta(
+        sequence_lengths=sequence_lengths,
+        parent_indices=parent_indices,
+        segment_indices=segment_indices,
+    )
+
+
+def split_packed_attention_microbatch_metas(
+    meta: KVBatchMeta,
+) -> list[KVBatchMeta]:
+    """Split one DP-rank meta into its already-planned packed microbatches.
+
+    ``shard_meta_for_dp`` stores physical calls in packer execution order and
+    records contiguous ranges for each packed bin.  Workers use this helper to
+    fetch the logical parent rows once, then expand/broadcast/consume one bin at
+    a time instead of materializing the full ``[calls, global_max_call]``
+    rectangle.
+
+    The returned metas retain only the parent rows referenced by their bin and
+    remap ``PACKED_ATTENTION_SELECTED_SEGMENTS`` to those local rows.  Their
+    packing metadata describes exactly one microbatch, so the existing model
+    preparation path consumes them without re-packing or changing call order.
+    """
+    extra = meta.extra_info or {}
+    segment_lengths = extra.get(PACKED_ATTENTION_SEGMENT_LENGTHS)
+    selected_segments = extra.get(PACKED_ATTENTION_SELECTED_SEGMENTS)
+    micro_batch_indices = extra.get(MICRO_BATCH_INDICES)
+    micro_batch_lengths = extra.get(MICRO_BATCH_LENGTHS)
+    elem_counts = extra.get(ELEM_COUNTS_PER_GB)
+
+    if segment_lengths is None or selected_segments is None:
+        return [meta]
+    if micro_batch_indices is None or micro_batch_lengths is None:
+        return [meta]
+    if len(micro_batch_indices) != len(micro_batch_lengths):
+        raise ValueError(
+            "packed attention microbatch index/length chunk counts differ: "
+            f"{len(micro_batch_indices)} != {len(micro_batch_lengths)}"
+        )
+    if elem_counts is not None and len(elem_counts) != len(micro_batch_indices):
+        raise ValueError(
+            "packed attention elem_counts_per_gb must align with packing chunks"
+        )
+
+    out: list[KVBatchMeta] = []
+    chunk_offset = 0
+    for chunk_index, (chunk_ranges, chunk_lengths) in enumerate(
+        zip(micro_batch_indices, micro_batch_lengths, strict=True)
+    ):
+        if len(chunk_ranges) != len(chunk_lengths):
+            raise ValueError(
+                "packed attention microbatch ranges/lengths differ in chunk "
+                f"{chunk_index}: {len(chunk_ranges)} != {len(chunk_lengths)}"
+            )
+        chunk_count = (
+            int(elem_counts[chunk_index])
+            if elem_counts is not None
+            else (int(chunk_ranges[-1][1]) if chunk_ranges else 0)
+        )
+        for (start, stop), packed_length in zip(
+            chunk_ranges, chunk_lengths, strict=True
+        ):
+            start = int(start)
+            stop = int(stop)
+            if not 0 <= start < stop <= chunk_count:
+                raise ValueError(
+                    "invalid packed attention microbatch range "
+                    f"[{start}, {stop}) for chunk size {chunk_count}"
+                )
+            calls = selected_segments[chunk_offset + start : chunk_offset + stop]
+            if len(calls) != stop - start:
+                raise ValueError(
+                    "packed attention selected-call metadata ended before its "
+                    "microbatch ranges"
+                )
+
+            parent_indices = list(dict.fromkeys(int(parent) for parent, _ in calls))
+            parent_to_local = {
+                parent: local for local, parent in enumerate(parent_indices)
+            }
+            micro_meta = meta.subset(parent_indices)
+            micro_meta.extra_info[PACKED_ATTENTION_SELECTED_SEGMENTS] = [
+                (parent_to_local[int(parent)], int(segment))
+                for parent, segment in calls
+            ]
+            micro_meta.extra_info[MICRO_BATCH_INDICES] = [[[0, len(calls)]]]
+            micro_meta.extra_info[MICRO_BATCH_LENGTHS] = [[int(packed_length)]]
+            micro_meta.extra_info[ELEM_COUNTS_PER_GB] = [len(calls)]
+            micro_meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] = max(
+                int(segment_lengths[parent][segment])
+                for parent, segment in calls
+            )
+            out.append(micro_meta)
+        chunk_offset += chunk_count
+
+    if chunk_offset != len(selected_segments):
+        raise ValueError(
+            "packed attention packing metadata does not cover every selected call: "
+            f"covered={chunk_offset}, selected={len(selected_segments)}"
+        )
+    if not out:
+        raise ValueError("packed attention packing metadata contains no microbatches")
+    return out
 
 
 def shard_meta_for_dp(
@@ -94,25 +238,14 @@ def shard_meta_for_dp(
 
     logical_seq_lens = list(meta.sequence_lengths)
     packed_segment_lengths = meta.extra_info.get(PACKED_ATTENTION_SEGMENT_LENGTHS)
-    call_parents: list[int] | None = None
-    call_segment_indices: list[int] | None = None
-    if packed_segment_lengths is not None:
-        validate_packed_attention_segment_lengths(
-            packed_segment_lengths, logical_seq_lens
-        )
+    packed_call_meta = expand_meta_for_packed_attention(meta)
+    if packed_call_meta is not None:
         if dynamic_batching_args is not None:
             raise NotImplementedError(
                 "packed attention metadata is not supported with dynamic batching; "
                 "use sequence packing"
             )
-        call_parents = []
-        call_segment_indices = []
-        seq_lens = []
-        for parent_index, row_segments in enumerate(packed_segment_lengths):
-            for segment_index, segment_length in enumerate(row_segments):
-                call_parents.append(parent_index)
-                call_segment_indices.append(segment_index)
-                seq_lens.append(segment_length)
+        seq_lens = packed_call_meta.sequence_lengths
     else:
         seq_lens = logical_seq_lens
     # Skeleton BatchedDataDict — `shard_by_batch_size` only needs
@@ -174,10 +307,14 @@ def shard_meta_for_dp(
         idx_list: list[int] = shard[META_IDX].tolist()
         flat_idx.extend(idx_list)
         rank_extra = dict(base_extra)
-        if packed_segment_lengths is not None:
-            assert call_parents is not None and call_segment_indices is not None
+        if packed_call_meta is not None:
+            assert packed_segment_lengths is not None
             selected_global = [
-                (call_parents[i], call_segment_indices[i]) for i in idx_list
+                (
+                    packed_call_meta.parent_indices[i],
+                    packed_call_meta.segment_indices[i],
+                )
+                for i in idx_list
             ]
             parent_indices = list(
                 dict.fromkeys(parent for parent, _ in selected_global)

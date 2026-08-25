@@ -820,6 +820,16 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             generation_token_ids = output_item_dict.pop("generation_token_ids")
             generation_log_probs = output_item_dict.pop("generation_log_probs")
             routed_experts_raw = output_item_dict.pop("routed_experts", None)
+            execution_metadata = {
+                field: output_item_dict.pop(field)
+                for field in (
+                    "ng_generation_replica_id",
+                    "ng_generation_weight_version",
+                    "ng_kv_cache_scheduler_block_size",
+                    "ng_kv_cache_hash_block_size",
+                )
+                if field in output_item_dict
+            }
             new_prompt_token_ids = prompt_token_ids[len(seen_token_ids) :]
 
             routed_experts = None
@@ -903,6 +913,7 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                 "generation_logprobs": torch.tensor(generation_log_probs),
                 "is_invalid_tool_call": is_invalid_tool_call,
                 "has_malformed_thinking": has_malformed_thinking,
+                **execution_metadata,
             }
             if routed_experts is not None:
                 assistant_message["routed_experts"] = routed_experts[

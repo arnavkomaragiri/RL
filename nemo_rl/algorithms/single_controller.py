@@ -43,6 +43,7 @@ import ray
 import torch
 
 from nemo_rl.algorithms.async_utils.staleness_sampler import create_sampler
+from nemo_rl.algorithms.grpo import compute_and_apply_seq_logprob_error_masking
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
@@ -179,6 +180,7 @@ class SingleControllerActor:
             "rewards": [],
             "masked_advantages": [],
             "sequence_lengths": [],
+            "seq_logprob_error_records": [],
         }
 
         print(
@@ -655,6 +657,51 @@ class SingleControllerActor:
         sample_mask = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.sample_mask_field)
         ).float()
+
+        if self._policy_logprobs_required:
+            generation_logprobs = tensor_field(
+                data,
+                adv_cfg.generation_logprobs_field,
+            )
+            policy_logprobs = tensor_field(
+                data,
+                adv_cfg.policy_logprobs_field,
+            )
+            original_sample_mask = sample_mask.clone()
+            logprob_data = BatchedDataDict(
+                {
+                    "token_mask": token_mask,
+                    "sample_mask": sample_mask,
+                    "prev_logprobs": policy_logprobs,
+                    "generation_logprobs": generation_logprobs,
+                }
+            )
+            seq_error_record = compute_and_apply_seq_logprob_error_masking(
+                train_data=logprob_data,
+                rewards=rewards,
+                seq_logprob_error_threshold=(
+                    self._master_config.grpo.seq_logprob_error_threshold
+                ),
+            )
+            sample_mask = logprob_data["sample_mask"]
+            valid_seq_mask = (
+                token_mask[:, 1:] * original_sample_mask.unsqueeze(-1)
+            ).sum(dim=-1) > 0
+            kept_valid_seq_mask = valid_seq_mask & sample_mask.bool()
+            seq_error_record["_num_valid_seqs_before_mask"] = float(
+                valid_seq_mask.sum().item()
+            )
+            seq_error_record["_num_valid_seqs_after_mask"] = float(
+                kept_valid_seq_mask.sum().item()
+            )
+            seq_error_record["_num_masked_correct"] = float(
+                seq_error_record["masked_correct_pct"]
+                * seq_error_record["num_masked_seqs"]
+            )
+            self._step_log_dict["seq_logprob_error_records"].append(
+                seq_error_record
+            )
+
         mask = token_mask * sample_mask.unsqueeze(-1)
 
         repeated_batch: dict[str, torch.Tensor] = {
@@ -667,10 +714,7 @@ class SingleControllerActor:
 
         kwargs: dict[str, torch.Tensor] = {}
         if self._policy_logprobs_required:
-            kwargs["logprobs_policy"] = tensor_field(
-                data,
-                adv_cfg.policy_logprobs_field,
-            )
+            kwargs["logprobs_policy"] = policy_logprobs
         if self._reference_logprobs_required:
             kwargs["logprobs_reference"] = tensor_field(
                 data,
@@ -690,16 +734,17 @@ class SingleControllerActor:
             response_advantages.detach().cpu()
         )
 
+        fields_to_put = {adv_cfg.output_field: advantages}
+        if self._master_config.grpo.seq_logprob_error_threshold is not None:
+            fields_to_put[adv_cfg.sample_mask_field] = sample_mask
+
         await self._call_dp(
             "put_samples",
             sample_ids=meta.sample_ids,
             partition_id=meta.partition_id,
-            fields=fields_for_put(
-                meta,
-                {adv_cfg.output_field: advantages},
-            ),
+            fields=fields_for_put(meta, fields_to_put),
         )
-        return meta.with_fields([adv_cfg.output_field])
+        return meta.with_fields(list(fields_to_put))
 
     # ── utility helpers ────────────────────────────────────────────────────
 
@@ -713,7 +758,12 @@ class SingleControllerActor:
             *adv_cfg.repeated_batch_fields,
         ]
         if self._policy_logprobs_required:
-            fields.append(adv_cfg.policy_logprobs_field)
+            fields.extend(
+                [
+                    adv_cfg.policy_logprobs_field,
+                    adv_cfg.generation_logprobs_field,
+                ]
+            )
         if self._reference_logprobs_required:
             fields.append(adv_cfg.reference_logprobs_field)
         return list(dict.fromkeys(fields))

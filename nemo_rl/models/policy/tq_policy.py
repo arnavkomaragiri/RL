@@ -29,6 +29,7 @@ no key minting). Workers fetch their slice from TQ via
 
 from __future__ import annotations
 
+import json
 import warnings
 from collections import defaultdict
 from collections.abc import Mapping
@@ -42,6 +43,7 @@ import torch
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data.packed_rollouts import (
     PACKED_ATTENTION_SEGMENT_LENGTHS,
+    PACKED_ATTENTION_SELECTED_SEGMENTS,
     reassemble_packed_attention_segments,
 )
 from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta, build_data_plane_client
@@ -49,8 +51,10 @@ from nemo_rl.data_plane.column_io import read_columns, round_up, write_columns
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
 from nemo_rl.data_plane.schema import (
     DP_TRAIN_FIELDS,
+    ELEM_COUNTS_PER_GB,
     GLOBAL_FORWARD_PAD_SEQLEN,
     LP_SEED_FIELDS,
+    MICRO_BATCH_INDICES,
     fields_with_optional_routed_experts,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -87,6 +91,43 @@ def _model_sequence_lengths(meta: KVBatchMeta) -> list[int]:
     if segment_lengths is not None:
         return [length for row in segment_lengths for length in row]
     return list(meta.sequence_lengths or [])
+
+
+def _streamed_packed_broadcast_slots(meta: KVBatchMeta) -> list[int]:
+    """Dense token slots per streamed packed bin for one DP-rank meta."""
+    extra = meta.extra_info or {}
+    segment_lengths = extra.get(PACKED_ATTENTION_SEGMENT_LENGTHS)
+    selected_segments = extra.get(PACKED_ATTENTION_SELECTED_SEGMENTS)
+    micro_batch_indices = extra.get(MICRO_BATCH_INDICES)
+    elem_counts = extra.get(ELEM_COUNTS_PER_GB)
+    if (
+        segment_lengths is None
+        or selected_segments is None
+        or micro_batch_indices is None
+    ):
+        return []
+
+    slots: list[int] = []
+    chunk_offset = 0
+    for chunk_index, chunk_ranges in enumerate(micro_batch_indices):
+        chunk_count = (
+            int(elem_counts[chunk_index])
+            if elem_counts is not None
+            else (int(chunk_ranges[-1][1]) if chunk_ranges else 0)
+        )
+        for start, stop in chunk_ranges:
+            calls = selected_segments[
+                chunk_offset + int(start) : chunk_offset + int(stop)
+            ]
+            if not calls:
+                continue
+            width = max(
+                int(segment_lengths[parent][segment])
+                for parent, segment in calls
+            )
+            slots.append(len(calls) * width)
+        chunk_offset += chunk_count
+    return slots
 
 
 def _concatenate_packed_logprob_results(
@@ -251,7 +292,9 @@ class TQPolicy(Policy):
     def _stamp_pad_seqlen(self, meta: KVBatchMeta) -> None:
         """Mint ``GLOBAL_FORWARD_PAD_SEQLEN`` onto ``meta.extra_info`` (idempotent).
 
-        Cross-DP forward pad target. Preshard shards inherit it via
+        Cross-DP forward pad target. Packed rollouts use the longest physical
+        call, matching legacy's expand-before-shard batch width; unpacked
+        batches use the longest logical row. Preshard shards inherit it via
         ``dict(meta.extra_info)`` propagation.
         """
         if not meta.sequence_lengths:
@@ -261,9 +304,96 @@ class TQPolicy(Policy):
         _, dba = self._packing_args("train_mb_tokens")
         seq_round = int(dba["sequence_length_round"]) if dba is not None else 1
         pad_mult = int(meta.extra_info.get("pad_to_multiple", 1))
-        meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] = round_up(
+        model_sequence_lengths = _model_sequence_lengths(meta)
+        segment_lengths = (meta.extra_info or {}).get(
+            PACKED_ATTENTION_SEGMENT_LENGTHS
+        )
+        meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] = (
+            max(model_sequence_lengths)
+            if segment_lengths is not None
+            else round_up(
+                max(model_sequence_lengths), max(pad_mult, seq_round)
+            )
+        )
+
+    def _emit_packed_padding_comparison(
+        self,
+        *,
+        stage: str,
+        meta: KVBatchMeta,
+        dp_metas: list[KVBatchMeta],
+    ) -> None:
+        """Report old logical-row vs expanded-call replica-broadcast padding."""
+        observability = self.dp_cfg.get("observability") or {}
+        if not observability.get("packing_memory_enabled", False):
+            return
+        segment_lengths = (meta.extra_info or {}).get(
+            PACKED_ATTENTION_SEGMENT_LENGTHS
+        )
+        if segment_lengths is None or not meta.sequence_lengths:
+            return
+
+        _, dba = self._packing_args("train_mb_tokens")
+        seq_round = int(dba["sequence_length_round"]) if dba is not None else 1
+        pad_mult = int(meta.extra_info.get("pad_to_multiple", 1))
+        logical_pad = round_up(
             max(meta.sequence_lengths), max(pad_mult, seq_round)
         )
+        physical_pad = int(meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN])
+        previous_logical_slots = sum(
+            len(rank_meta.sample_ids) * logical_pad for rank_meta in dp_metas
+        )
+        expanded_call_slots = sum(
+            len(
+                rank_meta.extra_info.get(
+                    PACKED_ATTENTION_SELECTED_SEGMENTS, []
+                )
+            )
+            * physical_pad
+            for rank_meta in dp_metas
+        )
+        valid_call_tokens = sum(
+            length for row_lengths in segment_lengths for length in row_lengths
+        )
+        streamed_slots_by_microbatch = [
+            slots
+            for rank_meta in dp_metas
+            for slots in _streamed_packed_broadcast_slots(rank_meta)
+        ]
+        streamed_call_slots = sum(streamed_slots_by_microbatch)
+        event = {
+            "stage": stage,
+            "logical_rows": len(meta.sample_ids),
+            "physical_calls": sum(len(row) for row in segment_lengths),
+            "valid_call_tokens": valid_call_tokens,
+            "previous_logical_broadcast_slots": previous_logical_slots,
+            "expanded_call_broadcast_slots": expanded_call_slots,
+            "previous_padding_fraction": (
+                1.0 - valid_call_tokens / previous_logical_slots
+                if previous_logical_slots
+                else 0.0
+            ),
+            "expanded_padding_fraction": (
+                1.0 - valid_call_tokens / expanded_call_slots
+                if expanded_call_slots
+                else 0.0
+            ),
+            "streamed_microbatch_broadcast_slots": streamed_call_slots,
+            "streamed_padding_fraction": (
+                1.0 - valid_call_tokens / streamed_call_slots
+                if streamed_call_slots
+                else 0.0
+            ),
+            "peak_streamed_microbatch_broadcast_slots": max(
+                streamed_slots_by_microbatch, default=0
+            ),
+            "broadcast_slot_reduction_fraction": (
+                1.0 - expanded_call_slots / previous_logical_slots
+                if previous_logical_slots
+                else 0.0
+            ),
+        }
+        print(f"tq_packed_padding: {json.dumps(event, sort_keys=True)}", flush=True)
 
     def read_from_dataplane(
         self,
@@ -360,6 +490,11 @@ class TQPolicy(Policy):
                 sequence_packing_args=spa,
                 dynamic_batching_args=dba,
             )
+        self._emit_packed_padding_comparison(
+            stage=task_name,
+            meta=meta,
+            dp_metas=metas,
+        )
         with timer.time(f"{timer_prefix}/submit_futures") if timer else nullcontext():
             futures = self.worker_group.run_all_workers_sharded_data(
                 worker_method,
@@ -503,6 +638,11 @@ class TQPolicy(Policy):
                 sequence_packing_args=spa,
                 dynamic_batching_args=dba,
             )
+        self._emit_packed_padding_comparison(
+            stage="train",
+            meta=meta,
+            dp_metas=dp_metas,
+        )
 
         if self.flops_tracker is not None:
             self.flops_tracker.reset()
@@ -637,6 +777,11 @@ class TQPolicy(Policy):
                 sequence_packing_args=spa,
                 dynamic_batching_args=dba,
             )
+        self._emit_packed_padding_comparison(
+            stage="train_microbatch",
+            meta=meta,
+            dp_metas=dp_metas,
+        )
 
         if self.flops_tracker is not None:
             self.flops_tracker.track_batch(_model_sequence_lengths(meta))

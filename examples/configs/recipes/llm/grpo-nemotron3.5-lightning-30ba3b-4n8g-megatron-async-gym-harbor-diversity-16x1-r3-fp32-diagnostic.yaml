@@ -1,0 +1,49 @@
+# One-step model-parity control over 16 distinct Harbor tasks. Keep the
+# checkpoint-required FP32 vLLM recurrent-state cache and replay vLLM's MoE
+# routes in MCore. The trace also computes MCore's natural top-k routes from the
+# same scores without changing the replayed forward.
+defaults: ./grpo-nemotron3.5-lightning-30ba3b-4n8g-megatron-async-gym-harbor-smoke-131k-tp8cp2.yaml
+
+grpo:
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 1
+  max_num_steps: 1
+  async_grpo:
+    max_trajectory_age_steps: 1
+
+policy:
+  train_global_batch_size: 16
+  generation_batch_size: 16
+  router_replay:
+    enabled: true
+  megatron_cfg:
+    # The installed mamba_ssm lacks the optional state_dtype argument. Keep the
+    # MCore default, which makes materialized SSM states follow BF16 activations.
+    mamba_training_ssm_states_dtype: null
+    env_vars:
+      NRL_R3_TRACE: "1"
+      NRL_R3_TRACE_VERIFY_FORWARD: "1"
+      NRL_R3_TRACE_COMPARE_NATURAL: "1"
+      NRL_R3_TRACE_STEPS: "1"
+      NRL_R3_TRACE_SAMPLES: "16"
+      NRL_R3_TRACE_MICROBATCHES: "16"
+      NRL_R3_TRACE_DIR: ${logger.log_dir}/r3_trace
+  generation:
+    vllm_kwargs:
+      mamba_ssm_cache_dtype: float32
+
+checkpointing:
+  enabled: false
+
+logger:
+  token_logprob_diagnostics:
+    enabled: true
+    max_sequences: 16
+    top_k_tokens_per_sequence: 32
+    min_abs_logprob_diff: 0.25
+    min_sequence_mult_prob_error: 1.05
+    context_tokens: 8
+    relative_position_bins: 10
+    top_token_ids_by_total_abs_diff: 32
+  wandb:
+    name: grpo-nemotron3.5-lightning-harbor-diversity-16x1-r3-fp32-diagnostic

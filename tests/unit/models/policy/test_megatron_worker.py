@@ -69,6 +69,25 @@ def test_model_owned_mtp_loss_mask_packing_capability_is_detected():
     assert not _model_self_packs_mtp_loss_mask(object())
 
 
+@pytest.mark.parametrize(
+    "mtp_num_layers,disable_mtp_loss,expected",
+    [(None, False, False), (0, False, False), (1, False, True), (1, True, False)],
+)
+def test_mtp_loss_enabled_requires_layers_and_enabled_loss(
+    mtp_num_layers: Optional[int], disable_mtp_loss: bool, expected: bool
+):
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _mtp_loss_enabled,
+    )
+
+    config = SimpleNamespace(
+        mtp_num_layers=mtp_num_layers,
+        disable_mtp_loss=disable_mtp_loss,
+    )
+
+    assert _mtp_loss_enabled(config) is expected
+
+
 def test_regular_model_does_not_delegate_packing():
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         _model_self_packs_for_cp,

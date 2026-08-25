@@ -14,6 +14,8 @@ from typing import Any
 import httpx
 from opensandbox import Sandbox
 from opensandbox.config import ConnectionConfig
+from opensandbox.models.execd import RunCommandOpts
+from opensandbox.models.sandboxes import Volume
 
 
 def parse_args() -> argparse.Namespace:
@@ -29,11 +31,43 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--create-timeout-seconds", type=int, default=720)
     parser.add_argument("--observe-seconds", type=int, default=120)
+    parser.add_argument("--command-timeout-seconds", type=int, default=30)
+    parser.add_argument(
+        "--background-exec",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Submit and poll the command through OpenSandbox background exec.",
+    )
+    parser.add_argument(
+        "--command",
+        default="printf opensandbox-probe-ok",
+        help="Read-only diagnostic command to run after the sandbox is healthy.",
+    )
+    parser.add_argument(
+        "--volumes-json",
+        default="[]",
+        help="JSON list of OpenSandbox Volume mappings to attach to the probe.",
+    )
+    parser.add_argument(
+        "--metadata-json",
+        default='{"probe":"nemo-rl-opensandbox"}',
+        help="JSON metadata mapping attached to the probe sandbox.",
+    )
     args = parser.parse_args()
     if not args.domain:
         parser.error("--domain or OPENSANDBOX_DOMAIN is required")
     if not os.environ.get("OPENSANDBOX_API_KEY"):
         parser.error("OPENSANDBOX_API_KEY is required")
+    try:
+        args.volumes = [Volume(**item) for item in json.loads(args.volumes_json)]
+    except (TypeError, ValueError) as error:
+        parser.error(f"--volumes-json must be a JSON list of Volume mappings: {error}")
+    try:
+        args.metadata = json.loads(args.metadata_json)
+        if not isinstance(args.metadata, dict):
+            raise TypeError("metadata must be a mapping")
+    except (TypeError, ValueError) as error:
+        parser.error(f"--metadata-json must be a JSON mapping: {error}")
     return args
 
 
@@ -60,6 +94,54 @@ async def report_diagnostics(sandbox: Sandbox) -> None:
             print(
                 f"diagnostic_{kind}_error={type(error).__name__}: {error}", flush=True
             )
+
+
+async def run_probe_command(sandbox: Sandbox, args: argparse.Namespace) -> None:
+    if not args.background_exec:
+        execution = await asyncio.wait_for(
+            sandbox.commands.run(args.command),
+            timeout=args.command_timeout_seconds,
+        )
+        print_json("command", execution)
+        return
+
+    submitted_at = time.monotonic()
+    execution = await asyncio.wait_for(
+        sandbox.commands.run(
+            args.command,
+            opts=RunCommandOpts(
+                background=True,
+                timeout=timedelta(seconds=args.command_timeout_seconds),
+            ),
+        ),
+        timeout=30,
+    )
+    execution_id = execution.id
+    print(
+        f"background_submit_elapsed_seconds={time.monotonic() - submitted_at:.3f}",
+        flush=True,
+    )
+    print(f"background_execution_id={execution_id}", flush=True)
+
+    deadline = time.monotonic() + args.command_timeout_seconds + 60
+    attempt = 0
+    while True:
+        attempt += 1
+        status = await asyncio.wait_for(
+            sandbox.commands.get_command_status(execution_id), timeout=30
+        )
+        print_json(f"background_status_{attempt}", status)
+        if not status.running:
+            logs = await asyncio.wait_for(
+                sandbox.commands.get_background_command_logs(execution_id), timeout=30
+            )
+            print_json("background_logs", logs)
+            return
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"background command still running after {args.command_timeout_seconds + 60}s"
+            )
+        await asyncio.sleep(5)
 
 
 async def probe(args: argparse.Namespace) -> None:
@@ -92,7 +174,8 @@ async def probe(args: argparse.Namespace) -> None:
                 entrypoint=["tail", "-f", "/dev/null"],
                 resource={"cpu": "4", "memory": "64Gi"},
                 resource_requests={"cpu": "0.25", "memory": "512Mi"},
-                metadata={"probe": "nemo-rl-opensandbox"},
+                metadata=args.metadata,
+                volumes=args.volumes,
                 connection_config=connection,
                 skip_health_check=True,
             ),
@@ -125,10 +208,7 @@ async def probe(args: argparse.Namespace) -> None:
 
         await report_diagnostics(sandbox)
         try:
-            execution = await asyncio.wait_for(
-                sandbox.commands.run("printf opensandbox-probe-ok"), timeout=30
-            )
-            print_json("command", execution)
+            await run_probe_command(sandbox, args)
         except Exception as error:  # noqa: BLE001 - command failure is probe output
             print(f"command_error={type(error).__name__}: {error}", flush=True)
             await report_diagnostics(sandbox)

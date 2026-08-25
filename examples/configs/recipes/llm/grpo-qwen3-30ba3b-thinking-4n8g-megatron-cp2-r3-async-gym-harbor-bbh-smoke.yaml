@@ -7,6 +7,9 @@ grpo:
   num_prompts_per_step: 2
   num_generations_per_prompt: 2
   max_num_steps: 1
+  # Force behavior-policy logprob recomputation for the same sequence- and
+  # token-level diagnostics used by the Nemotron Harbor smoke.
+  seq_logprob_error_threshold: 2
   val_at_start: false
   val_at_end: false
   val_period: 1000

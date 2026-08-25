@@ -1,0 +1,27 @@
+# Four-hour Harbor/OpenCode stress stage with one eight-sample advantage group
+# per prompt. The launcher must use the same 64 x 8 shape so generation and
+# training both retain a global batch size of 512.
+defaults: ./grpo-nemotron3.5-lightning-30ba3b-4n8g-megatron-async-gym-harbor-smoke-131k-tp8cp2.yaml
+
+grpo:
+  num_prompts_per_step: 64
+  num_generations_per_prompt: 8
+  max_num_epochs: 100
+  max_num_steps: 1000000
+  async_grpo:
+    max_trajectory_age_steps: 4
+
+env:
+  nemo_gym:
+    num_samples_in_parallel: 1024
+
+checkpointing:
+  enabled: true
+  metric_name: null
+  keep_top_k: 1
+  save_period: 1000000
+  checkpoint_must_save_by: "00:03:45:00"
+
+logger:
+  wandb:
+    name: grpo-nemotron3.5-lightning-harbor-stress-64x8-age4

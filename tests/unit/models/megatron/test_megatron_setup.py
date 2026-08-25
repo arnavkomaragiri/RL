@@ -586,6 +586,35 @@ class TestApplyParallelismConfig:
 
 
 @pytest.mark.mcore
+class TestApplyMTPConfig:
+    """Tests for _apply_mtp_config function."""
+
+    def test_applies_loss_disable_without_changing_mtp_topology(self):
+        from nemo_rl.models.megatron.setup import _apply_mtp_config
+
+        model_cfg = SimpleNamespace(
+            mtp_num_layers=1,
+            mtp_loss_scaling_factor=0.3,
+            disable_mtp_loss=False,
+            mtp_use_repeated_layer=True,
+            mtp_detach_heads=False,
+        )
+        config = {
+            "megatron_cfg": {
+                "mtp_loss_scaling_factor": 0.0,
+                "disable_mtp_loss": True,
+            }
+        }
+
+        _apply_mtp_config(model_cfg, config)
+
+        assert model_cfg.mtp_num_layers == 1
+        assert model_cfg.mtp_use_repeated_layer is True
+        assert model_cfg.mtp_loss_scaling_factor == 0.0
+        assert model_cfg.disable_mtp_loss is True
+
+
+@pytest.mark.mcore
 class TestApplyMoeConfig:
     """Tests for _apply_moe_config function."""
 
@@ -904,6 +933,33 @@ class TestApplyPrecisionConfig:
             }
             _apply_precision_config(model_cfg, config, torch.float32)
             assert model_cfg.pipeline_dtype == expected_dtype
+
+    @pytest.mark.parametrize(
+        "dtype_str,expected_dtype",
+        [
+            ("float32", torch.float32),
+            ("bfloat16", torch.bfloat16),
+            ("float16", torch.float16),
+            (None, None),
+        ],
+    )
+    def test_mamba_training_ssm_states_dtype_mapping(
+        self, dtype_str, expected_dtype
+    ):
+        """Test that the configured Mamba training-state dtype reaches MCore."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        model_cfg = SimpleNamespace(bf16=False, fp16=False)
+        config = {
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "mamba_training_ssm_states_dtype": dtype_str,
+            }
+        }
+
+        _apply_precision_config(model_cfg, config, torch.bfloat16)
+
+        assert model_cfg.mamba_training_ssm_states_dtype == expected_dtype
 
 
 @pytest.mark.mcore

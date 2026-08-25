@@ -1,0 +1,16 @@
+# Isolate whether vLLM's FP32 recurrent-state cache causes the Nemotron 3.5
+# generation/training logprob mismatch. The bundled MCore scan accumulates its
+# recurrent state internally in FP32 even though this mamba_ssm build does not
+# expose an explicit training-state dtype argument.
+defaults: ./grpo-nemotron3.5-lightning-30ba3b-4n8g-megatron-async-gym-harbor-stress-32x16-age4.yaml
+
+policy:
+  megatron_cfg:
+    mamba_training_ssm_states_dtype: null
+  generation:
+    vllm_kwargs:
+      mamba_ssm_cache_dtype: bfloat16
+
+logger:
+  wandb:
+    name: grpo-nemotron3.5-lightning-harbor-stress-32x16-age4-vllm-bf16-ssm

@@ -171,7 +171,7 @@ def task_rubric_item_points(task: dict[str, Any]) -> list[int]:
 
 def validate_input_inventory(task: dict[str, Any]) -> list[str]:
     records = task.get("input_file_manifest")
-    if not isinstance(records, list) or not records:
+    if not isinstance(records, list):
         raise ValueError("hidden task metadata has no input_file_manifest")
     expected: dict[Path, dict[str, Any]] = {}
     for record in records:
@@ -209,12 +209,13 @@ def validate_input_inventory(task: dict[str, Any]) -> list[str]:
     ]
 
 
-def validate_submission(task: dict[str, Any]) -> dict[str, Any]:
+def validate_submission(
+    task: dict[str, Any], capsule_inputs: list[str]
+) -> dict[str, Any]:
     report = APP_ROOT / "REPORT.md"
     if not report.is_file() or not report.read_text(errors="replace").strip():
         raise InvalidSubmissionError("REPORT.md is missing or empty")
 
-    inputs = validate_input_inventory(task)
     source: list[str] = []
     artifacts: list[str] = []
     documents: list[str] = []
@@ -237,7 +238,7 @@ def validate_submission(task: dict[str, Any]) -> dict[str, Any]:
         "valid": True,
         "validation_errors": [],
         "analysis_source": source,
-        "capsule_inputs": inputs,
+        "capsule_inputs": capsule_inputs,
         "generated_artifacts": artifacts,
         "documentation": documents,
     }
@@ -297,14 +298,16 @@ def score_solution(arguments: dict[str, Any]) -> dict[str, Any]:
     if sum(item_maxima) != task.get("max_points"):
         raise ValueError("hidden rubric points do not match max_points")
     score, assessment = validate_assessment(arguments, item_maxima)
+    capsule_inputs: list[str] = []
     try:
-        submission = validate_submission(task)
+        capsule_inputs = validate_input_inventory(task)
+        submission = validate_submission(task, capsule_inputs)
     except InvalidSubmissionError as exc:
         submission = {
             "valid": False,
             "validation_errors": [str(exc)],
             "analysis_source": [],
-            "capsule_inputs": [],
+            "capsule_inputs": capsule_inputs,
             "generated_artifacts": [],
             "documentation": [],
         }

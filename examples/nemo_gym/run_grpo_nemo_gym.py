@@ -180,6 +180,7 @@ def main() -> None:
             "megatron_cfg" in config.policy
             and config.policy["megatron_cfg"]["enabled"]
             and bool(config.policy["megatron_cfg"].get("mtp_num_layers"))
+            and not bool(config.policy["megatron_cfg"].get("disable_mtp_loss"))
         )
         config.policy["generation"] = configure_generation_config(
             config.policy["generation"],

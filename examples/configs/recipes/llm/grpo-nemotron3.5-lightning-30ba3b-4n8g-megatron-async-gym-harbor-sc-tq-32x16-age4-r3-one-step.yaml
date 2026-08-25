@@ -1,0 +1,33 @@
+# One-step SingleController/TQ stress gate. In-order lookahead admits four
+# future rollout batches while preserving chronological training dispatch.
+defaults: ./grpo-nemotron3.5-lightning-30ba3b-4n8g-megatron-async-gym-harbor-stress-32x16-age4-r3-one-step.yaml
+
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: simple
+  storage_capacity: 1000000
+  num_storage_units: 2
+  claim_meta_poll_interval_s: 0.5
+  global_segment_size: 549755813888
+  local_buffer_size: 68719476736
+  observability:
+    enabled: true
+    packing_memory_enabled: true
+
+async_rl:
+  sampler:
+    name: in_order
+    max_lookahead_versions: 4
+  min_groups_for_streaming_train: 1
+  # Four 32-prompt lookahead batches can keep 128 prompts in flight. At G=16,
+  # this reaches the configured 2048-environment ceiling.
+  max_inflight_prompts: 128
+  # In-order requires one live batch plus four lookahead batches.
+  max_buffered_rollouts: 160
+  diagnostics: true
+
+logger:
+  log_dir: logs/grpo-nemotron3.5-lightning-harbor-sc-tq-32x16-age4-r3-one-step
+  wandb:
+    name: grpo-nemotron3.5-lightning-harbor-sc-tq-32x16-age4-r3-one-step

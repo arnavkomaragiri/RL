@@ -1,0 +1,40 @@
+# Four-hour Harbor/OpenCode stress stage with one 16-sample advantage group
+# per prompt. The launcher must use the same 32 x 16 shape so generation and
+# training both retain a global batch size of 512.
+defaults: ./grpo-nemotron3.5-lightning-30ba3b-4n8g-megatron-async-gym-harbor-smoke-131k-tp8cp2.yaml
+
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
+  max_num_epochs: 100
+  max_num_steps: 1000000
+  async_grpo:
+    max_trajectory_age_steps: 4
+    # Keep each 16-rollout prompt group intact for advantage estimation and
+    # optimization. Partial completion cohorts are deliberately disabled.
+
+env:
+  nemo_gym:
+    # Temporary upload backpressure until capsule data is mounted in OpenSandbox.
+    num_samples_in_parallel: 1024
+    # Retry only a failed rollout in a fresh sandbox; completed G=16 siblings
+    # remain attached to their original prompt group.
+    max_rollout_retries: 3
+
+checkpointing:
+  enabled: true
+  metric_name: null
+  keep_top_k: 1
+  save_period: 1000000
+  checkpoint_must_save_by: "00:03:45:00"
+
+logger:
+  token_logprob_diagnostics:
+    enabled: true
+    max_sequences: 32
+    top_k_tokens_per_sequence: 32
+    min_abs_logprob_diff: 0.25
+    min_sequence_mult_prob_error: 1.05
+    context_tokens: 8
+  wandb:
+    name: grpo-nemotron3.5-lightning-harbor-stress-32x16-age4

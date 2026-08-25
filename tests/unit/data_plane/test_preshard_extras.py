@@ -32,13 +32,20 @@ import torch
 from nemo_rl.data.packed_rollouts import (
     PACKED_ATTENTION_SEGMENT_LENGTHS,
     PACKED_ATTENTION_SELECTED_SEGMENTS,
+    expand_batched_data_for_packed_attention,
+    expand_selected_packed_attention_segments,
 )
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data_plane.column_io import kv_first_write, read_columns
-from nemo_rl.data_plane.preshard import shard_meta_for_dp
+from nemo_rl.data_plane.preshard import (
+    shard_meta_for_dp,
+    split_packed_attention_microbatch_metas,
+)
 from nemo_rl.data_plane.schema import (
     DP_TRAIN_FIELDS,
+    ELEM_COUNTS_PER_GB,
+    GLOBAL_FORWARD_PAD_SEQLEN,
     MICRO_BATCH_INDICES,
     MICRO_BATCH_LENGTHS,
 )
@@ -231,6 +238,201 @@ def test_shard_meta_for_dp_balances_exact_calls_and_preserves_logical_keys():
         aggregated = BatchedDataDict({"call": torch.tensor(dispatched_calls)})
         aggregated.reorder_data(unsorted)
         assert aggregated["call"].tolist() == [0, 1, 2]
+
+
+def test_tq_selected_calls_match_legacy_expansion_including_routes() -> None:
+    segment_lengths = [[3, 2], [4]]
+    logical = BatchedDataDict(
+        {
+            "input_ids": torch.tensor(
+                [[10, 11, 12, 20, 21], [30, 31, 32, 33, 0]]
+            ),
+            "input_lengths": torch.tensor([5, 4]),
+            "token_mask": torch.tensor([[0, 1, 1, 0, 1], [0, 1, 1, 1, 0]]),
+            "generation_logprobs": torch.arange(10, dtype=torch.float32).reshape(
+                2, 5
+            ),
+            "routed_experts": torch.arange(2 * 5 * 3 * 2, dtype=torch.int16).reshape(
+                2, 5, 3, 2
+            ),
+            PACKED_ATTENTION_SEGMENT_LENGTHS: segment_lengths,
+        }
+    )
+    legacy, _ = expand_batched_data_for_packed_attention(
+        logical, output_sequence_length=6
+    )
+    meta = KVBatchMeta(
+        partition_id="train",
+        task_name="prev_lp",
+        sample_ids=["rollout-0", "rollout-1"],
+        fields=[
+            "input_ids",
+            "input_lengths",
+            "token_mask",
+            "generation_logprobs",
+            "routed_experts",
+        ],
+        sequence_lengths=[5, 4],
+        extra_info={PACKED_ATTENTION_SEGMENT_LENGTHS: segment_lengths},
+    )
+    rank_metas, unsorted = shard_meta_for_dp(
+        meta,
+        dp_world=2,
+        sequence_packing_args={
+            "algorithm": "modified_first_fit_decreasing",
+            "input_key": "input_ids",
+            "input_lengths_key": "input_lengths",
+            "max_tokens_per_microbatch": 5,
+            "sequence_length_pad_multiple": 1,
+        },
+    )
+
+    sample_index = {"rollout-0": 0, "rollout-1": 1}
+    rank_calls = []
+    for rank_meta in rank_metas:
+        parent_indices = torch.tensor(
+            [sample_index[sample_id] for sample_id in rank_meta.sample_ids]
+        )
+        fetched = BatchedDataDict(
+            {
+                key: value.index_select(0, parent_indices)
+                for key, value in logical.items()
+                if key != PACKED_ATTENTION_SEGMENT_LENGTHS
+            }
+        )
+        rank_calls.append(
+            expand_selected_packed_attention_segments(
+                fetched,
+                segment_lengths=rank_meta.extra_info[
+                    PACKED_ATTENTION_SEGMENT_LENGTHS
+                ],
+                selected_segments=rank_meta.extra_info[
+                    PACKED_ATTENTION_SELECTED_SEGMENTS
+                ],
+                output_sequence_length=6,
+            )
+        )
+
+    tq_calls = BatchedDataDict.from_batches(rank_calls)
+    if unsorted is not None:
+        tq_calls.reorder_data(unsorted)
+    for field in (
+        "input_ids",
+        "input_lengths",
+        "token_mask",
+        "generation_logprobs",
+        "routed_experts",
+    ):
+        assert torch.equal(tq_calls[field], legacy[field])
+    assert tq_calls["input_ids"].shape == (3, 6)
+
+
+def test_jagged_tq_selected_calls_match_dense_expansion() -> None:
+    segment_lengths = [[3, 2], [4]]
+    dense = BatchedDataDict(
+        {
+            "input_ids": torch.tensor(
+                [[10, 11, 12, 20, 21], [30, 31, 32, 33, 0]]
+            ),
+            "input_lengths": torch.tensor([5, 4]),
+            "token_mask": torch.tensor([[0, 1, 1, 0, 1], [0, 1, 1, 1, 0]]),
+            "routed_experts": torch.arange(
+                2 * 5 * 3 * 2, dtype=torch.int16
+            ).reshape(2, 5, 3, 2),
+        }
+    )
+    jagged = BatchedDataDict(
+        {
+            "input_ids": torch.nested.nested_tensor(
+                [dense["input_ids"][0, :5], dense["input_ids"][1, :4]],
+                layout=torch.jagged,
+            ),
+            "input_lengths": dense["input_lengths"],
+            "token_mask": torch.nested.nested_tensor(
+                [dense["token_mask"][0, :5], dense["token_mask"][1, :4]],
+                layout=torch.jagged,
+            ),
+            "routed_experts": torch.nested.nested_tensor(
+                [
+                    dense["routed_experts"][0, :5],
+                    dense["routed_experts"][1, :4],
+                ],
+                layout=torch.jagged,
+            ),
+        }
+    )
+
+    selected = [(1, 0), (0, 1)]
+    expected = expand_selected_packed_attention_segments(
+        dense,
+        segment_lengths=segment_lengths,
+        selected_segments=selected,
+        output_sequence_length=4,
+    )
+    actual = expand_selected_packed_attention_segments(
+        jagged,
+        segment_lengths=segment_lengths,
+        selected_segments=selected,
+        output_sequence_length=4,
+    )
+
+    for field in ("input_ids", "input_lengths", "token_mask", "routed_experts"):
+        assert torch.equal(actual[field], expected[field])
+
+
+def test_split_packed_attention_metas_preserves_packer_bins() -> None:
+    meta = KVBatchMeta(
+        partition_id="train",
+        task_name="prev_lp",
+        sample_ids=["rollout-0", "rollout-1", "rollout-2"],
+        fields=list(DP_TRAIN_FIELDS),
+        sequence_lengths=[8, 7, 6],
+        extra_info={
+            PACKED_ATTENTION_SEGMENT_LENGTHS: [[5, 3], [7], [4, 2]],
+        },
+    )
+    rank_metas, _ = shard_meta_for_dp(
+        meta,
+        dp_world=1,
+        sequence_packing_args={
+            "algorithm": "modified_first_fit_decreasing",
+            "input_key": "input_ids",
+            "input_lengths_key": "input_lengths",
+            "max_tokens_per_microbatch": 10,
+            "sequence_length_pad_multiple": 1,
+            "microbatch_order": "largest_first",
+        },
+    )
+    rank_meta = rank_metas[0]
+    micro_metas = split_packed_attention_microbatch_metas(rank_meta)
+
+    original_calls = rank_meta.extra_info[PACKED_ATTENTION_SELECTED_SEGMENTS]
+    reconstructed_calls = []
+    for micro_meta in micro_metas:
+        assert micro_meta.extra_info[MICRO_BATCH_INDICES] == [
+            [[0, len(micro_meta.extra_info[PACKED_ATTENTION_SELECTED_SEGMENTS])]]
+        ]
+        assert micro_meta.extra_info[ELEM_COUNTS_PER_GB] == [
+            len(micro_meta.extra_info[PACKED_ATTENTION_SELECTED_SEGMENTS])
+        ]
+        local_calls = micro_meta.extra_info[PACKED_ATTENTION_SELECTED_SEGMENTS]
+        source_parent = {
+            sample_id: rank_meta.sample_ids.index(sample_id)
+            for sample_id in micro_meta.sample_ids
+        }
+        reconstructed_calls.extend(
+            (source_parent[micro_meta.sample_ids[parent]], segment)
+            for parent, segment in local_calls
+        )
+        expected_width = max(
+            rank_meta.extra_info[PACKED_ATTENTION_SEGMENT_LENGTHS][parent][segment]
+            for parent, segment in reconstructed_calls[-len(local_calls) :]
+        )
+        assert (
+            micro_meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] == expected_width
+        )
+
+    assert reconstructed_calls == original_calls
 
 
 # ── meta utility helpers ──────────────────────────────────────────────

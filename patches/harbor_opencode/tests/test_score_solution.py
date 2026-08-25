@@ -127,6 +127,9 @@ class ScoreSolutionTest(unittest.TestCase):
             ["REPORT.md is missing or empty"],
         )
         self.assertEqual(
+            evaluation["submission"]["capsule_inputs"], ["data/input.csv"]
+        )
+        self.assertEqual(
             json.loads(self.scorer.REWARD_PATH.read_text()), {"reward": 0.0}
         )
 
@@ -143,6 +146,18 @@ class ScoreSolutionTest(unittest.TestCase):
             "capsule input was modified during rollout",
             evaluation["submission"]["validation_errors"][0],
         )
+
+    def test_accepts_declared_empty_input_inventory(self) -> None:
+        (self.app / "REPORT.md").write_text("# Result\n")
+        (self.app / "data" / "input.csv").unlink()
+        self.task["input_file_manifest"] = []
+        (self.tests / "task.json").write_text(json.dumps(self.task))
+
+        result = self.scorer.score_solution(self.arguments())
+
+        self.assertEqual(result["reward"], 1.0)
+        evaluation = json.loads(self.scorer.EVALUATION_PATH.read_text())
+        self.assertEqual(evaluation["submission"]["capsule_inputs"], [])
 
     def test_hidden_task_error_still_raises(self) -> None:
         (self.app / "REPORT.md").write_text("# Result\n")

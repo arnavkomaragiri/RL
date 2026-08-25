@@ -88,6 +88,7 @@ class ObservabilityConfig(TypedDict):
 
     enabled: bool
     callback: NotRequired[Callable[[dict[str, Any]], None]]
+    packing_memory_enabled: NotRequired[bool]
 
 
 @dataclass

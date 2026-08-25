@@ -152,3 +152,18 @@ def test_main_configures_generation_for_trained_mtp(
     assert (
         main_context.config.policy["generation"] is main_context.configured_generation
     )
+
+
+def test_main_does_not_refit_disabled_mtp(
+    main_context: SimpleNamespace,
+) -> None:
+    main_context.config.policy["megatron_cfg"]["disable_mtp_loss"] = True
+
+    run_grpo_single_controller.main()
+
+    main_context.configure_generation.assert_called_once_with(
+        main_context.generation_config,
+        "tokenizer",
+        has_refit_draft_weights=False,
+        trains_mtp=False,
+    )

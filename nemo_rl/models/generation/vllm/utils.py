@@ -318,17 +318,40 @@ def attach_routed_experts_to_chat_response_choices(
     return response
 
 
+def attach_generation_metadata_to_chat_response_choices(
+    response: Any,
+    *,
+    weight_version: int,
+    kv_cache_block_metadata: dict[str, int],
+) -> Any:
+    """Attach internal execution identity used by exact-call reconstruction."""
+    for choice in getattr(response, "choices", []):
+        choice.message.ng_generation_weight_version = weight_version
+        choice.message.ng_kv_cache_scheduler_block_size = kv_cache_block_metadata[
+            "scheduler_block_size"
+        ]
+        choice.message.ng_kv_cache_hash_block_size = kv_cache_block_metadata[
+            "hash_block_size"
+        ]
+    return response
+
+
 def model_dump_chat_response_with_routed_experts(response: Any) -> dict[str, Any]:
-    """Dump a vLLM OpenAI chat response while preserving dynamic R3 fields."""
+    """Dump a vLLM response while preserving dynamic training metadata."""
     response_dict = response.model_dump()
     for choice, choice_dict in zip(
         getattr(response, "choices", []), response_dict.get("choices", [])
     ):
-        routed_experts = getattr(
-            getattr(choice, "message", None), "routed_experts", None
-        )
-        if routed_experts is not None:
-            choice_dict.setdefault("message", {})["routed_experts"] = routed_experts
+        message = getattr(choice, "message", None)
+        for field in (
+            "routed_experts",
+            "ng_generation_weight_version",
+            "ng_kv_cache_scheduler_block_size",
+            "ng_kv_cache_hash_block_size",
+        ):
+            value = getattr(message, field, None)
+            if value is not None:
+                choice_dict.setdefault("message", {})[field] = value
     return response_dict
 
 

@@ -23,6 +23,8 @@ The bugs these catch:
     dispatch a per-call reduce, ADDING to an already-reduced bucket).
   - PP>1 pipeline-schedule bypass if ``model.config.grad_sync_func`` is
     not nulled for the step's duration.
+  - repeated MCore finalization across streamed calls, which re-reduces
+    cumulative TP gradients and can overflow the gradient buffer.
   - ``trainer_version`` advancing on abort.
   - ``zero_grad_buffer`` not called at begin (mcore's contiguous grad
     buffer leaks stale grads otherwise).
@@ -65,6 +67,7 @@ def _make_mock_model():
     model = MagicMock()
     model.config = MagicMock()
     model.config.grad_sync_func = "ORIGINAL_GRAD_SYNC_FUNC"  # sentinel
+    model.config.no_sync_func = "ORIGINAL_NO_SYNC_FUNC"  # sentinel
     model.config.num_moe_experts = None  # disable MoE branch
     # no_sync() is a context manager — return a MagicMock that supports
     # __enter__/__exit__ so the `with self.model.no_sync():` block works.
@@ -79,6 +82,12 @@ def _make_mock_model():
     model.parameters = MagicMock(
         return_value=iter([])
     )  # no params for the rescale loop
+
+    # Mirror MCore's finalizer enough for finish-order assertions: the real
+    # function owns finish_grad_sync in addition to TP/embedding reductions.
+    model.config.finalize_model_grads_func = MagicMock(
+        side_effect=lambda models, _num_tokens, **_kwargs: models[0].finish_grad_sync()
+    )
     return model
 
 
@@ -185,6 +194,7 @@ def mock_module_symbols():
             return_value=patches["aggregate_training_statistics"],
         ) as agg,
         patch(f"{WORKER_MOD}.get_moe_metrics", return_value={}) as moe,
+        patch(f"{WORKER_MOD}.reset_model_temporary_tensors") as reset_tmp,
         patch(f"{WORKER_MOD}.get_rerun_state_machine") as grsm,
         patch(f"{WORKER_MOD}.parallel_state") as pstate,
         patch("torch.distributed.all_reduce") as ar,
@@ -211,6 +221,7 @@ def mock_module_symbols():
             "rmax": rmax,
             "agg": agg,
             "moe": moe,
+            "reset_tmp": reset_tmp,
             "grsm": grsm,
             "pstate": pstate,
             "all_reduce": ar,
@@ -268,6 +279,16 @@ class TestBegin:
         w.begin_train_step(loss_fn=w._test_loss_fn)
         assert w.model.config.grad_sync_func is None
         assert w._train_step_state["saved_grad_sync_func"] == "ORIGINAL_GRAD_SYNC_FUNC"
+
+    def test_saves_and_nulls_finalize_model_grads_func(self, mock_module_symbols):
+        """Each streamed scheduler call must not finalize cumulative grads."""
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        finalizer = w.model.config.finalize_model_grads_func
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        assert w.model.config.finalize_model_grads_func is None
+        assert w._train_step_state["saved_finalize_model_grads_func"] is finalizer
 
     def test_double_begin_raises(self, mock_module_symbols):
         from nemo_rl.algorithms.loss.interfaces import LossType
@@ -397,6 +418,16 @@ class TestTrainMicrobatch:
         w.train_microbatch(_fake_batch())
         w.optimizer.step.assert_not_called()
 
+    def test_does_not_finalize_between_streamed_calls(self, mock_module_symbols):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        finalizer = w.model.config.finalize_model_grads_func
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        for _ in range(3):
+            w.train_microbatch(_fake_batch())
+        finalizer.assert_not_called()
+
 
 # ── finish_train_step ────────────────────────────────────────────────────
 
@@ -477,6 +508,24 @@ class TestFinish:
         w = self._setup_open_step(mock_module_symbols, LossType.TOKEN_LEVEL)
         w.finish_train_step()
         assert w.model.config.grad_sync_func == "ORIGINAL_GRAD_SYNC_FUNC"
+
+    def test_finalizes_logical_batch_once(self, mock_module_symbols):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        finalizer = w.model.config.finalize_model_grads_func
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        for _ in range(3):
+            w.train_microbatch(_fake_batch())
+        w.finish_train_step()
+
+        finalizer.assert_called_once_with(
+            [w.model],
+            None,
+            pg_collection=mock_module_symbols["get_pg_collection"],
+            force_all_reduce=False,
+        )
+        assert w.model.config.finalize_model_grads_func is finalizer
 
     def test_clears_train_step_state(self, mock_module_symbols):
         from nemo_rl.algorithms.loss.interfaces import LossType
@@ -648,6 +697,21 @@ class TestAbort:
         w.abort_train_step()
         w.model.zero_grad_buffer.assert_called_once()
         w.optimizer.zero_grad.assert_called_once()
+
+    def test_resets_temporary_state_without_finalizing(self, mock_module_symbols):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        finalizer = w.model.config.finalize_model_grads_func
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(_fake_batch())
+        w.abort_train_step()
+
+        finalizer.assert_not_called()
+        mock_module_symbols["reset_tmp"].assert_called_once_with(
+            w.model.config, [w.model]
+        )
+        assert w.model.config.finalize_model_grads_func is finalizer
 
     def test_does_not_call_optimizer_step(self, mock_module_symbols):
         from nemo_rl.algorithms.loss.interfaces import LossType

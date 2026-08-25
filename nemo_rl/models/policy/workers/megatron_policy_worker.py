@@ -39,6 +39,9 @@ from megatron.bridge.utils.common_utils import get_rank_safe
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.strategies.torch import get_async_strategy
 from megatron.core.distributed import DistributedDataParallel
+from megatron.core.distributed.finalize_model_grads import (
+    reset_model_temporary_tensors,
+)
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallel as custom_FSDP,
 )
@@ -164,6 +167,14 @@ def _model_self_packs_mtp_loss_mask(model: Any) -> bool:
     return any(
         bool(getattr(chunk, "model_owns_mtp_loss_mask_packing", False))
         for chunk in chunks
+    )
+
+
+def _mtp_loss_enabled(model_config: Any) -> bool:
+    """Whether the model should execute and optimize its MTP objective."""
+    mtp_num_layers = getattr(model_config, "mtp_num_layers", None)
+    return bool(mtp_num_layers) and not bool(
+        getattr(model_config, "disable_mtp_loss", False)
     )
 
 
@@ -556,9 +567,10 @@ class MegatronPolicyWorkerImpl(
         # (mbridge VLM wrappers like Qwen3VL). If so, NeMo-RL must hand it an
         # unpacked [B, S] batch rather than pre-packing + CP-sharding itself.
         self.delegate_pack_to_model = _model_self_packs_for_cp(self.model)
-        self.delegate_mtp_loss_mask_to_model = _model_self_packs_mtp_loss_mask(
-            self.model
-        )
+        model_config = self._get_model_config()
+        self.delegate_mtp_loss_mask_to_model = _mtp_loss_enabled(
+            model_config
+        ) and _model_self_packs_mtp_loss_mask(self.model)
         assert (
             not self.delegate_mtp_loss_mask_to_model or self.delegate_pack_to_model
         ), "A model cannot own MTP-mask packing without owning sequence packing"
@@ -571,9 +583,7 @@ class MegatronPolicyWorkerImpl(
                     "A model cannot both own sequence packing and consume caller-packed "
                     "full THD inputs."
                 )
-            model_config = self._get_model_config()
-            mtp_num_layers = getattr(model_config, "mtp_num_layers", None)
-            if mtp_num_layers is not None and mtp_num_layers > 0:
+            if _mtp_loss_enabled(model_config):
                 raise NotImplementedError(
                     "Nemotron Omni caller-packed THD inputs do not yet support MTP. "
                     "Disable MTP for the Nano image/text path."
@@ -777,8 +787,7 @@ class MegatronPolicyWorkerImpl(
                 # Pre-compute the MTP loss mask, only when MTP is enabled, so
                 # process_microbatch can pack it.
                 model_config = self._get_model_config()
-                mtp_num_layers = getattr(model_config, "mtp_num_layers", None)
-                mtp_enabled = mtp_num_layers is not None and mtp_num_layers > 0
+                mtp_enabled = _mtp_loss_enabled(model_config)
                 if mtp_enabled and "token_mask" in batch and "sample_mask" in batch:
                     mtp_loss_mask = batch["token_mask"] * batch[
                         "sample_mask"
@@ -835,8 +844,9 @@ class MegatronPolicyWorkerImpl(
                         self._compute_moe_grad_scale(global_valid_toks)
                     )
                     # Set mtp_grad_scale_func for MTP loss scaling (scales by valid tokens)
-                    mtp_scale = 1.0 / global_valid_toks.clamp(min=1).float()
-                    self._set_mtp_grad_scale_func(lambda: mtp_scale)
+                    if mtp_enabled:
+                        mtp_scale = 1.0 / global_valid_toks.clamp(min=1).float()
+                        self._set_mtp_grad_scale_func(lambda: mtp_scale)
 
                     # Forward pass.
                     draft_enabled = "draft" in self.cfg and self.cfg["draft"]["enabled"]
@@ -1105,7 +1115,7 @@ class MegatronPolicyWorkerImpl(
     #
     # SC drives one ``begin / train_microbatch×N / finish`` cycle per
     # optimizer step. The worker exposes:
-    #   begin_train_step      — open the step (zero grads, null mcore sync hooks)
+    #   begin_train_step      — open the step (zero grads, defer mcore finalization)
     #   train_microbatch      — one DP slice of fwd/bwd, grads accumulate locally
     #   finish_train_step     — all_reduce + opt.step + scheduler.step
     #   abort_train_step      — drop partial state (no opt.step)
@@ -1119,15 +1129,21 @@ class MegatronPolicyWorkerImpl(
     #    over-count: each call's terminal reduce sums an already-reduced
     #    bucket again. We wrap every call in ``self.model.no_sync()`` so
     #    hooks accumulate locally only; one explicit ``start_grad_sync`` +
-    #    ``finish_grad_sync`` at finish does the single true reduce.
+    #    ``finalize_model_grads_func`` at finish does the single true reduce.
     # 2. PP>1: the pipeline scheduler invokes ``config.grad_sync_func``
     #    directly on last-microbatch boundaries — this bypasses the
     #    ``no_sync`` gate. We null it for the duration of the step and
     #    restore at finish/abort.
-    # 3. Grad clip is bundled inside ``MegatronOptimizer.step()``; the 1/N
+    # 3. Every mcore schedule invocation normally calls
+    #    ``finalize_model_grads_func``. Besides DP synchronization, that
+    #    finalizer all-reduces sequence-parallel gradients across TP, updates
+    #    router expert bias, and resets per-batch temporary tensors. Running it
+    #    after every split call repeatedly re-sums cumulative gradients. Defer
+    #    it and invoke it exactly once for the logical optimizer step.
+    # 4. Grad clip is bundled inside ``MegatronOptimizer.step()``; the 1/N
     #    rescale via ``self.model.scale_gradients(1/N)`` must run before
     #    ``optimizer.step()`` so the clip operates on the rescaled grad.
-    # 4. With ``calculate_per_token_loss=True`` + ``average_in_collective=
+    # 5. With ``calculate_per_token_loss=True`` + ``average_in_collective=
     #    False``, mcore's DDP sums (does not average) grads across DP, so
     #    no FSDP-style ``loss *= dp_size*cp_size`` cancellation is needed
     #    per microbatch.
@@ -1162,6 +1178,7 @@ class MegatronPolicyWorkerImpl(
             # Saved across the step so we can restore at finish/abort.
             "saved_grad_sync_func": None,
             "saved_no_sync_func": None,
+            "saved_finalize_model_grads_func": None,
         }
 
     def _assert_step_open(self) -> dict[str, Any]:
@@ -1172,20 +1189,20 @@ class MegatronPolicyWorkerImpl(
             )
         return state
 
-    def _restore_saved_grad_sync_func(self, state: dict[str, Any]) -> None:
+    def _restore_saved_mcore_hooks(self, state: dict[str, Any]) -> None:
         """Restore the mcore hooks nulled in ``begin_train_step``.
 
-        Restores both ``grad_sync_func`` and ``no_sync_func`` from the
-        saved values on the open-step state. Idempotent on those values;
-        safe to call from the happy-path finish/abort or from a try/except
-        cleanup in train_microbatch / finish_train_step when those raise
-        mid-body. See begin_train_step for why ``.config`` is read via
-        getattr-by-string.
+        Idempotent on the saved values, so this is safe on the happy path and
+        from exception cleanup. See ``begin_train_step`` for why ``.config``
+        is read via getattr-by-string.
         """
         model_config = getattr(self.model, "config", None)
         if model_config is not None:
             model_config.grad_sync_func = state.get("saved_grad_sync_func")
             model_config.no_sync_func = state.get("saved_no_sync_func")
+            model_config.finalize_model_grads_func = state.get(
+                "saved_finalize_model_grads_func"
+            )
 
     @wrap_with_nvtx_name("megatron_policy_worker/begin_train_step")
     def begin_train_step(
@@ -1215,7 +1232,7 @@ class MegatronPolicyWorkerImpl(
 
         state = self._split_step_state_init(loss_fn=loss_fn, gbs=gbs, mbs=mbs)
 
-        # Null both mcore hooks that would fire a mid-step DP reduce:
+        # Null the mcore hooks that would finalize or synchronize a partial step:
         #   grad_sync_func — PP scheduler's direct call on last-MB boundaries
         #                    (PP>1 path).
         #   no_sync_func   — ``forward_backward_no_pipelining`` (PP=1, the
@@ -1226,7 +1243,11 @@ class MegatronPolicyWorkerImpl(
         #                    ``model.no_sync()`` we apply in train_microbatch,
         #                    triggering an assertion on the next begin/microbatch
         #                    pair (typically step 2).
-        # Save both so finish/abort restores them.
+        #   finalize_model_grads_func — every scheduler invocation calls this
+        #                    after backward. It includes TP/embedding reductions
+        #                    and per-global-batch router bookkeeping in addition
+        #                    to DP synchronization, so it must run exactly once.
+        # Save all three so finish/abort restores them.
         # Read "config" via getattr-by-string so the token stays out of
         # begin_train_step.__code__.co_names; otherwise cloudpickle matches
         # torch.distributed.config (a non-pickleable ConfigModuleInstance).
@@ -1236,11 +1257,16 @@ class MegatronPolicyWorkerImpl(
                 model_config, "grad_sync_func", None
             )
             state["saved_no_sync_func"] = getattr(model_config, "no_sync_func", None)
+            state["saved_finalize_model_grads_func"] = getattr(
+                model_config, "finalize_model_grads_func", None
+            )
             model_config.grad_sync_func = None
             model_config.no_sync_func = nullcontext
+            model_config.finalize_model_grads_func = None
         else:
             state["saved_grad_sync_func"] = None
             state["saved_no_sync_func"] = None
+            state["saved_finalize_model_grads_func"] = None
 
         self._train_step_state = state
 
@@ -1262,16 +1288,16 @@ class MegatronPolicyWorkerImpl(
         try:
             self._train_microbatch_body(state, data)
         except Exception:
-            # The body left ``grad_sync_func`` nulled when begin_train_step
-            # opened the step. If we propagate without restoring, future
-            # steps run with the PP scheduler bypass disabled. Restore here;
+            # The body left MCore's synchronization/finalization hooks nulled
+            # when begin_train_step opened the step. Restore them before
+            # propagating so future schedules retain normal behavior;
             # the caller is still expected to invoke abort_train_step
             # (idempotent on the saved value) to drop ``_train_step_state``.
             try:
-                self._restore_saved_grad_sync_func(state)
+                self._restore_saved_mcore_hooks(state)
             except Exception:
                 log.exception(
-                    "failed to restore grad_sync_func after train_microbatch error"
+                    "failed to restore mcore hooks after train_microbatch error"
                 )
             raise
 
@@ -1399,16 +1425,16 @@ class MegatronPolicyWorkerImpl(
         try:
             return self._finish_train_step_body(state)
         except Exception:
-            # Mid-finish failure: state machine is in a partial state and
-            # ``grad_sync_func`` may still be nulled (or restored, depending
-            # on how far the body got). Restore unconditionally so future
+            # Mid-finish failure: hooks may still be nulled or may already be
+            # restored, depending on how far the body got. Restore
+            # unconditionally so future
             # steps run with the right config. Leave ``_train_step_state``
             # for the caller's abort_train_step to clear.
             try:
-                self._restore_saved_grad_sync_func(state)
+                self._restore_saved_mcore_hooks(state)
             except Exception:
                 log.exception(
-                    "failed to restore grad_sync_func after finish_train_step error"
+                    "failed to restore mcore hooks after finish_train_step error"
                 )
             raise
 
@@ -1438,17 +1464,30 @@ class MegatronPolicyWorkerImpl(
         # Either way, opt.step sees the right-normalized gradient.
         self.model.scale_gradients(inv_n)
 
-        # Cross-DP grad reduce. Megatron-core's BucketGroup.finish_grad_sync,
-        # when overlap_grad_reduce=False, internally dispatches the synchronous
-        # collective via start_grad_sync(force_all_reduce=...). So calling
-        # both unconditionally double-reduces the grads (scales by world_size).
-        # Mirror the contract: only fire start_grad_sync ourselves when the
-        # overlap path needs it; finish_grad_sync handles the rest.
+        # Restore and run the same finalizer mcore normally invokes once after
+        # all scheduler microbatches. Passing num_tokens=None is intentional:
+        # the split API already applied its exact 1/N normalization above.
+        # The finalizer performs the one DP sync plus TP/embedding reductions
+        # and per-global-batch router bookkeeping that were deferred from each
+        # streamed scheduler invocation.
+        self._restore_saved_mcore_hooks(state)
+        pg_collection = get_pg_collection(self.model)
         if self.cfg["megatron_cfg"]["distributed_data_parallel_config"][
             "overlap_grad_reduce"
         ]:
             self.model.start_grad_sync()
-        self.model.finish_grad_sync()
+        finalize_model_grads_func = state.get("saved_finalize_model_grads_func")
+        if finalize_model_grads_func is not None:
+            finalize_model_grads_func(
+                [self.model],
+                None,
+                pg_collection=pg_collection,
+                force_all_reduce=False,
+            )
+        else:
+            # Preserve the old behavior for lightweight models/test doubles
+            # without an mcore finalizer.
+            self.model.finish_grad_sync()
 
         # Wait for the comm-stream reduce dispatched above before opt.step
         # reads main_grad. Without this, grad_norm collapses to ~1/2.
@@ -1458,7 +1497,6 @@ class MegatronPolicyWorkerImpl(
         # already-rescaled grad. Returns (success, grad_norm, num_zeros).
         update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
 
-        pg_collection = get_pg_collection(self.model)
         update_successful = logical_and_across_model_parallel_group(
             update_successful, mp_group=pg_collection.mp
         )
@@ -1471,9 +1509,6 @@ class MegatronPolicyWorkerImpl(
 
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 2:
             torch.cuda.empty_cache()
-
-        # Restore grad_sync_func before scheduler.step / further state.
-        self._restore_saved_grad_sync_func(state)
 
         # Capture lr/wd BEFORE scheduler.step so the per-mb metrics carry
         # the value of THIS step, not the next one. (terrykong, #2683:832).
@@ -1586,9 +1621,13 @@ class MegatronPolicyWorkerImpl(
         state = getattr(self, "_train_step_state", None)
         if state is None:
             return
-        # Restore grad_sync_func first so the model is back to a normal
-        # state before zero_grad_buffer touches anything.
-        self._restore_saved_grad_sync_func(state)
+        # Restore normal scheduling, then clear temporary router state without
+        # running the full finalizer: abort must not communicate gradients or
+        # update expert bias from a discarded partial batch.
+        self._restore_saved_mcore_hooks(state)
+        model_config = getattr(self.model, "config", None)
+        if model_config is not None:
+            reset_model_temporary_tensors(model_config, [self.model])
         self.model.zero_grad_buffer()
         self.optimizer.zero_grad()
         self._train_step_state = None
@@ -1943,8 +1982,7 @@ class MegatronPolicyWorkerImpl(
                 the model-parallel group, or None when unavailable (e.g. clip_grad == 0 or
                 mtp_detach_heads=False). Logged under "mtp_metrics" as "grad_norm".
         """
-        mtp_num_layers = getattr(self.model.config, "mtp_num_layers", None)
-        if mtp_num_layers is not None and mtp_num_layers > 0:
+        if _mtp_loss_enabled(self._get_model_config()):
             from nemo_rl.models.megatron.common import get_mtp_metrics
 
             # MTP layers live only on the last pipeline stage, so the tracker is
@@ -2275,6 +2313,26 @@ class MegatronPolicyWorkerImpl(
         self, kv_scales: Optional[dict[str, float]] = None
     ) -> None:
         """Broadcast the weights for collective communication."""
+        # A split train step can release its final optimizer/metric temporaries
+        # only after finish_train_step returns, which is later than that method's
+        # own empty_cache call. Refit conversion immediately allocates EP gather
+        # buffers, so make the train -> refit boundary explicit before starting
+        # the weight iterator.
+        if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 2:
+            allocated_before = torch.cuda.memory_allocated()
+            reserved_before = torch.cuda.memory_reserved()
+            torch.cuda.synchronize()
+            gc.collect()
+            torch.cuda.empty_cache()
+            if self.rank == 0:
+                gib = 1024**3
+                print(
+                    "[weight_sync_memory] "
+                    f"allocated={allocated_before / gib:.2f}GiB "
+                    f"reserved_before={reserved_before / gib:.2f}GiB "
+                    f"reserved_after={torch.cuda.memory_reserved() / gib:.2f}GiB",
+                    flush=True,
+                )
         # param_iterator will return (name, tensor), we only need tensor.
         packed_broadcast_producer(
             iterator=self._iter_params_with_optional_kv_scales(kv_scales=kv_scales),

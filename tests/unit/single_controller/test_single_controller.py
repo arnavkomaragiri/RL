@@ -16,7 +16,7 @@
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import torch
@@ -318,8 +318,60 @@ def _train_pump_controller(*, sampler) -> object:
         "rewards": [],
         "masked_advantages": [],
         "sequence_lengths": [],
+        "seq_logprob_error_records": [],
     }
     return ctrl
+
+
+def test_advantage_stage_applies_seq_logprob_mask_before_advantages() -> None:
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._master_config = SimpleNamespace(
+        grpo=SimpleNamespace(seq_logprob_error_threshold=1.2)
+    )
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._policy_logprobs_required = True
+    ctrl._reference_logprobs_required = False
+    ctrl._step_log_dict = {
+        "rewards": [],
+        "masked_advantages": [],
+        "sequence_lengths": [],
+        "seq_logprob_error_records": [],
+    }
+    ctrl._advantage_estimator = MagicMock()
+    ctrl._advantage_estimator.compute_advantage.return_value = torch.ones((2, 3))
+
+    data = BatchedDataDict(
+        {
+            "prompt_ids_for_adv": torch.tensor([[10], [20]]),
+            "total_reward": torch.tensor([1.0, 0.0]),
+            "token_mask": torch.tensor([[0, 1, 1], [0, 1, 1]]),
+            "sample_mask": torch.ones(2),
+            "generation_logprobs": torch.zeros((2, 3)),
+            "prev_logprobs": torch.tensor(
+                [[0.0, 0.0, 0.0], [0.0, 1.0, 1.0]]
+            ),
+        }
+    )
+    ctrl._call_dp = AsyncMock(side_effect=[data, None])
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0", "sample-1"],
+        fields=list(data.keys()),
+        sequence_lengths=[3, 3],
+    )
+
+    out_meta = asyncio.run(ctrl._advantage_stage(meta))
+
+    mask = ctrl._advantage_estimator.compute_advantage.call_args.kwargs["mask"]
+    assert torch.equal(mask, torch.tensor([[0.0, 1.0, 1.0], [0.0, 0.0, 0.0]]))
+    put_fields = ctrl._call_dp.await_args_list[1].kwargs["fields"]
+    assert torch.equal(put_fields["sample_mask"], torch.tensor([1.0, 0.0]))
+    assert "sample_mask" in out_meta.fields
+    assert ctrl._step_log_dict["seq_logprob_error_records"][0][
+        "num_masked_seqs"
+    ] == 1
 
 
 def test_train_pump_stops_after_rollout_exhaustion_and_buffer_drain() -> None:

@@ -1,0 +1,17 @@
+# 131K-context variant of the one-step OpenCode/Harbor diagnostic.
+# PP remains disabled because Nemotron-H refit metadata is currently ambiguous
+# across pipeline stages. TP8 x CP2 uses all 16 training GPUs and reduces the
+# per-rank FP32 vocabulary-logprob tensor from 6 GiB at 49K/TP2/CP2 to 4 GiB.
+defaults: ./grpo-nemotron3.5-lightning-30ba3b-4n8g-megatron-async-gym-harbor-smoke.yaml
+
+policy:
+  max_total_sequence_length: 131072
+  megatron_cfg:
+    empty_unused_memory_level: 2
+    tensor_model_parallel_size: 8
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 2
+
+logger:
+  wandb:
+    name: grpo-nemotron3.5-lightning-harbor-async-smoke-131k-tp8cp2

@@ -102,6 +102,9 @@ policy:
     num_layers_in_last_pipeline_stage: null
     context_parallel_size: 4
     pipeline_dtype: ${policy.precision}
+    # null follows the activation dtype; use float32 for numerically sensitive
+    # Mamba models when parity with the generation backend is required.
+    mamba_training_ssm_states_dtype: null
     sequence_parallel: true
     freeze_moe_router: true
       # moe_router_dtype: "fp64"
@@ -121,6 +124,8 @@ policy:
     moe_shared_expert_overlap: false
     gradient_accumulation_fusion: false
     use_fused_weighted_squared_relu: false
+    # Retain MTP checkpoint parameters but skip and freeze the MTP training loss path.
+    disable_mtp_loss: false
 
     optimizer:
       optimizer: "adam"

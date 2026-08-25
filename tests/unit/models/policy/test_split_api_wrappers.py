@@ -51,9 +51,11 @@ class _SplitStubWorker(TQWorkerMixin):
         self.calls: list[tuple] = []
         self._leader = is_leader
 
-    def _fetch(self, meta):
+    def _fetch(self, meta, **kwargs):
         self.calls.append(("fetch", meta))
-        return {"data_from": meta}
+        data = {"data_from": meta}
+        preprocess = kwargs.get("preprocess")
+        return preprocess(self, data) if preprocess is not None else data
 
     def _attach_or_repack_pack_metadata(self, data, meta):
         self.calls.append(("attach", meta))
@@ -113,7 +115,9 @@ class TestPreshardedWrappers:
                 "sample_mask": torch.tensor([1.0, 0.5]),
             }
         )
-        w._fetch = MagicMock(return_value=data)
+        w._fetch = MagicMock(
+            side_effect=lambda _meta, **kwargs: kwargs["preprocess"](w, data)
+        )
         meta = KVBatchMeta(
             partition_id="train",
             task_name="train",

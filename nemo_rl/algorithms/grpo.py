@@ -19,7 +19,7 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, fields
-from typing import Any, Callable, Optional, TypeVar, cast
+from typing import Any, Callable, NotRequired, Optional, TypeVar, cast
 
 import numpy as np
 import ray
@@ -91,6 +91,7 @@ from nemo_rl.distributed.virtual_cluster import (
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
 from nemo_rl.experience.interfaces import (
+    NEMO_GYM_ROLLOUT_INDEX_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
 )
@@ -107,6 +108,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     GenerationInterface,
     GenerationSamplingParams,
+    ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
     resolve_routed_experts_dtype_name_for_model,
 )
 from nemo_rl.models.generation.megatron import MegatronGeneration
@@ -335,8 +337,33 @@ def _get_grpo_save_state(
     return GRPOSaveState(**state_values)
 
 
+class TokenLogprobDiagnosticsConfig(BaseModel, extra="allow"):
+    """Configure compact per-token generation/recompute logprob diagnostics."""
+
+    enabled: bool = False
+    max_sequences: int = Field(default=32, gt=0)
+    top_k_tokens_per_sequence: int = Field(default=32, gt=0)
+    min_abs_logprob_diff: float = Field(default=0.25, ge=0)
+    min_sequence_mult_prob_error: float = Field(default=1.05, ge=1)
+    context_tokens: int = Field(default=8, ge=0)
+    relative_position_bins: int = Field(default=10, gt=0, le=100)
+    top_token_ids_by_total_abs_diff: int = Field(default=32, gt=0)
+
+
 class GRPOLoggerConfig(LoggerConfig):
     num_val_samples_to_print: int  # number of val samples to print to stdout
+    token_logprob_diagnostics: NotRequired[TokenLogprobDiagnosticsConfig]
+
+
+def _resolve_token_logprob_diagnostics_config(
+    logger_config: GRPOLoggerConfig,
+) -> TokenLogprobDiagnosticsConfig:
+    raw_config = logger_config.get("token_logprob_diagnostics")
+    if raw_config is None:
+        return TokenLogprobDiagnosticsConfig()
+    if isinstance(raw_config, TokenLogprobDiagnosticsConfig):
+        return raw_config
+    return TokenLogprobDiagnosticsConfig.model_validate(raw_config)
 
 
 class MasterConfig(BaseModel, extra="allow"):
@@ -2051,30 +2078,520 @@ def _build_async_grpo_train_data(
     return train_data
 
 
+@dataclass(frozen=True)
+class _ExactCallGeneratedSpan:
+    """One independently sampled token span within an exact model call."""
+
+    start: int
+    end: int
+    message: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _ExactCallSequence:
+    """Tensor view of one captured model invocation."""
+
+    index: int
+    messages: list[dict[str, Any]]
+    length: int
+    token_parts: list[torch.Tensor]
+    routed_expert_parts: list[torch.Tensor] | None
+    has_incomplete_routes: bool
+    generated_spans: list[_ExactCallGeneratedSpan]
+    generation_replica_id: str | None
+    generation_weight_version: int | None
+    kv_cache_scheduler_block_size: int | None
+    kv_cache_hash_block_size: int | None
+
+
+@dataclass
+class _ExactCallPath:
+    """A materialized trie leaf and the sampled spans assigned to it."""
+
+    call: _ExactCallSequence
+    generated_spans: list[_ExactCallGeneratedSpan]
+
+
+def _flatten_exact_call(
+    call: list[dict[str, Any]], call_index: int
+) -> _ExactCallSequence:
+    token_parts: list[torch.Tensor] = []
+    route_parts: list[torch.Tensor] = []
+    route_presence: list[bool] = []
+    generated_spans: list[_ExactCallGeneratedSpan] = []
+    offset = 0
+
+    def call_metadata(field: str, expected_type: type) -> Any:
+        values = {message[field] for message in call if message.get(field) is not None}
+        if len(values) > 1:
+            raise ValueError(
+                f"NeMo-Gym exact call has inconsistent {field}: {sorted(values)!r}"
+            )
+        if not values:
+            return None
+        value = next(iter(values))
+        if not isinstance(value, expected_type):
+            raise ValueError(
+                f"NeMo-Gym exact call {field} must be {expected_type.__name__}, "
+                f"got {type(value).__name__}"
+            )
+        return value
+
+    for message in call:
+        token_ids = message.get("token_ids")
+        if not isinstance(token_ids, torch.Tensor) or token_ids.ndim != 1:
+            raise ValueError(
+                "NeMo-Gym exact calls require one-dimensional token_ids tensors"
+            )
+        message_length = int(token_ids.shape[0])
+        token_parts.append(token_ids)
+
+        routed_experts = message.get("routed_experts")
+        if routed_experts is not None:
+            if not isinstance(routed_experts, torch.Tensor):
+                raise ValueError("routed_experts must be a tensor when present")
+            if routed_experts.shape[0] != message_length:
+                raise ValueError(
+                    "routed_experts must have one row per exact-call token: "
+                    f"routes={routed_experts.shape[0]}, tokens={message_length}"
+                )
+            route_parts.append(routed_experts)
+            route_presence.append(True)
+        elif message_length:
+            route_presence.append(False)
+
+        generation_logprobs = message.get("generation_logprobs")
+        if message.get("role") == "assistant" and generation_logprobs is not None:
+            if (
+                not isinstance(generation_logprobs, torch.Tensor)
+                or generation_logprobs.ndim != 1
+                or generation_logprobs.shape[0] != message_length
+            ):
+                raise ValueError(
+                    "generation_logprobs must have one value per generated token"
+                )
+            if message_length:
+                generated_spans.append(
+                    _ExactCallGeneratedSpan(
+                        start=offset,
+                        end=offset + message_length,
+                        message=message,
+                    )
+                )
+        offset += message_length
+
+    if offset <= 0:
+        raise ValueError("NeMo-Gym produced an empty exact training call")
+
+    has_any_routes = any(route_presence)
+    has_incomplete_routes = has_any_routes and not all(route_presence)
+    return _ExactCallSequence(
+        index=call_index,
+        messages=call,
+        length=offset,
+        token_parts=token_parts,
+        routed_expert_parts=(
+            route_parts if has_any_routes and not has_incomplete_routes else None
+        ),
+        has_incomplete_routes=has_incomplete_routes,
+        generated_spans=generated_spans,
+        generation_replica_id=call_metadata("ng_generation_replica_id", str),
+        generation_weight_version=call_metadata("ng_generation_weight_version", int),
+        kv_cache_scheduler_block_size=call_metadata(
+            "ng_kv_cache_scheduler_block_size", int
+        ),
+        kv_cache_hash_block_size=call_metadata("ng_kv_cache_hash_block_size", int),
+    )
+
+
+def _tensor_parts_equal_prefix(
+    prefix_parts: list[torch.Tensor],
+    descendant_parts: list[torch.Tensor],
+    *,
+    prefix_length: int | None = None,
+) -> bool:
+    """Compare tensor sequences without concatenating their token dimension."""
+    total_prefix_length = sum(int(part.shape[0]) for part in prefix_parts)
+    if prefix_length is None:
+        prefix_length = total_prefix_length
+    if prefix_length < 0 or prefix_length > total_prefix_length:
+        raise ValueError(
+            "prefix_length must lie within the flattened prefix tensor sequence"
+        )
+
+    prefix_index = 0
+    descendant_index = 0
+    prefix_offset = 0
+    descendant_offset = 0
+    compared = 0
+    while compared < prefix_length:
+        if descendant_index >= len(descendant_parts):
+            return False
+        prefix_part = prefix_parts[prefix_index]
+        descendant_part = descendant_parts[descendant_index]
+        length = min(
+            int(prefix_part.shape[0]) - prefix_offset,
+            int(descendant_part.shape[0]) - descendant_offset,
+            prefix_length - compared,
+        )
+        if not torch.equal(
+            prefix_part[prefix_offset : prefix_offset + length],
+            descendant_part[descendant_offset : descendant_offset + length],
+        ):
+            return False
+        compared += length
+        prefix_offset += length
+        descendant_offset += length
+        if prefix_offset == int(prefix_part.shape[0]):
+            prefix_index += 1
+            prefix_offset = 0
+        if descendant_offset == int(descendant_part.shape[0]):
+            descendant_index += 1
+            descendant_offset = 0
+    return True
+
+
+def _tensor_parts_prefix_contains_value(
+    parts: list[torch.Tensor], *, prefix_length: int, value: int
+) -> bool:
+    """Return whether a value occurs in the first ``prefix_length`` token rows."""
+    remaining = prefix_length
+    for part in parts:
+        if remaining <= 0:
+            break
+        length = min(int(part.shape[0]), remaining)
+        if length and bool(part[:length].eq(value).any().item()):
+            return True
+        remaining -= length
+    if remaining:
+        raise ValueError("prefix_length exceeds the flattened tensor sequence")
+    return False
+
+
+def _is_exact_execution_prefix(
+    prefix: _ExactCallSequence, descendant: _ExactCallSequence
+) -> bool:
+    """Return whether ``prefix`` is a strict token-and-route prefix."""
+    if prefix.length >= descendant.length:
+        return False
+    if not _tensor_parts_equal_prefix(prefix.token_parts, descendant.token_parts):
+        return False
+
+    # Partial route capture cannot prove execution-prefix equivalence. Calls with
+    # no routes are the router-replay-off case and may still share token prefixes.
+    if prefix.has_incomplete_routes or descendant.has_incomplete_routes:
+        return False
+    if (prefix.routed_expert_parts is None) != (descendant.routed_expert_parts is None):
+        return False
+    if prefix.routed_expert_parts is None:
+        return True
+
+    # vLLM has not forwarded the final sampled token, so its route row is a
+    # placeholder. Compare only routes that were actually executed. A missing
+    # route before that terminal position is different: execution happened but
+    # capture was incomplete, so equivalence cannot be established.
+    route_comparison_length = prefix.length - 1
+    descendant_routes = cast(list[torch.Tensor], descendant.routed_expert_parts)
+    if _tensor_parts_prefix_contains_value(
+        prefix.routed_expert_parts,
+        prefix_length=route_comparison_length,
+        value=ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
+    ) or _tensor_parts_prefix_contains_value(
+        descendant_routes,
+        prefix_length=route_comparison_length,
+        value=ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
+    ):
+        return False
+    return _tensor_parts_equal_prefix(
+        prefix.routed_expert_parts,
+        descendant_routes,
+        prefix_length=route_comparison_length,
+    )
+
+
+def _page_aligned_execution_prefix_length(
+    prefix: _ExactCallSequence, descendant: _ExactCallSequence
+) -> int | None:
+    """Return the fully reusable cache-page prefix, or ``None`` if unproven.
+
+    The final sampled token has not been forwarded through the model, so it is
+    not part of a reusable page even when the call length lands on a boundary.
+    Routes in the trailing partial page may differ because vLLM recomputes that
+    page. This classifies the fork; it does not merge the two training paths.
+    """
+    if prefix.length >= descendant.length:
+        return None
+    if not _tensor_parts_equal_prefix(prefix.token_parts, descendant.token_parts):
+        return None
+    if (
+        prefix.generation_replica_id is None
+        or prefix.generation_replica_id != descendant.generation_replica_id
+        or prefix.generation_weight_version is None
+        or prefix.generation_weight_version != descendant.generation_weight_version
+    ):
+        return None
+    block_size = prefix.kv_cache_scheduler_block_size
+    hash_block_size = prefix.kv_cache_hash_block_size
+    if (
+        block_size is None
+        or block_size <= 0
+        or block_size != descendant.kv_cache_scheduler_block_size
+        or hash_block_size is None
+        or hash_block_size <= 0
+        or hash_block_size != descendant.kv_cache_hash_block_size
+    ):
+        return None
+    if prefix.has_incomplete_routes or descendant.has_incomplete_routes:
+        return None
+    if prefix.routed_expert_parts is None or descendant.routed_expert_parts is None:
+        return None
+
+    reusable_length = ((prefix.length - 1) // block_size) * block_size
+    if reusable_length <= 0:
+        return None
+    descendant_routes = cast(list[torch.Tensor], descendant.routed_expert_parts)
+    if _tensor_parts_prefix_contains_value(
+        prefix.routed_expert_parts,
+        prefix_length=reusable_length,
+        value=ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
+    ) or _tensor_parts_prefix_contains_value(
+        descendant_routes,
+        prefix_length=reusable_length,
+        value=ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
+    ):
+        return None
+    if not _tensor_parts_equal_prefix(
+        prefix.routed_expert_parts,
+        descendant_routes,
+        prefix_length=reusable_length,
+    ):
+        return None
+    if _tensor_parts_equal_prefix(
+        prefix.routed_expert_parts,
+        descendant_routes,
+        prefix_length=prefix.length - 1,
+    ):
+        return None
+    return reusable_length
+
+
+def _exact_call_trie_diagnostics(
+    calls: list[_ExactCallSequence],
+) -> tuple[int, int, set[str]]:
+    """Count conservative page forks and replicas used by one rollout."""
+    page_forks = 0
+    page_shared_tokens = 0
+    for prefix in calls:
+        for descendant in calls:
+            reusable_length = _page_aligned_execution_prefix_length(prefix, descendant)
+            if reusable_length is not None:
+                page_forks += 1
+                page_shared_tokens += reusable_length
+    replicas = {
+        call.generation_replica_id
+        for call in calls
+        if call.generation_replica_id is not None
+    }
+    return page_forks, page_shared_tokens, replicas
+
+
+def _generated_spans_overlap(
+    left: _ExactCallGeneratedSpan, right: _ExactCallGeneratedSpan
+) -> bool:
+    return left.start < right.end and right.start < left.end
+
+
+def _slice_exact_call_message(
+    message: dict[str, Any], start: int, end: int
+) -> dict[str, Any]:
+    """Slice token-aligned fields while preserving message-level metadata."""
+    message_length = int(cast(torch.Tensor, message["token_ids"]).shape[0])
+    result: dict[str, Any] = {}
+    for key, value in message.items():
+        if (
+            isinstance(value, torch.Tensor)
+            and value.ndim > 0
+            and value.shape[0] == message_length
+        ):
+            result[key] = value[start:end]
+        else:
+            result[key] = value
+    return result
+
+
+def _materialize_exact_call_path(path: _ExactCallPath) -> list[dict[str, Any]]:
+    """Overlay assigned sampled spans onto one exact leaf execution path."""
+    base_messages: list[tuple[int, int, dict[str, Any]]] = []
+    boundaries = {0, path.call.length}
+    offset = 0
+    for message in path.call.messages:
+        end = offset + int(cast(torch.Tensor, message["token_ids"]).shape[0])
+        if end > offset:
+            base_messages.append((offset, end, message))
+            boundaries.update((offset, end))
+        offset = end
+
+    generated_spans = sorted(path.generated_spans, key=lambda span: span.start)
+    for previous, current in zip(generated_spans, generated_spans[1:]):
+        if _generated_spans_overlap(previous, current):
+            raise ValueError(
+                "Exact-call compaction assigned multiple sampled occurrences to "
+                "the same token positions"
+            )
+    for span in generated_spans:
+        boundaries.update((span.start, span.end))
+
+    materialized: list[dict[str, Any]] = []
+    sorted_boundaries = sorted(boundaries)
+    base_index = 0
+    span_index = 0
+    for start, end in zip(sorted_boundaries, sorted_boundaries[1:]):
+        while base_messages[base_index][1] <= start:
+            base_index += 1
+        base_start, _, base_message = base_messages[base_index]
+
+        while (
+            span_index < len(generated_spans)
+            and generated_spans[span_index].end <= start
+        ):
+            span_index += 1
+        owner = (
+            generated_spans[span_index]
+            if span_index < len(generated_spans)
+            and generated_spans[span_index].start <= start
+            and end <= generated_spans[span_index].end
+            else None
+        )
+        if owner is not None:
+            source = owner.message
+            source_start = start - owner.start
+            source_end = end - owner.start
+        else:
+            source = base_message
+            source_start = start - base_start
+            source_end = end - base_start
+        materialized_message = _slice_exact_call_message(
+            source, source_start, source_end
+        )
+
+        # Sampling ownership (role, logprobs, penalty flags) comes from the call
+        # that generated this span, but routes describe the maximal leaf's exact
+        # execution. In particular, do not let an ancestor's synthetic terminal
+        # route overwrite the real route supplied by a descendant prefill.
+        base_routes = base_message.get("routed_experts")
+        if isinstance(base_routes, torch.Tensor):
+            materialized_message["routed_experts"] = base_routes[
+                start - base_start : end - base_start
+            ]
+        else:
+            materialized_message.pop("routed_experts", None)
+        materialized.append(materialized_message)
+
+    return materialized
+
+
+def _compact_exact_call_sequences(
+    rollout_calls: list[list[dict[str, Any]]],
+) -> tuple[list[dict[str, Any]], list[int]]:
+    """Materialize maximal paths through the exact token-and-route prefix trie.
+
+    The trie is represented implicitly by strict-prefix comparisons so building it
+    does not allocate one Python object per captured token. Calls are visited from
+    leaves toward the root. An internal call's sampled spans are assigned to one
+    compatible descendant; calls that retokenize, route differently, or would
+    duplicate an already-owned sampled span remain separate paths.
+    """
+    calls = [
+        _flatten_exact_call(call, call_index)
+        for call_index, call in enumerate(rollout_calls)
+    ]
+    paths: list[_ExactCallPath] = []
+    for call in reversed(calls):
+        assigned = False
+        for path in sorted(paths, key=lambda candidate: candidate.call.index):
+            if not _is_exact_execution_prefix(call, path.call):
+                continue
+            if any(
+                _generated_spans_overlap(span, owned)
+                for span in call.generated_spans
+                for owned in path.generated_spans
+            ):
+                continue
+            path.generated_spans.extend(call.generated_spans)
+            assigned = True
+            break
+        if not assigned:
+            paths.append(
+                _ExactCallPath(
+                    call=call,
+                    generated_spans=list(call.generated_spans),
+                )
+            )
+
+    paths.sort(key=lambda path: path.call.index)
+    materialized_paths = [_materialize_exact_call_path(path) for path in paths]
+    return (
+        [message for path in materialized_paths for message in path],
+        [
+            sum(len(cast(torch.Tensor, message["token_ids"])) for message in path)
+            for path in materialized_paths
+        ],
+    )
+
+
 def _use_exact_nemo_gym_call_sequences(repeated_batch: BatchedDataDict) -> None:
-    """Concatenate exact calls per rollout and retain their attention boundaries."""
+    """Compact exact calls into route-aware trie leaves and retain boundaries."""
     training_message_logs = repeated_batch.get("training_message_logs")
     if training_message_logs is None:
         return
 
     combined_message_logs = []
     segment_lengths = []
+    input_call_count = 0
+    input_token_count = 0
+    page_fork_count = 0
+    page_shared_token_count = 0
+    cross_replica_rollouts = 0
+    max_replicas_per_rollout = 0
     for rollout_calls in training_message_logs:
         if not rollout_calls:
             raise ValueError("NeMo-Gym produced no exact training calls for a rollout")
-        combined = []
-        lengths = []
-        for call in rollout_calls:
-            length = sum(len(message["token_ids"]) for message in call)
-            if length <= 0:
-                raise ValueError("NeMo-Gym produced an empty exact training call")
-            combined.extend(call)
-            lengths.append(length)
+        input_call_count += len(rollout_calls)
+        input_token_count += sum(
+            len(cast(torch.Tensor, message["token_ids"]))
+            for call in rollout_calls
+            for message in call
+        )
+        flattened_calls = [
+            _flatten_exact_call(call, call_index)
+            for call_index, call in enumerate(rollout_calls)
+        ]
+        page_forks, page_shared_tokens, replicas = _exact_call_trie_diagnostics(
+            flattened_calls
+        )
+        page_fork_count += page_forks
+        page_shared_token_count += page_shared_tokens
+        cross_replica_rollouts += int(len(replicas) > 1)
+        max_replicas_per_rollout = max(max_replicas_per_rollout, len(replicas))
+        combined, lengths = _compact_exact_call_sequences(rollout_calls)
         combined_message_logs.append(combined)
         segment_lengths.append(lengths)
 
     repeated_batch["message_log"] = combined_message_logs
     repeated_batch[PACKED_ATTENTION_SEGMENT_LENGTHS] = segment_lengths
+    output_path_count = sum(len(lengths) for lengths in segment_lengths)
+    output_token_count = sum(sum(lengths) for lengths in segment_lengths)
+    print(
+        "NeMo-Gym exact-call trie: "
+        f"calls={input_call_count}, paths={output_path_count}, "
+        f"tokens_before={input_token_count}, tokens_after={output_token_count}, "
+        f"token_reduction={1 - output_token_count / input_token_count:.4f}, "
+        f"page_forks={page_fork_count}, "
+        f"page_shared_tokens={page_shared_token_count}, "
+        f"cross_replica_rollouts={cross_replica_rollouts}, "
+        f"max_replicas_per_rollout={max_replicas_per_rollout}",
+        flush=True,
+    )
 
 
 def _apply_mask_sample_filter(repeated_batch: BatchedDataDict[DatumSpec]) -> int:
@@ -2502,6 +3019,8 @@ def compute_and_apply_seq_logprob_error_masking(
     train_data: BatchedDataDict,
     rewards: torch.Tensor,
     seq_logprob_error_threshold: Optional[float],
+    *,
+    include_per_sequence_errors: bool = False,
 ) -> dict:
     """Compute sequence-level logprob error metrics and optionally mask high-error sequences.
 
@@ -2616,7 +3135,7 @@ def compute_and_apply_seq_logprob_error_masking(
                 flush=True,
             )
 
-    return {
+    result = {
         "max_seq_mult_prob_error": max_seq_mult_prob_error,
         "mean_seq_mult_prob_error": mean_seq_mult_prob_error,
         "min_seq_mult_prob_error": min_seq_mult_prob_error,
@@ -2626,6 +3145,81 @@ def compute_and_apply_seq_logprob_error_masking(
         "num_masked_seqs": num_masked_seqs,
         "masked_correct_pct": masked_correct_pct,
     }
+    if include_per_sequence_errors:
+        result["_per_sequence_mult_prob_error"] = seq_mult_prob_error.detach().cpu()
+    return result
+
+
+def _logprob_sample_metadata(
+    repeated_batch: BatchedDataDict, num_generations_per_prompt: int
+) -> list[dict[str, Any]]:
+    """Build stable identifiers for correlating logprob records with Gym jobs."""
+    task_names = repeated_batch.get("task_name")
+    extra_env_info = repeated_batch.get("extra_env_info")
+    metadata = []
+    for sample_index in range(repeated_batch.size):
+        sample = {
+            "prompt_group_index": sample_index // num_generations_per_prompt,
+            "rollout_index_within_group": sample_index % num_generations_per_prompt,
+        }
+        if isinstance(task_names, list) and sample_index < len(task_names):
+            sample["task_name"] = task_names[sample_index]
+        if isinstance(extra_env_info, list) and sample_index < len(extra_env_info):
+            info = extra_env_info[sample_index]
+            if isinstance(info, dict):
+                for key in (
+                    NEMO_GYM_TASK_INDEX_KEY,
+                    NEMO_GYM_ROLLOUT_INDEX_KEY,
+                ):
+                    if info.get(key) is not None:
+                        sample[key] = info[key]
+        metadata.append(sample)
+    return metadata
+
+
+def _maybe_log_token_logprob_diagnostics(
+    *,
+    logger: Logger,
+    tokenizer: TokenizerType,
+    train_data: BatchedDataDict,
+    repeated_batch: BatchedDataDict,
+    original_sample_mask: torch.Tensor,
+    per_sequence_mult_prob_error: Optional[torch.Tensor],
+    config: TokenLogprobDiagnosticsConfig,
+    step: int,
+    num_generations_per_prompt: int,
+) -> None:
+    if not config.enabled or per_sequence_mult_prob_error is None:
+        return
+
+    diagnostic_data = {
+        "input_ids": train_data["input_ids"],
+        "input_lengths": train_data["input_lengths"],
+        "generation_logprobs": train_data["generation_logprobs"],
+        "prev_logprobs": train_data["prev_logprobs"],
+        "token_mask": train_data["token_mask"],
+        "sample_mask": original_sample_mask,
+    }
+    if PACKED_ATTENTION_SEGMENT_LENGTHS in train_data:
+        diagnostic_data["attention_segment_lengths"] = train_data[
+            PACKED_ATTENTION_SEGMENT_LENGTHS
+        ]
+    logger.log_token_logprob_diagnostics(
+        diagnostic_data,
+        tokenizer,
+        step,
+        per_sequence_mult_prob_error=per_sequence_mult_prob_error,
+        sample_metadata=_logprob_sample_metadata(
+            repeated_batch, num_generations_per_prompt
+        ),
+        max_sequences=config.max_sequences,
+        top_k_tokens_per_sequence=config.top_k_tokens_per_sequence,
+        min_abs_logprob_diff=config.min_abs_logprob_diff,
+        min_sequence_mult_prob_error=config.min_sequence_mult_prob_error,
+        context_tokens=config.context_tokens,
+        relative_position_bins=config.relative_position_bins,
+        top_token_ids_by_total_abs_diff=config.top_token_ids_by_total_abs_diff,
+    )
 
 
 # ===============================================================================
@@ -3217,6 +3811,10 @@ def grpo_train(
                     del extra_multimodal_data
 
                 # Seq-level logprob error metrics/masking require real prev_logprobs
+                token_logprob_diagnostics_config = (
+                    _resolve_token_logprob_diagnostics_config(master_config.logger)
+                )
+                pre_logprob_error_sample_mask = train_data["sample_mask"].clone()
                 if skip_prev_logprobs:
                     # Cannot compute seq-level metrics with placeholder prev_logprobs
                     seq_logprob_error_metrics = _placeholder_seq_logprob_error_metrics()
@@ -3225,6 +3823,21 @@ def grpo_train(
                         train_data=train_data,
                         rewards=rewards,
                         seq_logprob_error_threshold=seq_logprob_error_threshold,
+                        include_per_sequence_errors=token_logprob_diagnostics_config.enabled,
+                    )
+                    per_sequence_mult_prob_error = seq_error_result.pop(
+                        "_per_sequence_mult_prob_error", None
+                    )
+                    _maybe_log_token_logprob_diagnostics(
+                        logger=logger,
+                        tokenizer=tokenizer,
+                        train_data=train_data,
+                        repeated_batch=repeated_batch,
+                        original_sample_mask=pre_logprob_error_sample_mask,
+                        per_sequence_mult_prob_error=per_sequence_mult_prob_error,
+                        config=token_logprob_diagnostics_config,
+                        step=total_steps + 1,
+                        num_generations_per_prompt=master_config.grpo.num_generations_per_prompt,
                     )
                     seq_logprob_error_metrics = seq_error_result
                     if "num_masked_seqs" in seq_logprob_error_metrics:
@@ -3599,7 +4212,7 @@ def grpo_train(
                         "generation_logprobs": train_data["generation_logprobs"],
                         "prev_logprobs": train_data["prev_logprobs"],
                         "token_mask": train_data["token_mask"],
-                        "sample_mask": train_data["sample_mask"],
+                        "sample_mask": pre_logprob_error_sample_mask,
                     },
                     total_steps + 1,
                     name="train/token_mult_prob_error_plot_sample",
@@ -4645,6 +5258,10 @@ def async_grpo_train(
                         )
 
                 # Seq-level logprob error metrics/masking require real prev_logprobs
+                token_logprob_diagnostics_config = (
+                    _resolve_token_logprob_diagnostics_config(master_config.logger)
+                )
+                pre_logprob_error_sample_mask = train_data["sample_mask"].clone()
                 if skip_prev_logprobs:
                     # Cannot compute seq-level metrics with placeholder prev_logprobs
                     seq_logprob_error_metrics = _placeholder_seq_logprob_error_metrics()
@@ -4653,6 +5270,21 @@ def async_grpo_train(
                         train_data=train_data,
                         rewards=rewards,
                         seq_logprob_error_threshold=seq_logprob_error_threshold,
+                        include_per_sequence_errors=token_logprob_diagnostics_config.enabled,
+                    )
+                    per_sequence_mult_prob_error = seq_error_result.pop(
+                        "_per_sequence_mult_prob_error", None
+                    )
+                    _maybe_log_token_logprob_diagnostics(
+                        logger=logger,
+                        tokenizer=tokenizer,
+                        train_data=train_data,
+                        repeated_batch=repeated_batch,
+                        original_sample_mask=pre_logprob_error_sample_mask,
+                        per_sequence_mult_prob_error=per_sequence_mult_prob_error,
+                        config=token_logprob_diagnostics_config,
+                        step=step + 1,
+                        num_generations_per_prompt=master_config.grpo.num_generations_per_prompt,
                     )
                     seq_logprob_error_metrics = seq_error_result
                     if "num_masked_seqs" in seq_logprob_error_metrics:

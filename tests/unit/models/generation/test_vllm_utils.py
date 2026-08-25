@@ -29,6 +29,7 @@ from nemo_rl.models.generation.vllm import utils as vllm_utils
 from nemo_rl.models.generation.vllm.utils import (
     R3_MISSING_ROUTE_SENTINEL,
     aggregate_spec_decode_counters,
+    attach_generation_metadata_to_chat_response_choices,
     attach_routed_experts_to_chat_response_choices,
     compute_spec_decode_metrics,
     format_prompt_for_vllm_generation,
@@ -558,7 +559,7 @@ def test_attach_routed_experts_to_chat_response_choices_raises_for_unmatched_cho
         )
 
 
-def test_model_dump_chat_response_with_routed_experts_preserves_dynamic_field():
+def test_model_dump_chat_response_with_routed_experts_preserves_dynamic_fields():
     routed_experts = [[[1]], [[2]]]
 
     class Response:
@@ -583,6 +584,31 @@ def test_model_dump_chat_response_with_routed_experts_preserves_dynamic_field():
     response_dict = model_dump_chat_response_with_routed_experts(Response())
 
     assert response_dict["choices"][0]["message"]["routed_experts"] == routed_experts
+
+
+def test_attach_and_dump_generation_metadata():
+    response = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace())])
+
+    attach_generation_metadata_to_chat_response_choices(
+        response,
+        weight_version=3,
+        kv_cache_block_metadata={
+            "scheduler_block_size": 1056,
+            "hash_block_size": 1056,
+        },
+    )
+
+    class DumpableResponse:
+        choices = response.choices
+
+        def model_dump(self):
+            return {"choices": [{"message": {"role": "assistant"}}]}
+
+    dumped = model_dump_chat_response_with_routed_experts(DumpableResponse())
+    message = dumped["choices"][0]["message"]
+    assert message["ng_generation_weight_version"] == 3
+    assert message["ng_kv_cache_scheduler_block_size"] == 1056
+    assert message["ng_kv_cache_hash_block_size"] == 1056
 
 
 @pytest.mark.vllm

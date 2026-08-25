@@ -125,10 +125,25 @@ def _global_moe_layer_numbers(model_config: Any) -> list[int]:
 def _router_replay_instances_for_model(model: Any) -> list[tuple[Any, int]]:
     instances: list[tuple[Any, int]] = []
     seen: set[int] = set()
+    mtp_replay_ids: set[int] = set()
+    for module in _iter_model_modules(model):
+        mtp = getattr(module, "mtp", None)
+        if mtp is None:
+            continue
+        for mtp_module in _iter_model_modules(mtp):
+            mtp_replay = getattr(mtp_module, "router_replay", None)
+            if mtp_replay is not None:
+                mtp_replay_ids.add(id(mtp_replay))
+
     for module in _iter_model_modules(model):
         replay = getattr(module, "router_replay", None)
         layer_number = getattr(module, "layer_number", None)
         if replay is None or layer_number is None:
+            continue
+        # vLLM rollout payloads contain routes for the policy transformer, not
+        # the auxiliary MTP block. MTP layer numbers restart at one, so treating
+        # them as policy layers silently replays unrelated routes.
+        if id(replay) in mtp_replay_ids:
             continue
         if id(replay) in seen:
             continue
