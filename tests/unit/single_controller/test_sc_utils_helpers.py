@@ -23,12 +23,14 @@ import torch
 from tensordict import TensorDict
 
 from nemo_rl.algorithms.single_controller_utils.utils import (
+    advantage_group_ids_from_meta,
     aggregate_step_metrics,
     fields_for_put,
     reduce_advantage_pump_metrics,
     squeeze_trailing_unit_dim,
     tensor_field,
 )
+from nemo_rl.data.packed_rollouts import TREE_ATTENTION_LAYOUTS, TreeAttentionLayout
 from nemo_rl.data_plane import KVBatchMeta
 
 
@@ -226,3 +228,56 @@ class TestFieldsForPut:
         out = fields_for_put(meta, {"scalar": value})
         assert not out["scalar"].is_nested
         assert out["scalar"].shape == (2, 1)
+
+    def test_tree_advantages_use_sampled_edge_lengths(self) -> None:
+        meta = _meta(2, sequence_lengths=[7, 5])
+        meta.extra_info[TREE_ATTENTION_LAYOUTS] = [
+            TreeAttentionLayout(
+                segment_lengths=(7,),
+                segment_parents=(-1,),
+                segment_depths=(0,),
+                edge_source_indices=(1, 2, 3),
+                original_token_count=7,
+            ),
+            TreeAttentionLayout(
+                segment_lengths=(5,),
+                segment_parents=(-1,),
+                segment_depths=(0,),
+                edge_source_indices=(1,),
+                original_token_count=5,
+            ),
+        ]
+        value = torch.tensor([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 0.0, 0.0]])
+
+        out = fields_for_put(meta, {"advantages": value})
+
+        assert out["advantages"].is_nested
+        rows = out["advantages"].unbind()
+        assert rows[0].tolist() == [1.0, 2.0, 3.0, 4.0]
+        assert rows[1].tolist() == [5.0, 6.0]
+
+
+class TestAdvantageGroupIdsFromMeta:
+    def test_uses_explicit_group_and_rollout_tags(self) -> None:
+        meta = _meta(4, sequence_lengths=[1, 1, 1, 1])
+        meta.tags = [
+            {"group_id": "a", "rollout_index": 0},
+            {"group_id": "b", "rollout_index": 0},
+            {"group_id": "a", "rollout_index": 1},
+            {"group_id": "b", "rollout_index": 1},
+        ]
+
+        labels = advantage_group_ids_from_meta(meta, expected_group_size=2)
+
+        assert torch.equal(labels, torch.tensor([[0], [1], [0], [1]]))
+
+    def test_rejects_partial_group(self) -> None:
+        meta = _meta(3, sequence_lengths=[1, 1, 1])
+        meta.tags = [
+            {"group_id": "a", "rollout_index": 0},
+            {"group_id": "a", "rollout_index": 1},
+            {"group_id": "b", "rollout_index": 0},
+        ]
+
+        with pytest.raises(ValueError, match="must contain rollout indices"):
+            advantage_group_ids_from_meta(meta, expected_group_size=2)

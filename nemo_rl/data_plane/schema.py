@@ -79,6 +79,7 @@ PROMOTE_1D_FIELDS: frozenset[str] = frozenset(
         INPUT_LENGTHS,
         "total_reward",
         SAMPLE_MASK,
+        "tree_attention_edge_lengths",
     }
 )
 

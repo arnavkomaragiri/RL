@@ -232,8 +232,15 @@ class TestTQReplayBufferReserveCommit:
         assert buf.end_weight_list == [4]
         assert buf.ready_list == [True]
         assert buf.meta_list[0].sample_ids == meta.sample_ids
-        # TQ tag uses start_weight_version (dispatch time).
-        assert meta.tags == [{"weight_version": 3}] * _N_GENS
+        # TQ tags retain dispatch version and explicit rollout-group identity.
+        assert meta.tags == [
+            {
+                "weight_version": 3,
+                "group_id": group_id,
+                "rollout_index": rollout_index,
+            }
+            for rollout_index in range(_N_GENS)
+        ]
         assert len(dp.put_calls) == 1
         assert len(trace_calls) == 1
         assert trace_calls[0]["keys"] == meta.sample_ids

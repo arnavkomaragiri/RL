@@ -36,6 +36,7 @@ from nemo_rl.algorithms.grpo import (
     _apply_configured_message_level_advantage_penalties,
     _apply_mask_sample_filter,
     _apply_message_level_advantage_penalties,
+    _build_exact_call_tree,
     _get_grpo_save_state,
     _initial_grpo_save_state,
     _initial_policy_generation_stale,
@@ -63,10 +64,9 @@ from nemo_rl.algorithms.reward_functions import (
 )
 from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
-from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data.packed_rollouts import (
-    PACKED_ATTENTION_SEGMENT_LENGTHS,
-    expand_batched_data_for_packed_attention,
+    TREE_ATTENTION_LAYOUTS,
+    TREE_ATTENTION_UNIQUE_MESSAGE_LOGS,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import (
@@ -95,17 +95,29 @@ def test_use_exact_nemo_gym_call_sequences_preserves_rollout_rows() -> None:
         [
             [
                 {"role": "user", "token_ids": torch.tensor([10, 11])},
-                {"role": "assistant", "token_ids": torch.tensor([12])},
+                {
+                    "role": "assistant",
+                    "token_ids": torch.tensor([12]),
+                    "generation_logprobs": torch.tensor([-1.0]),
+                },
             ],
             [
                 {"role": "user", "token_ids": torch.tensor([20])},
-                {"role": "assistant", "token_ids": torch.tensor([21, 22])},
+                {
+                    "role": "assistant",
+                    "token_ids": torch.tensor([21, 22]),
+                    "generation_logprobs": torch.tensor([-2.0, -2.1]),
+                },
             ],
         ],
         [
             [
                 {"role": "user", "token_ids": torch.tensor([30])},
-                {"role": "assistant", "token_ids": torch.tensor([31])},
+                {
+                    "role": "assistant",
+                    "token_ids": torch.tensor([31]),
+                    "generation_logprobs": torch.tensor([-3.0]),
+                },
             ]
         ],
     ]
@@ -119,12 +131,79 @@ def test_use_exact_nemo_gym_call_sequences_preserves_rollout_rows() -> None:
 
     _use_exact_nemo_gym_call_sequences(batch)
 
-    assert batch[PACKED_ATTENTION_SEGMENT_LENGTHS] == [[3, 3], [2]]
+    assert [layout.segment_lengths for layout in batch[TREE_ATTENTION_LAYOUTS]] == [
+        (3, 3),
+        (2,),
+    ]
     assert [
         [message["token_ids"].tolist() for message in message_log]
-        for message_log in batch["message_log"]
+        for message_log in batch[TREE_ATTENTION_UNIQUE_MESSAGE_LOGS]
     ] == [[[10, 11], [12], [20], [21, 22]], [[30], [31]]]
+    assert [
+        torch.cat([message["token_ids"] for message in message_log]).tolist()
+        for message_log in batch["message_log"]
+    ] == [[10, 12, 21, 22], [30, 31]]
     assert torch.equal(batch["rewards"], torch.tensor([1.0, 0.0]))
+
+
+def test_exact_call_tree_shares_branches_and_keeps_edge_predecessors() -> None:
+    result = _build_exact_call_tree(
+        [
+            [
+                {"role": "user", "token_ids": torch.tensor([10])},
+                {
+                    "role": "assistant",
+                    "token_ids": torch.tensor([11, 12]),
+                    "generation_logprobs": torch.tensor([-1.1, -1.2]),
+                },
+            ],
+            [
+                {"role": "user", "token_ids": torch.tensor([10, 11])},
+                {
+                    "role": "assistant",
+                    "token_ids": torch.tensor([13]),
+                    "generation_logprobs": torch.tensor([-2.1]),
+                },
+            ],
+        ]
+    )
+
+    assert result.layout.segment_lengths == (2, 1, 1)
+    assert result.layout.segment_parents == (-1, 0, 0)
+    assert result.layout.segment_depths == (0, 2, 2)
+    assert result.layout.edge_source_indices == (0, 1, 1)
+    assert result.layout.original_token_count == 6
+    assert result.layout.unique_token_count == 4
+    assert result.layout.valid_attention_pairs == 9
+    assert torch.equal(
+        torch.cat([message["token_ids"] for message in result.unique_message_log]),
+        torch.tensor([10, 11, 12, 13]),
+    )
+    assert torch.equal(
+        torch.cat([message["token_ids"] for message in result.edge_message_log]),
+        torch.tensor([10, 11, 12, 13]),
+    )
+
+
+def test_exact_call_tree_preserves_duplicate_sampled_edges() -> None:
+    duplicate_call = [
+        {"role": "user", "token_ids": torch.tensor([10])},
+        {
+            "role": "assistant",
+            "token_ids": torch.tensor([11]),
+            "generation_logprobs": torch.tensor([-1.1]),
+        },
+    ]
+
+    result = _build_exact_call_tree([duplicate_call, duplicate_call])
+
+    assert result.layout.segment_lengths == (2,)
+    assert result.layout.unique_token_count == 2
+    assert result.layout.edge_source_indices == (0, 0)
+    assert torch.equal(
+        torch.cat([message["token_ids"] for message in result.edge_message_log]),
+        torch.tensor([10, 11, 11]),
+    )
 
 
 def test_exact_calls_compact_strict_prefix_and_train_each_token_once() -> None:
@@ -160,32 +239,26 @@ def test_exact_calls_compact_strict_prefix_and_train_each_token_once() -> None:
 
     _use_exact_nemo_gym_call_sequences(batch)
     add_grpo_token_loss_masks_and_generation_logprobs(batch["message_log"])
-    flat, input_lengths = batched_message_log_to_flat_message(
-        batch["message_log"], pad_value_dict={"token_ids": 0}
-    )
-    train_data = BatchedDataDict(
-        {
-            "input_ids": flat["token_ids"],
-            "input_lengths": input_lengths,
-            "token_mask": flat["token_loss_mask"],
-            PACKED_ATTENTION_SEGMENT_LENGTHS: batch[PACKED_ATTENTION_SEGMENT_LENGTHS],
-        }
-    )
-
-    expanded, _ = expand_batched_data_for_packed_attention(train_data)
-
+    layout = batch[TREE_ATTENTION_LAYOUTS][0]
+    assert layout.segment_lengths == (6,)
+    assert layout.edge_source_indices == (0, 1, 3, 4)
     assert torch.equal(
-        expanded["input_ids"],
-        torch.tensor([[10, 11, 12, 20, 21, 22]]),
+        torch.cat(
+            [
+                message["token_ids"]
+                for message in batch[TREE_ATTENTION_UNIQUE_MESSAGE_LOGS][0]
+            ]
+        ),
+        torch.tensor([10, 11, 12, 20, 21, 22]),
     )
-    assert torch.equal(
-        expanded["token_mask"],
-        torch.tensor([[0, 1, 1, 0, 1, 1]]),
+    # The edge stream contains one dummy predecessor plus every sampled token
+    # exactly once, so the shifted policy loss counts four tokens.
+    assert (
+        sum(
+            int(message["token_loss_mask"].sum()) for message in batch["message_log"][0]
+        )
+        == 4
     )
-    assert batch[PACKED_ATTENTION_SEGMENT_LENGTHS] == [[6]]
-    # ClippedPGLossFn consumes token_mask[:, 1:]. Both turns share one exact
-    # execution path, and each of the four sampled tokens is counted once.
-    assert expanded["token_mask"][:, 1:].sum().item() == 4
 
 
 def test_exact_calls_branch_when_retokenization_changes_context() -> None:
@@ -218,7 +291,9 @@ def test_exact_calls_branch_when_retokenization_changes_context() -> None:
 
     _use_exact_nemo_gym_call_sequences(batch)
 
-    assert batch[PACKED_ATTENTION_SEGMENT_LENGTHS] == [[3, 4]]
+    layout = batch[TREE_ATTENTION_LAYOUTS][0]
+    assert layout.segment_lengths == (1, 2, 3)
+    assert layout.segment_parents == (-1, 0, 0)
 
 
 def test_exact_calls_branch_when_router_replay_prefix_differs() -> None:
@@ -266,7 +341,9 @@ def test_exact_calls_branch_when_router_replay_prefix_differs() -> None:
 
     _use_exact_nemo_gym_call_sequences(batch)
 
-    assert batch[PACKED_ATTENTION_SEGMENT_LENGTHS] == [[3, 5]]
+    layout = batch[TREE_ATTENTION_LAYOUTS][0]
+    assert layout.segment_lengths == (1, 2, 4)
+    assert layout.segment_parents == (-1, 0, 0)
 
 
 def test_exact_calls_classify_runtime_page_aligned_route_fork(capsys) -> None:
@@ -314,7 +391,9 @@ def test_exact_calls_classify_runtime_page_aligned_route_fork(capsys) -> None:
     _use_exact_nemo_gym_call_sequences(batch)
 
     # The trailing partial cache page remains two independent training paths.
-    assert batch[PACKED_ATTENTION_SEGMENT_LENGTHS] == [[6, 7]]
+    layout = batch[TREE_ATTENTION_LAYOUTS][0]
+    assert layout.segment_lengths == (4, 2, 3)
+    assert layout.segment_parents == (-1, 0, 0)
     diagnostics = capsys.readouterr().out
     assert "page_forks=1" in diagnostics
     assert "page_shared_tokens=4" in diagnostics
@@ -364,11 +443,11 @@ def test_exact_calls_compact_when_router_replay_prefix_matches() -> None:
 
     _use_exact_nemo_gym_call_sequences(batch)
 
-    assert batch[PACKED_ATTENTION_SEGMENT_LENGTHS] == [[4]]
+    assert batch[TREE_ATTENTION_LAYOUTS][0].segment_lengths == (4,)
     materialized_routes = torch.cat(
         [
             message["routed_experts"]
-            for message in batch["message_log"][0]
+            for message in batch[TREE_ATTENTION_UNIQUE_MESSAGE_LOGS][0]
             if "routed_experts" in message
         ]
     )
@@ -419,7 +498,9 @@ def test_exact_calls_branch_on_internal_missing_route() -> None:
 
     _use_exact_nemo_gym_call_sequences(batch)
 
-    assert batch[PACKED_ATTENTION_SEGMENT_LENGTHS] == [[3, 5]]
+    layout = batch[TREE_ATTENTION_LAYOUTS][0]
+    assert layout.segment_lengths == (1, 2, 4)
+    assert layout.segment_parents == (-1, 0, 0)
 
 
 def test_exact_calls_preserve_duplicate_sample_multiplicity() -> None:
@@ -449,7 +530,7 @@ def test_exact_calls_preserve_duplicate_sample_multiplicity() -> None:
     _use_exact_nemo_gym_call_sequences(batch)
     add_grpo_token_loss_masks_and_generation_logprobs(batch["message_log"])
 
-    assert batch[PACKED_ATTENTION_SEGMENT_LENGTHS] == [[2, 4]]
+    assert batch[TREE_ATTENTION_LAYOUTS][0].segment_lengths == (4,)
     assert (
         sum(
             int(message["token_loss_mask"].sum()) for message in batch["message_log"][0]

@@ -31,6 +31,7 @@ import torch
 from nemo_rl.data.packed_rollouts import (
     PACKED_ATTENTION_SEGMENT_LENGTHS,
     PACKED_ATTENTION_SELECTED_SEGMENTS,
+    TREE_ATTENTION_LAYOUTS,
     validate_packed_attention_segment_lengths,
 )
 from nemo_rl.data_plane.interfaces import KVBatchMeta
@@ -69,9 +70,7 @@ def expand_meta_for_packed_attention(
     if packed_segment_lengths is None:
         return None
     if meta.sequence_lengths is None:
-        raise ValueError(
-            "packed attention metadata requires meta.sequence_lengths"
-        )
+        raise ValueError("packed attention metadata requires meta.sequence_lengths")
     validate_packed_attention_segment_lengths(
         packed_segment_lengths, meta.sequence_lengths
     )
@@ -173,8 +172,7 @@ def split_packed_attention_microbatch_metas(
             micro_meta.extra_info[MICRO_BATCH_LENGTHS] = [[int(packed_length)]]
             micro_meta.extra_info[ELEM_COUNTS_PER_GB] = [len(calls)]
             micro_meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] = max(
-                int(segment_lengths[parent][segment])
-                for parent, segment in calls
+                int(segment_lengths[parent][segment]) for parent, segment in calls
             )
             out.append(micro_meta)
         chunk_offset += chunk_count
@@ -186,6 +184,85 @@ def split_packed_attention_microbatch_metas(
         )
     if not out:
         raise ValueError("packed attention packing metadata contains no microbatches")
+    return out
+
+
+def split_tree_attention_microbatch_metas(meta: KVBatchMeta) -> list[KVBatchMeta]:
+    """Split a tree DP shard into its already-planned packed microbatches.
+
+    Tree rollouts stay one row per episode in TQ.  The driver has already
+    ordered and packed those rows, so this transform only slices the control
+    plane and narrows the per-fetch pad width.  It never rebuilds the packing
+    plan on a worker.
+    """
+    extra = meta.extra_info or {}
+    layouts = extra.get(TREE_ATTENTION_LAYOUTS)
+    micro_batch_indices = extra.get(MICRO_BATCH_INDICES)
+    micro_batch_lengths = extra.get(MICRO_BATCH_LENGTHS)
+    elem_counts = extra.get(ELEM_COUNTS_PER_GB)
+
+    if layouts is None:
+        return [meta]
+    if micro_batch_indices is None or micro_batch_lengths is None:
+        return [meta]
+    if len(layouts) != len(meta.sample_ids):
+        raise ValueError(
+            f"{TREE_ATTENTION_LAYOUTS} must align with sample_ids: "
+            f"{len(layouts)} != {len(meta.sample_ids)}"
+        )
+    if len(micro_batch_indices) != len(micro_batch_lengths):
+        raise ValueError(
+            "tree attention microbatch index/length chunk counts differ: "
+            f"{len(micro_batch_indices)} != {len(micro_batch_lengths)}"
+        )
+    if elem_counts is not None and len(elem_counts) != len(micro_batch_indices):
+        raise ValueError(
+            "tree attention elem_counts_per_gb must align with packing chunks"
+        )
+
+    out: list[KVBatchMeta] = []
+    chunk_offset = 0
+    for chunk_index, (chunk_ranges, chunk_lengths) in enumerate(
+        zip(micro_batch_indices, micro_batch_lengths, strict=True)
+    ):
+        if len(chunk_ranges) != len(chunk_lengths):
+            raise ValueError(
+                "tree attention microbatch ranges/lengths differ in chunk "
+                f"{chunk_index}: {len(chunk_ranges)} != {len(chunk_lengths)}"
+            )
+        chunk_count = (
+            int(elem_counts[chunk_index])
+            if elem_counts is not None
+            else (int(chunk_ranges[-1][1]) if chunk_ranges else 0)
+        )
+        for (start, stop), packed_length in zip(
+            chunk_ranges, chunk_lengths, strict=True
+        ):
+            start = int(start)
+            stop = int(stop)
+            if not 0 <= start < stop <= chunk_count:
+                raise ValueError(
+                    "invalid tree attention microbatch range "
+                    f"[{start}, {stop}) for chunk size {chunk_count}"
+                )
+            row_indices = list(range(chunk_offset + start, chunk_offset + stop))
+            micro_meta = meta.subset(row_indices)
+            micro_meta.extra_info[MICRO_BATCH_INDICES] = [[[0, len(row_indices)]]]
+            micro_meta.extra_info[MICRO_BATCH_LENGTHS] = [[int(packed_length)]]
+            micro_meta.extra_info[ELEM_COUNTS_PER_GB] = [len(row_indices)]
+            micro_meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] = max(
+                int(meta.sequence_lengths[index]) for index in row_indices
+            )
+            out.append(micro_meta)
+        chunk_offset += chunk_count
+
+    if chunk_offset != len(meta.sample_ids):
+        raise ValueError(
+            "tree attention packing metadata does not cover every row: "
+            f"covered={chunk_offset}, rows={len(meta.sample_ids)}"
+        )
+    if not out:
+        raise ValueError("tree attention packing metadata contains no microbatches")
     return out
 
 
@@ -238,6 +315,12 @@ def shard_meta_for_dp(
 
     logical_seq_lens = list(meta.sequence_lengths)
     packed_segment_lengths = meta.extra_info.get(PACKED_ATTENTION_SEGMENT_LENGTHS)
+    tree_layouts = meta.extra_info.get(TREE_ATTENTION_LAYOUTS)
+    if tree_layouts is not None and len(tree_layouts) != n:
+        raise ValueError(
+            f"{TREE_ATTENTION_LAYOUTS} must align with sample_ids: "
+            f"{len(tree_layouts)} != {n}"
+        )
     packed_call_meta = expand_meta_for_packed_attention(meta)
     if packed_call_meta is not None:
         if dynamic_batching_args is not None:
@@ -339,6 +422,8 @@ def shard_meta_for_dp(
         else:
             rank_sample_ids = [meta.sample_ids[i] for i in idx_list]
             rank_seqlens = [seq_lens[i] for i in idx_list]
+            if tree_layouts is not None:
+                rank_extra[TREE_ATTENTION_LAYOUTS] = [tree_layouts[i] for i in idx_list]
             rank_tags = (
                 [meta.tags[i] for i in idx_list] if meta.tags is not None else None
             )

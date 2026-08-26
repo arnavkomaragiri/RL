@@ -21,9 +21,20 @@ import numpy as np
 import torch
 from tensordict import TensorDict
 
-from nemo_rl.data.packed_rollouts import PACKED_ATTENTION_SEGMENT_LENGTHS
+from nemo_rl.data.packed_rollouts import (
+    PACKED_ATTENTION_SEGMENT_LENGTHS,
+    TREE_ATTENTION_EDGE_LENGTHS,
+    TREE_ATTENTION_EDGE_SOURCE_INDICES,
+    TREE_ATTENTION_EDGE_TARGET_IDS,
+    TREE_ATTENTION_LAYOUTS,
+)
 from nemo_rl.data_plane.codec import pack_jagged_fields
-from nemo_rl.data_plane.column_io import TOKEN_ALIGNED_FIELDS
+from nemo_rl.data_plane.column_io import (
+    TOKEN_ALIGNED_FIELDS,
+    TREE_EDGE_ALIGNED_FIELDS,
+    TREE_EDGE_SHIFTED_FIELDS,
+    TREE_EDGE_UNSHIFTED_FIELDS,
+)
 from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.interfaces import PromptGroupRecord
@@ -47,6 +58,7 @@ def record_to_train_batch(
     # Lazy imports: grpo and llm_message_utils transitively pull
     # experience.rollouts, so importing at module top risks a cycle.
     from nemo_rl.algorithms.grpo import (
+        _flatten_tree_model_inputs,
         _use_exact_nemo_gym_call_sequences,
         add_grpo_token_loss_masks_and_generation_logprobs,
         extract_initial_prompt_messages,
@@ -58,9 +70,8 @@ def record_to_train_batch(
     n = len(completions)
     assert n > 0, "PromptGroupRecord has no completions"
 
-    rollout_batch = BatchedDataDict[Any](
-        {"message_log": [c.message_log for c in completions]}
-    )
+    original_message_logs = [c.message_log for c in completions]
+    rollout_batch = BatchedDataDict[Any]({"message_log": original_message_logs})
     exact_call_logs = [c.training_message_logs for c in completions]
     if any(call_logs is not None for call_logs in exact_call_logs):
         if any(call_logs is None for call_logs in exact_call_logs):
@@ -82,7 +93,9 @@ def record_to_train_batch(
     # add_grpo_token_loss_masks_and_generation_logprobs would be too late.
     backfill_missing_routed_experts(message_logs)
 
-    prompt_message_logs = extract_initial_prompt_messages(message_logs, prompt_lengths)
+    prompt_message_logs = extract_initial_prompt_messages(
+        original_message_logs, prompt_lengths
+    )
     prompt_flat, _ = batched_message_log_to_flat_message(
         prompt_message_logs,
         pad_value_dict=dict(pad_value_dict),  # type: ignore
@@ -94,22 +107,48 @@ def record_to_train_batch(
         pad_value_dict=dict(pad_value_dict),  # type: ignore
     )
 
+    model_flat = flat
+    model_input_lengths = input_lengths
+    if TREE_ATTENTION_LAYOUTS in rollout_batch:
+        model_flat, model_input_lengths = _flatten_tree_model_inputs(
+            rollout_batch,
+            flat,
+            input_lengths,
+            pad_token_id=int(pad_value_dict.get("token_ids", 0)),
+            make_sequence_length_divisible_by=1,
+        )
+
     total_reward = torch.tensor(
         [float(c.reward) for c in completions], dtype=torch.float32
     )
     sample_mask = torch.ones(n, dtype=torch.float32)
 
     train_data: dict[str, Any] = {
-        "input_ids": flat["token_ids"],
-        "input_lengths": input_lengths,
+        "input_ids": model_flat["token_ids"],
+        "input_lengths": model_input_lengths,
         "generation_logprobs": flat["generation_logprobs"],
         "token_mask": flat["token_loss_mask"],
         "sample_mask": sample_mask,
         "prompt_ids_for_adv": prompt_flat["token_ids"],
         "total_reward": total_reward,
     }
-    if ROUTED_EXPERTS_FIELD in flat:
-        train_data[ROUTED_EXPERTS_FIELD] = flat[ROUTED_EXPERTS_FIELD]
+    if ROUTED_EXPERTS_FIELD in model_flat:
+        train_data[ROUTED_EXPERTS_FIELD] = model_flat[ROUTED_EXPERTS_FIELD]
+    if TREE_ATTENTION_LAYOUTS in rollout_batch:
+        layouts = rollout_batch[TREE_ATTENTION_LAYOUTS]
+        edge_width = flat["token_ids"].shape[1] - 1
+        edge_sources = torch.full((n, edge_width), -1, dtype=torch.long)
+        for row, layout in enumerate(layouts):
+            edge_sources[row, : len(layout.edge_source_indices)] = torch.tensor(
+                layout.edge_source_indices, dtype=torch.long
+            )
+        train_data[TREE_ATTENTION_EDGE_SOURCE_INDICES] = edge_sources
+        train_data[TREE_ATTENTION_EDGE_TARGET_IDS] = flat["token_ids"][:, 1:]
+        train_data[TREE_ATTENTION_EDGE_LENGTHS] = torch.tensor(
+            [len(layout.edge_source_indices) for layout in layouts],
+            dtype=torch.long,
+        )
+        train_data[TREE_ATTENTION_LAYOUTS] = layouts
     if PACKED_ATTENTION_SEGMENT_LENGTHS in rollout_batch:
         train_data[PACKED_ATTENTION_SEGMENT_LENGTHS] = rollout_batch[
             PACKED_ATTENTION_SEGMENT_LENGTHS
@@ -141,9 +180,28 @@ def pack_payload(
         if isinstance(v, torch.Tensor)
         or (isinstance(v, np.ndarray) and v.dtype == object)
     }
+    token_aligned_fields = TOKEN_ALIGNED_FIELDS
+    lengths_by_field = None
+    if TREE_ATTENTION_LAYOUTS in train_batch:
+        edge_lengths = train_batch[TREE_ATTENTION_EDGE_LENGTHS]
+        token_aligned_fields = TOKEN_ALIGNED_FIELDS - TREE_EDGE_ALIGNED_FIELDS
+        lengths_by_field = {
+            **{field: edge_lengths + 1 for field in TREE_EDGE_SHIFTED_FIELDS},
+            **{field: edge_lengths for field in TREE_EDGE_UNSHIFTED_FIELDS},
+        }
     fields_td = pack_jagged_fields(
-        tensor_fields, lengths=lengths, token_aligned_fields=TOKEN_ALIGNED_FIELDS
+        tensor_fields,
+        lengths=lengths,
+        token_aligned_fields=token_aligned_fields,
+        lengths_by_field=lengths_by_field,
     )
     sample_ids = [f"{group_id}_g{i}" for i in range(n)]
-    tags = [{"weight_version": weight_version} for _ in range(n)]
+    tags = [
+        {
+            "weight_version": weight_version,
+            "group_id": group_id,
+            "rollout_index": rollout_index,
+        }
+        for rollout_index in range(n)
+    ]
     return sample_ids, fields_td, tags

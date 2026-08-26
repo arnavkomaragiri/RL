@@ -53,6 +53,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 )
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.algorithms.single_controller_utils.utils import (
+    advantage_group_ids_from_meta,
     aggregate_step_metrics,
     fields_for_put,
     reduce_advantage_pump_metrics,
@@ -649,7 +650,10 @@ class SingleControllerActor:
             select_fields=self._advantage_input_fields(),
         )
 
-        prompt_ids = tensor_field(data, adv_cfg.prompt_ids_field)
+        advantage_group_ids = advantage_group_ids_from_meta(
+            meta,
+            expected_group_size=(self._master_config.grpo.num_generations_per_prompt),
+        )
         rewards = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.reward_field)
         ).float()
@@ -698,9 +702,7 @@ class SingleControllerActor:
                 seq_error_record["masked_correct_pct"]
                 * seq_error_record["num_masked_seqs"]
             )
-            self._step_log_dict["seq_logprob_error_records"].append(
-                seq_error_record
-            )
+            self._step_log_dict["seq_logprob_error_records"].append(seq_error_record)
 
         mask = token_mask * sample_mask.unsqueeze(-1)
 
@@ -722,7 +724,7 @@ class SingleControllerActor:
             )
 
         advantages = self._advantage_estimator.compute_advantage(
-            prompt_ids=prompt_ids,
+            prompt_ids=advantage_group_ids,
             rewards=rewards,
             mask=mask,
             repeated_batch=repeated_batch,
@@ -751,7 +753,6 @@ class SingleControllerActor:
     def _advantage_input_fields(self) -> list[str]:
         adv_cfg = self._advantage_cfg
         fields = [
-            adv_cfg.prompt_ids_field,
             adv_cfg.reward_field,
             adv_cfg.token_mask_field,
             adv_cfg.sample_mask_field,

@@ -41,7 +41,10 @@ from typing import Any, Callable, Literal, NotRequired, Sequence, TypedDict
 
 from tensordict import TensorDict
 
-from nemo_rl.data.packed_rollouts import PACKED_ATTENTION_SEGMENT_LENGTHS
+from nemo_rl.data.packed_rollouts import (
+    PACKED_ATTENTION_SEGMENT_LENGTHS,
+    TREE_ATTENTION_LAYOUTS,
+)
 
 
 class DataPlaneConfig(TypedDict):
@@ -201,6 +204,14 @@ class KVBatchMeta:
             out.extra_info[PACKED_ATTENTION_SEGMENT_LENGTHS] = [
                 segment_lengths[i] for i in indices
             ]
+        tree_layouts = self.extra_info.get(TREE_ATTENTION_LAYOUTS)
+        if tree_layouts is not None:
+            if len(tree_layouts) != self.size:
+                raise ValueError(
+                    f"{TREE_ATTENTION_LAYOUTS} must align with sample_ids: "
+                    f"{len(tree_layouts)} != {self.size}"
+                )
+            out.extra_info[TREE_ATTENTION_LAYOUTS] = [tree_layouts[i] for i in indices]
         return out
 
     def slice(self, start: int, stop: int) -> "KVBatchMeta":
@@ -244,6 +255,18 @@ class KVBatchMeta:
                     )
                 merged_layout.extend(layout)
             out.extra_info[PACKED_ATTENTION_SEGMENT_LENGTHS] = merged_layout
+        tree_layouts = [m.extra_info.get(TREE_ATTENTION_LAYOUTS) for m in all_m]
+        if any(layout is not None for layout in tree_layouts):
+            if not all(layout is not None for layout in tree_layouts):
+                raise ValueError("cannot merge tree and non-tree attention metadata")
+            merged_trees = []
+            for m, layouts in zip(all_m, tree_layouts):
+                if len(layouts) != m.size:
+                    raise ValueError(
+                        f"{TREE_ATTENTION_LAYOUTS} must align with sample_ids"
+                    )
+                merged_trees.extend(layouts)
+            out.extra_info[TREE_ATTENTION_LAYOUTS] = merged_trees
         return out
 
     def drop(self, indices: "Sequence[int]") -> "KVBatchMeta | None":

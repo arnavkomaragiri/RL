@@ -28,6 +28,31 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 PACKED_ATTENTION_SEGMENT_LENGTHS = "packed_attention_segment_lengths"
 PACKED_ATTENTION_SELECTED_SEGMENTS = "packed_attention_selected_segments"
+TREE_ATTENTION_LAYOUTS = "tree_attention_layouts"
+TREE_ATTENTION_UNIQUE_MESSAGE_LOGS = "tree_attention_unique_message_logs"
+TREE_ATTENTION_EDGE_SOURCE_INDICES = "tree_attention_edge_source_indices"
+TREE_ATTENTION_EDGE_TARGET_IDS = "tree_attention_edge_target_ids"
+TREE_ATTENTION_EDGE_LENGTHS = "tree_attention_edge_lengths"
+
+# Tree model inputs are aligned to unique physical nodes, while policy-loss
+# fields retain the original sampled-edge stream. Shifted fields include the
+# initial dummy position used by the rest of NeMo-RL's next-token convention.
+TREE_EDGE_SHIFTED_FIELDS = frozenset(
+    {
+        "generation_logprobs",
+        "prev_logprobs",
+        "reference_policy_logprobs",
+        "advantages",
+        "token_mask",
+    }
+)
+TREE_EDGE_UNSHIFTED_FIELDS = frozenset(
+    {
+        TREE_ATTENTION_EDGE_SOURCE_INDICES,
+        TREE_ATTENTION_EDGE_TARGET_IDS,
+    }
+)
+TREE_EDGE_ALIGNED_FIELDS = TREE_EDGE_SHIFTED_FIELDS | TREE_EDGE_UNSHIFTED_FIELDS
 
 
 @dataclass(frozen=True)
@@ -36,6 +61,85 @@ class PackedAttentionLayout:
 
     segment_lengths: Sequence[Sequence[int]]
     output_sequence_length: int
+
+
+@dataclass(frozen=True)
+class TreeAttentionLayout:
+    """One rollout's compressed execution tree in DFS segment order.
+
+    Segments are maximal non-branching token runs. A root has parent ``-1``;
+    every other segment begins immediately after the final token of its parent.
+    ``depths`` are zero-based logical positions of each segment's first token.
+    Sampled edges remain separate from unique nodes because one predecessor can
+    supervise multiple child tokens, including duplicate samples.
+    """
+
+    segment_lengths: tuple[int, ...]
+    segment_parents: tuple[int, ...]
+    segment_depths: tuple[int, ...]
+    edge_source_indices: tuple[int, ...]
+    original_token_count: int
+
+    @property
+    def unique_token_count(self) -> int:
+        return sum(self.segment_lengths)
+
+    @property
+    def max_path_length(self) -> int:
+        return max(
+            depth + length
+            for depth, length in zip(self.segment_depths, self.segment_lengths)
+        )
+
+    @property
+    def valid_attention_pairs(self) -> int:
+        return sum(
+            depth * length + length * (length + 1) // 2
+            for depth, length in zip(self.segment_depths, self.segment_lengths)
+        )
+
+    def validate(self) -> None:
+        """Reject layouts that could silently change tree attention semantics."""
+        segment_count = len(self.segment_lengths)
+        if not (segment_count == len(self.segment_parents) == len(self.segment_depths)):
+            raise ValueError(
+                "tree attention segment lengths, parents, and depths must align"
+            )
+        if segment_count == 0 or any(length <= 0 for length in self.segment_lengths):
+            raise ValueError("tree attention requires non-empty positive segments")
+        if self.original_token_count < self.unique_token_count:
+            raise ValueError(
+                "tree attention original token count cannot be smaller than the "
+                "unique token count"
+            )
+
+        for segment_index, (length, parent, depth) in enumerate(
+            zip(self.segment_lengths, self.segment_parents, self.segment_depths)
+        ):
+            if parent == -1:
+                if depth != 0:
+                    raise ValueError("tree attention roots must start at depth zero")
+            else:
+                if parent < 0 or parent >= segment_index:
+                    raise ValueError(
+                        "tree attention parents must precede children in DFS order"
+                    )
+                expected_depth = (
+                    self.segment_depths[parent] + self.segment_lengths[parent]
+                )
+                if depth != expected_depth:
+                    raise ValueError(
+                        "tree attention child depth must follow its parent segment: "
+                        f"segment={segment_index}, depth={depth}, "
+                        f"expected={expected_depth}"
+                    )
+        if any(
+            source < 0 or source >= self.unique_token_count
+            for source in self.edge_source_indices
+        ):
+            raise ValueError(
+                "tree attention sampled-edge sources must reference unique tokens"
+            )
 
 
 def validate_packed_attention_segment_lengths(
@@ -194,9 +298,7 @@ def expand_selected_packed_attention_segments(
     if not torch.is_tensor(input_ids) or input_ids.ndim < 2:
         raise ValueError("packed attention requires tensor input_ids with shape [B, S]")
     input_ids_is_jagged = bool(input_ids.is_nested)
-    input_row_lengths = (
-        input_ids.offsets().diff() if input_ids_is_jagged else None
-    )
+    input_row_lengths = input_ids.offsets().diff() if input_ids_is_jagged else None
     validate_packed_attention_segment_lengths(segment_lengths, data["input_lengths"])
 
     selected: list[tuple[int, int, int]] = []
@@ -266,9 +368,7 @@ def expand_selected_packed_attention_segments(
                 and value.ndim > 1
                 and value.shape[1] == input_ids.shape[1]
             ):
-                output = value.new_zeros(
-                    (len(selected), max_length, *value.shape[2:])
-                )
+                output = value.new_zeros((len(selected), max_length, *value.shape[2:]))
                 for index, (row, offset, length) in enumerate(selected):
                     output[index, :length] = value[row, offset : offset + length]
                 expanded[key] = output

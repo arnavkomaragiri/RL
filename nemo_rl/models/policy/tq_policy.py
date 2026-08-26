@@ -44,8 +44,13 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data.packed_rollouts import (
     PACKED_ATTENTION_SEGMENT_LENGTHS,
     PACKED_ATTENTION_SELECTED_SEGMENTS,
+    TREE_ATTENTION_EDGE_LENGTHS,
+    TREE_ATTENTION_EDGE_SOURCE_INDICES,
+    TREE_ATTENTION_EDGE_TARGET_IDS,
+    TREE_ATTENTION_LAYOUTS,
     reassemble_packed_attention_segments,
 )
+
 from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta, build_data_plane_client
 from nemo_rl.data_plane.column_io import read_columns, round_up, write_columns
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
@@ -61,6 +66,50 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.flops_tracker import get_theoretical_tflops
 from nemo_rl.utils.timer import Timer
+
+TREE_ATTENTION_TENSOR_FIELDS = (
+    TREE_ATTENTION_EDGE_SOURCE_INDICES,
+    TREE_ATTENTION_EDGE_TARGET_IDS,
+    TREE_ATTENTION_EDGE_LENGTHS,
+)
+
+
+def _with_tree_attention_fields(
+    fields: tuple[str, ...] | list[str], meta: KVBatchMeta
+) -> list[str]:
+    out = list(fields)
+    if TREE_ATTENTION_LAYOUTS in (meta.extra_info or {}):
+        out.extend(field for field in TREE_ATTENTION_TENSOR_FIELDS if field not in out)
+    return out
+
+
+def _allow_oversized_tree_rows(
+    meta: KVBatchMeta,
+    sequence_packing_args: Optional[dict[str, Any]],
+    *,
+    max_context_length: int,
+) -> None:
+    if TREE_ATTENTION_LAYOUTS not in (meta.extra_info or {}):
+        return
+    if sequence_packing_args is None:
+        raise ValueError("tree rollouts require policy.sequence_packing.enabled=true")
+    if not meta.sequence_lengths:
+        raise ValueError("tree rollout metadata requires physical sequence lengths")
+    for layout in meta.extra_info[TREE_ATTENTION_LAYOUTS]:
+        if layout.max_path_length > max_context_length:
+            raise ValueError(
+                "tree rollout logical path exceeds configured context: "
+                f"{layout.max_path_length} > {max_context_length}"
+            )
+    padded_physical_length = round_up(
+        max(meta.sequence_lengths),
+        int(sequence_packing_args["sequence_length_pad_multiple"]),
+    )
+    sequence_packing_args["max_tokens_per_microbatch"] = max(
+        int(sequence_packing_args["max_tokens_per_microbatch"]),
+        padded_physical_length,
+    )
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # Per-stage aggregators that assemble per-rank worker results into the
@@ -122,8 +171,7 @@ def _streamed_packed_broadcast_slots(meta: KVBatchMeta) -> list[int]:
             if not calls:
                 continue
             width = max(
-                int(segment_lengths[parent][segment])
-                for parent, segment in calls
+                int(segment_lengths[parent][segment]) for parent, segment in calls
             )
             slots.append(len(calls) * width)
         chunk_offset += chunk_count
@@ -251,7 +299,8 @@ class TQPolicy(Policy):
         self.dp_client.register_partition(
             partition_id=self.tq_partition_id,
             fields=fields_with_optional_routed_experts(
-                DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+                [*DP_TRAIN_FIELDS, *TREE_ATTENTION_TENSOR_FIELDS],
+                enabled=self._router_replay_enabled,
             ),
             num_samples=num_samples,
             consumer_tasks=["prev_lp", "ref_lp", "train"],
@@ -270,7 +319,8 @@ class TQPolicy(Policy):
         self.dp_client.register_partition(
             partition_id=partition_id,
             fields=fields_with_optional_routed_experts(
-                DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+                [*DP_TRAIN_FIELDS, *TREE_ATTENTION_TENSOR_FIELDS],
+                enabled=self._router_replay_enabled,
             ),
             num_samples=num_samples,
             consumer_tasks=[partition_id],
@@ -305,15 +355,11 @@ class TQPolicy(Policy):
         seq_round = int(dba["sequence_length_round"]) if dba is not None else 1
         pad_mult = int(meta.extra_info.get("pad_to_multiple", 1))
         model_sequence_lengths = _model_sequence_lengths(meta)
-        segment_lengths = (meta.extra_info or {}).get(
-            PACKED_ATTENTION_SEGMENT_LENGTHS
-        )
+        segment_lengths = (meta.extra_info or {}).get(PACKED_ATTENTION_SEGMENT_LENGTHS)
         meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] = (
             max(model_sequence_lengths)
             if segment_lengths is not None
-            else round_up(
-                max(model_sequence_lengths), max(pad_mult, seq_round)
-            )
+            else round_up(max(model_sequence_lengths), max(pad_mult, seq_round))
         )
 
     def _emit_packed_padding_comparison(
@@ -327,28 +373,20 @@ class TQPolicy(Policy):
         observability = self.dp_cfg.get("observability") or {}
         if not observability.get("packing_memory_enabled", False):
             return
-        segment_lengths = (meta.extra_info or {}).get(
-            PACKED_ATTENTION_SEGMENT_LENGTHS
-        )
+        segment_lengths = (meta.extra_info or {}).get(PACKED_ATTENTION_SEGMENT_LENGTHS)
         if segment_lengths is None or not meta.sequence_lengths:
             return
 
         _, dba = self._packing_args("train_mb_tokens")
         seq_round = int(dba["sequence_length_round"]) if dba is not None else 1
         pad_mult = int(meta.extra_info.get("pad_to_multiple", 1))
-        logical_pad = round_up(
-            max(meta.sequence_lengths), max(pad_mult, seq_round)
-        )
+        logical_pad = round_up(max(meta.sequence_lengths), max(pad_mult, seq_round))
         physical_pad = int(meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN])
         previous_logical_slots = sum(
             len(rank_meta.sample_ids) * logical_pad for rank_meta in dp_metas
         )
         expanded_call_slots = sum(
-            len(
-                rank_meta.extra_info.get(
-                    PACKED_ATTENTION_SELECTED_SEGMENTS, []
-                )
-            )
+            len(rank_meta.extra_info.get(PACKED_ATTENTION_SELECTED_SEGMENTS, []))
             * physical_pad
             for rank_meta in dp_metas
         )
@@ -419,6 +457,9 @@ class TQPolicy(Policy):
         segment_lengths = (meta.extra_info or {}).get(PACKED_ATTENTION_SEGMENT_LENGTHS)
         if segment_lengths is not None:
             data[PACKED_ATTENTION_SEGMENT_LENGTHS] = segment_lengths
+        tree_layouts = (meta.extra_info or {}).get(TREE_ATTENTION_LAYOUTS)
+        if tree_layouts is not None:
+            data[TREE_ATTENTION_LAYOUTS] = tree_layouts
         return data
 
     def write_to_dataplane(self, meta: KVBatchMeta, fields: dict[str, Any]) -> None:
@@ -474,10 +515,14 @@ class TQPolicy(Policy):
         """
         self._stamp_pad_seqlen(meta)
         spa, dba = self._packing_args("logprob_mb_tokens")
+        _allow_oversized_tree_rows(
+            meta, spa, max_context_length=self.cfg["max_total_sequence_length"]
+        )
+        seed_fields = _with_tree_attention_fields(LP_SEED_FIELDS, meta)
         lp_meta = replace(
             meta,
             fields=fields_with_optional_routed_experts(
-                LP_SEED_FIELDS,
+                seed_fields,
                 enabled=self._router_replay_enabled and include_router_replay,
             ),
             task_name=task_name,
@@ -619,6 +664,9 @@ class TQPolicy(Policy):
 
         self._stamp_pad_seqlen(meta)
         spa, dba = self._packing_args("train_mb_tokens")
+        _allow_oversized_tree_rows(
+            meta, spa, max_context_length=self.cfg["max_total_sequence_length"]
+        )
         # ``train_fields`` (rollout + logprob deltas + advantages + sample_mask;
         # default ``DP_TRAIN_FIELDS``) must be in TQ before this call — written
         # by workers + driver delta-writes. Caller may narrow to drop columns
@@ -626,7 +674,8 @@ class TQPolicy(Policy):
         train_meta = replace(
             meta,
             fields=fields_with_optional_routed_experts(
-                train_fields, enabled=self._router_replay_enabled
+                _with_tree_attention_fields(train_fields, meta),
+                enabled=self._router_replay_enabled,
             ),
             task_name="train",
         )
@@ -762,10 +811,14 @@ class TQPolicy(Policy):
             )
         self._stamp_pad_seqlen(meta)
         spa, dba = self._packing_args("train_mb_tokens")
+        _allow_oversized_tree_rows(
+            meta, spa, max_context_length=self.cfg["max_total_sequence_length"]
+        )
         train_meta = replace(
             meta,
             fields=fields_with_optional_routed_experts(
-                DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+                _with_tree_attention_fields(DP_TRAIN_FIELDS, meta),
+                enabled=self._router_replay_enabled,
             ),
             task_name="train",
         )

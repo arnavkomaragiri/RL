@@ -38,9 +38,14 @@ from nemo_rl.data.llm_message_utils import attach_message_log_view
 from nemo_rl.data.packed_rollouts import (
     PACKED_ATTENTION_SEGMENT_LENGTHS,
     PACKED_ATTENTION_SELECTED_SEGMENTS,
+    TREE_ATTENTION_LAYOUTS,
     expand_selected_packed_attention_segments,
 )
-from nemo_rl.data_plane.preshard import split_packed_attention_microbatch_metas
+from nemo_rl.data_plane.column_io import TREE_EDGE_ALIGNED_FIELDS, round_up
+from nemo_rl.data_plane.preshard import (
+    split_packed_attention_microbatch_metas,
+    split_tree_attention_microbatch_metas,
+)
 from nemo_rl.data_plane.schema import (
     ELEM_COUNTS_PER_GB,
     GLOBAL_FORWARD_PAD_SEQLEN,
@@ -240,6 +245,11 @@ class TQWorkerMixin:
             )
 
         pad_to_seqlen = self._forward_pad_seqlen(meta) if dp_aligned_seq_len else 0
+        excluded_fields = (
+            TREE_EDGE_ALIGNED_FIELDS
+            if TREE_ATTENTION_LAYOUTS in (meta.extra_info or {})
+            else ()
+        )
 
         if replica_group is not None and replica_group.size() > 1:
             is_leader = self._is_replica_leader()
@@ -255,6 +265,7 @@ class TQWorkerMixin:
                     layout=layout,
                     pad_value_dict=pad_value_dict,
                     pad_to_seqlen=pad_to_seqlen,
+                    exclude_pad_to_seqlen_fields=excluded_fields,
                 )
                 if preprocess is not None:
                     data = preprocess(self, data)
@@ -286,6 +297,7 @@ class TQWorkerMixin:
             layout=layout,
             pad_value_dict=pad_value_dict,
             pad_to_seqlen=pad_to_seqlen,
+            exclude_pad_to_seqlen_fields=excluded_fields,
         )
         if preprocess is not None:
             data = preprocess(self, data)
@@ -320,6 +332,21 @@ class TQWorkerMixin:
                 ],
                 "max_tokens_per_microbatch": seqpack["train_mb_tokens"],
             }
+            if TREE_ATTENTION_LAYOUTS in data:
+                configured_context = cfg["max_total_sequence_length"]
+                for layout in data[TREE_ATTENTION_LAYOUTS]:
+                    if layout.max_path_length > configured_context:
+                        raise ValueError(
+                            "tree rollout logical path exceeds worker context: "
+                            f"{layout.max_path_length} > {configured_context}"
+                        )
+                spa["max_tokens_per_microbatch"] = max(
+                    spa["max_tokens_per_microbatch"],
+                    round_up(
+                        int(data["input_lengths"].max().item()),
+                        int(spa["sequence_length_pad_multiple"]),
+                    ),
+                )
             microbatch_order = seqpack.get("microbatch_order")
             if microbatch_order is not None:
                 spa["microbatch_order"] = microbatch_order
@@ -412,7 +439,11 @@ class TQWorkerMixin:
                 "and selected segments"
             )
         if not has_segments:
-            return self._fetch(meta)
+            data = self._fetch(meta)
+            tree_layouts = extra.get(TREE_ATTENTION_LAYOUTS)
+            if tree_layouts is not None:
+                data[TREE_ATTENTION_LAYOUTS] = tree_layouts
+            return data
         return self._fetch(
             meta,
             # Logical parent rows can be longer than the physical call width.
@@ -427,19 +458,82 @@ class TQWorkerMixin:
         self,
         meta: "KVBatchMeta",
     ) -> Iterator[tuple[BatchedDataDict[Any], "KVBatchMeta"]]:
-        """Yield bounded packed bins while fetching logical TQ rows once.
+        """Yield bounded packed bins without materializing a full expanded shard.
 
         A packed rollout row concatenates every independent model call.  The
         preshard metadata already assigns those calls to packed microbatches;
         expanding the whole assignment before replica broadcast creates a
-        potentially enormous ``[calls, longest_call, ...]`` tensor.  Instead,
-        keep the fetched rows jagged on CPU and expand/broadcast one planned bin
+        potentially enormous ``[calls, longest_call, ...]`` tensor. Tree rows
+        are fetched by planned bin because PyTorch nested tensors cannot be
+        fancy-indexed; each row belongs to exactly one bin, so this does not
+        duplicate payload bytes. Each bin is materialized and broadcast
         immediately before it is consumed.
 
         Unpacked data and packed data without sequence-packing metadata retain
         the existing single-fetch behavior.
         """
         extra = meta.extra_info or {}
+        if (
+            TREE_ATTENTION_LAYOUTS in extra
+            and MICRO_BATCH_INDICES in extra
+            and MICRO_BATCH_LENGTHS in extra
+        ):
+            from nemo_rl.data_plane import materialize
+
+            micro_metas = split_tree_attention_microbatch_metas(meta)
+            replica_group = self._get_replica_group()
+            use_replica_broadcast = (
+                replica_group is not None and replica_group.size() > 1
+            )
+            is_leader = not use_replica_broadcast or self._is_replica_leader()
+            leader = (
+                torch.distributed.get_global_rank(replica_group, 0)
+                if use_replica_broadcast
+                else 0
+            )
+
+            dp_client = self._require_dp_client() if is_leader else None
+            for micro_meta in micro_metas:
+                micro_data: Optional[BatchedDataDict[Any]] = None
+                if is_leader:
+                    assert dp_client is not None
+                    wire_data = dp_client.get_samples(
+                        sample_ids=micro_meta.sample_ids,
+                        partition_id=meta.partition_id,
+                        select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
+                    )
+                    micro_data = materialize(
+                        wire_data,
+                        layout="padded",
+                        pad_value_dict=self._pad_value_dict(),
+                        pad_to_seqlen=self._forward_pad_seqlen(micro_meta),
+                        exclude_pad_to_seqlen_fields=TREE_EDGE_ALIGNED_FIELDS,
+                    )
+                    micro_data[TREE_ATTENTION_LAYOUTS] = micro_meta.extra_info[
+                        TREE_ATTENTION_LAYOUTS
+                    ]
+
+                if use_replica_broadcast:
+                    micro_data = _broadcast_batched_data_dict(
+                        micro_data,
+                        is_leader=is_leader,
+                        src=leader,
+                        group=replica_group,
+                    )
+                assert micro_data is not None
+                if TREE_ATTENTION_LAYOUTS not in micro_data:
+                    micro_data[TREE_ATTENTION_LAYOUTS] = micro_meta.extra_info[
+                        TREE_ATTENTION_LAYOUTS
+                    ]
+                attach_message_log_view(micro_data)
+                trace_tq_fetch_payload(
+                    stage=meta.task_name or "unknown",
+                    keys=micro_meta.sample_ids,
+                    data=micro_data,
+                )
+                yield micro_data, micro_meta
+            return
+
         if not (
             PACKED_ATTENTION_SEGMENT_LENGTHS in extra
             and PACKED_ATTENTION_SELECTED_SEGMENTS in extra
@@ -453,9 +547,7 @@ class TQWorkerMixin:
 
         micro_metas = split_packed_attention_microbatch_metas(meta)
         replica_group = self._get_replica_group()
-        use_replica_broadcast = (
-            replica_group is not None and replica_group.size() > 1
-        )
+        use_replica_broadcast = replica_group is not None and replica_group.size() > 1
         is_leader = not use_replica_broadcast or self._is_replica_leader()
         leader = (
             torch.distributed.get_global_rank(replica_group, 0)
@@ -658,9 +750,7 @@ class TQWorkerMixin:
         if not results:
             raise RuntimeError("get_logprobs_presharded produced no microbatches")
         result = (
-            BatchedDataDict.from_batches(results)
-            if len(results) > 1
-            else results[0]
+            BatchedDataDict.from_batches(results) if len(results) > 1 else results[0]
         )
         if packed:
             return result.to("cpu")

@@ -25,6 +25,7 @@ from transformers import AutoProcessor, PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data.packed_rollouts import (
+    TREE_ATTENTION_LAYOUTS,
     expand_batched_data_for_packed_attention,
     reassemble_packed_attention_segments,
 )
@@ -461,6 +462,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         is the inverse permutation needed to undo seqpack/dynbatch reorder
         (``None`` when neither is enabled).
         """
+        if TREE_ATTENTION_LAYOUTS in data and not self.use_sequence_packing:
+            raise ValueError(
+                "tree rollouts require policy.sequence_packing.enabled=true"
+            )
         dp_size = self.data_parallel_size
         if self.use_dynamic_batches:
             self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
@@ -476,6 +481,18 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
                 "sequence_packing"
             ]["logprob_mb_tokens"]
+            if TREE_ATTENTION_LAYOUTS in data:
+                configured_context = self.cfg["max_total_sequence_length"]
+                for layout in data[TREE_ATTENTION_LAYOUTS]:
+                    if layout.max_path_length > configured_context:
+                        raise ValueError(
+                            "tree rollout logical path exceeds logprob context: "
+                            f"{layout.max_path_length} > {configured_context}"
+                        )
+                sequence_packing_args["max_tokens_per_microbatch"] = max(
+                    sequence_packing_args["max_tokens_per_microbatch"],
+                    int(data["input_lengths"].max().item()),
+                )
             # we just shard into DP shards here as Sequence packing allows for CP.
             sharded_data, unsorted_data_indices = data.shard_by_batch_size(
                 dp_size,
@@ -505,6 +522,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         does not return ``unsorted_data_indices`` because train returns
         scalar metrics (no per-row outputs to reorder).
         """
+        if TREE_ATTENTION_LAYOUTS in data and not self.use_sequence_packing:
+            raise ValueError(
+                "tree rollouts require policy.sequence_packing.enabled=true"
+            )
         dp_size = self.data_parallel_size
         if self.use_dynamic_batches:
             self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
@@ -520,6 +541,18 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
                 "sequence_packing"
             ]["train_mb_tokens"]
+            if TREE_ATTENTION_LAYOUTS in data:
+                configured_context = self.cfg["max_total_sequence_length"]
+                for layout in data[TREE_ATTENTION_LAYOUTS]:
+                    if layout.max_path_length > configured_context:
+                        raise ValueError(
+                            "tree rollout logical path exceeds training context: "
+                            f"{layout.max_path_length} > {configured_context}"
+                        )
+                sequence_packing_args["max_tokens_per_microbatch"] = max(
+                    sequence_packing_args["max_tokens_per_microbatch"],
+                    int(data["input_lengths"].max().item()),
+                )
             sharded_data, _ = data.shard_by_batch_size(
                 dp_size,
                 batch_size=batch_size,

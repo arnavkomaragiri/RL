@@ -75,6 +75,12 @@ from nemo_rl.data.llm_message_utils import (
 )
 from nemo_rl.data.packed_rollouts import (
     PACKED_ATTENTION_SEGMENT_LENGTHS,
+    TREE_ATTENTION_EDGE_LENGTHS,
+    TREE_ATTENTION_EDGE_SOURCE_INDICES,
+    TREE_ATTENTION_EDGE_TARGET_IDS,
+    TREE_ATTENTION_LAYOUTS,
+    TREE_ATTENTION_UNIQUE_MESSAGE_LOGS,
+    TreeAttentionLayout,
     validate_packed_attention_segment_lengths,
 )
 from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
@@ -2051,23 +2057,100 @@ def _preserve_router_replay_routed_experts(
         target["routed_experts"] = flat_messages["routed_experts"]
 
 
+def _flatten_tree_model_inputs(
+    repeated_batch: BatchedDataDict,
+    edge_flat_messages: BatchedDataDict,
+    edge_input_lengths: torch.Tensor,
+    *,
+    pad_token_id: int,
+    make_sequence_length_divisible_by: int,
+) -> tuple[BatchedDataDict, torch.Tensor]:
+    """Flatten the physical DFS nodes separately from sampled loss edges."""
+    if TREE_ATTENTION_LAYOUTS not in repeated_batch:
+        return edge_flat_messages, edge_input_lengths
+
+    layouts = repeated_batch[TREE_ATTENTION_LAYOUTS]
+    unique_message_logs = repeated_batch.get(TREE_ATTENTION_UNIQUE_MESSAGE_LOGS)
+    if unique_message_logs is None or len(unique_message_logs) != len(layouts):
+        raise ValueError(
+            "tree attention requires one unique-node message log per layout"
+        )
+
+    # Model inputs deliberately exclude edge-only fields such as rollout
+    # logprobs and loss masks. Routes remain aligned with the physical nodes.
+    model_message_logs = [
+        get_keys_from_message_log(
+            message_log, ["role", "content", "token_ids", "routed_experts"]
+        )
+        for message_log in unique_message_logs
+    ]
+    backfill_missing_routed_experts(model_message_logs)
+    model_flat_messages, model_input_lengths = batched_message_log_to_flat_message(
+        model_message_logs,
+        pad_value_dict={"token_ids": pad_token_id},
+        make_sequence_length_divisible_by=make_sequence_length_divisible_by,
+    )
+
+    for row, (layout, input_length) in enumerate(zip(layouts, model_input_lengths)):
+        layout.validate()
+        if layout.unique_token_count != int(input_length):
+            raise ValueError(
+                "tree attention unique-node log does not match its layout: "
+                f"row={row}, tokens={int(input_length)}, "
+                f"layout_tokens={layout.unique_token_count}"
+            )
+    return model_flat_messages, model_input_lengths
+
+
 def _build_async_grpo_train_data(
     flat_messages: BatchedDataDict,
     input_lengths: torch.Tensor,
     repeated_batch: BatchedDataDict,
     policy_config: PolicyConfig,
+    *,
+    model_flat_messages: BatchedDataDict | None = None,
 ) -> BatchedDataDict[ClippedPGLossDataDict]:
     """Build the async no-TQ policy train batch from flattened rollout messages."""
+    model_flat_messages = (
+        flat_messages if model_flat_messages is None else model_flat_messages
+    )
     train_data = BatchedDataDict[ClippedPGLossDataDict](
         {
-            "input_ids": flat_messages["token_ids"],
+            "input_ids": model_flat_messages["token_ids"],
             "input_lengths": input_lengths,
             "generation_logprobs": flat_messages["generation_logprobs"],
             "token_mask": flat_messages["token_loss_mask"],
             "sample_mask": repeated_batch["loss_multiplier"],
         }
     )
-    _preserve_router_replay_routed_experts(train_data, flat_messages, policy_config)
+    _preserve_router_replay_routed_experts(
+        train_data, model_flat_messages, policy_config
+    )
+    if TREE_ATTENTION_LAYOUTS in repeated_batch:
+        layouts = repeated_batch[TREE_ATTENTION_LAYOUTS]
+        edge_lengths = torch.tensor(
+            [len(layout.edge_source_indices) for layout in layouts],
+            dtype=torch.long,
+        )
+        max_edges = flat_messages["token_ids"].shape[1] - 1
+        edge_sources = torch.full(
+            (len(layouts), max_edges),
+            -1,
+            dtype=torch.long,
+        )
+        for row, layout in enumerate(layouts):
+            layout.validate()
+            if layout.edge_source_indices:
+                edge_sources[row, : len(layout.edge_source_indices)] = torch.tensor(
+                    layout.edge_source_indices,
+                    dtype=torch.long,
+                )
+            if len(layout.edge_source_indices) > max_edges:
+                raise ValueError("tree attention edge metadata exceeds its padded row")
+        train_data[TREE_ATTENTION_LAYOUTS] = layouts
+        train_data[TREE_ATTENTION_EDGE_SOURCE_INDICES] = edge_sources
+        train_data[TREE_ATTENTION_EDGE_TARGET_IDS] = flat_messages["token_ids"][:, 1:]
+        train_data[TREE_ATTENTION_EDGE_LENGTHS] = edge_lengths
     if PACKED_ATTENTION_SEGMENT_LENGTHS in repeated_batch:
         segment_lengths = repeated_batch[PACKED_ATTENTION_SEGMENT_LENGTHS]
         validate_packed_attention_segment_lengths(segment_lengths, input_lengths)
@@ -2249,6 +2332,159 @@ def _tensor_parts_equal_prefix(
             descendant_index += 1
             descendant_offset = 0
     return True
+
+
+def _tensor_parts_common_prefix_length(
+    left_parts: list[torch.Tensor],
+    right_parts: list[torch.Tensor],
+    *,
+    limit: int | None = None,
+) -> int:
+    """Return the number of equal token-axis rows without concatenating parts."""
+    left_length = sum(int(part.shape[0]) for part in left_parts)
+    right_length = sum(int(part.shape[0]) for part in right_parts)
+    comparison_length = min(left_length, right_length)
+    if limit is not None:
+        if limit < 0:
+            raise ValueError("common-prefix limit must be non-negative")
+        comparison_length = min(comparison_length, limit)
+
+    left_index = 0
+    right_index = 0
+    left_offset = 0
+    right_offset = 0
+    compared = 0
+    while compared < comparison_length:
+        left = left_parts[left_index]
+        right = right_parts[right_index]
+        length = min(
+            int(left.shape[0]) - left_offset,
+            int(right.shape[0]) - right_offset,
+            comparison_length - compared,
+        )
+        left_rows = left[left_offset : left_offset + length]
+        right_rows = right[right_offset : right_offset + length]
+        equal_rows = left_rows.eq(right_rows).reshape(length, -1).all(dim=1)
+        if not bool(equal_rows.all().item()):
+            first_mismatch = int((~equal_rows).nonzero(as_tuple=False)[0].item())
+            return compared + first_mismatch
+        compared += length
+        left_offset += length
+        right_offset += length
+        if left_offset == int(left.shape[0]):
+            left_index += 1
+            left_offset = 0
+        if right_offset == int(right.shape[0]):
+            right_index += 1
+            right_offset = 0
+    return compared
+
+
+def _tensor_parts_row(parts: list[torch.Tensor], index: int) -> torch.Tensor:
+    """Read one token-axis row from a tensor-part sequence."""
+    if index < 0:
+        raise IndexError("tensor-part row index must be non-negative")
+    for part in parts:
+        part_length = int(part.shape[0])
+        if index < part_length:
+            return part[index]
+        index -= part_length
+    raise IndexError("tensor-part row index is out of range")
+
+
+def _tensor_parts_first_row_containing(
+    parts: list[torch.Tensor], *, prefix_length: int, value: int
+) -> int | None:
+    """Find the first token-axis row containing ``value`` in a prefix."""
+    remaining = prefix_length
+    offset = 0
+    for part in parts:
+        if remaining <= 0:
+            break
+        length = min(int(part.shape[0]), remaining)
+        matching_rows = part[:length].eq(value).reshape(length, -1).any(dim=1)
+        if bool(matching_rows.any().item()):
+            return offset + int(matching_rows.nonzero(as_tuple=False)[0].item())
+        remaining -= length
+        offset += length
+    if remaining:
+        raise ValueError("prefix_length exceeds the flattened tensor sequence")
+    return None
+
+
+def _matching_execution_metadata(
+    left: _ExactCallSequence, right: _ExactCallSequence
+) -> bool:
+    """Return whether cache reuse metadata proves a shared execution domain."""
+    metadata = (
+        (left.generation_replica_id, right.generation_replica_id),
+        (left.generation_weight_version, right.generation_weight_version),
+        (
+            left.kv_cache_scheduler_block_size,
+            right.kv_cache_scheduler_block_size,
+        ),
+        (left.kv_cache_hash_block_size, right.kv_cache_hash_block_size),
+    )
+    return all(a is not None and a == b for a, b in metadata)
+
+
+def _shared_execution_prefix_length(
+    left: _ExactCallSequence, right: _ExactCallSequence
+) -> int:
+    """Return the longest token prefix safe to represent by one tree path.
+
+    Route disagreement inside a cache page means the page was recomputed under
+    a materially different execution. In that case sharing stops at the last
+    fully matched page. Without cache metadata, exact equal token-and-route rows
+    are still shareable. The final token of either request has no captured route;
+    it may be shared when the other request later executes it.
+    """
+    token_prefix = _tensor_parts_common_prefix_length(
+        left.token_parts, right.token_parts
+    )
+    if token_prefix == 0:
+        return 0
+    has_execution_metadata = (
+        left.generation_replica_id is not None
+        or right.generation_replica_id is not None
+        or left.generation_weight_version is not None
+        or right.generation_weight_version is not None
+    )
+    if has_execution_metadata and not _matching_execution_metadata(left, right):
+        return 0
+    if left.has_incomplete_routes or right.has_incomplete_routes:
+        return 0
+    if (left.routed_expert_parts is None) != (right.routed_expert_parts is None):
+        return 0
+    if left.routed_expert_parts is None:
+        return token_prefix
+
+    left_routes = left.routed_expert_parts
+    right_routes = cast(list[torch.Tensor], right.routed_expert_parts)
+    executed_prefix = min(token_prefix, left.length - 1, right.length - 1)
+    route_prefix = _tensor_parts_common_prefix_length(
+        left_routes,
+        right_routes,
+        limit=executed_prefix,
+    )
+    missing_rows = [
+        _tensor_parts_first_row_containing(
+            routes,
+            prefix_length=route_prefix,
+            value=ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
+        )
+        for routes in (left_routes, right_routes)
+    ]
+    route_prefix = min(
+        [route_prefix] + [row for row in missing_rows if row is not None]
+    )
+
+    if route_prefix < executed_prefix:
+        if _matching_execution_metadata(left, right):
+            block_size = cast(int, left.kv_cache_scheduler_block_size)
+            return (route_prefix // block_size) * block_size
+        return route_prefix
+    return token_prefix
 
 
 def _tensor_parts_prefix_contains_value(
@@ -2490,6 +2726,372 @@ def _materialize_exact_call_path(path: _ExactCallPath) -> list[dict[str, Any]]:
     return materialized
 
 
+@dataclass(frozen=True)
+class _ExactCallAttachment:
+    """How one captured call attaches to an earlier execution path."""
+
+    parent_call_index: int
+    shared_length: int
+    raw_segment_index: int | None
+
+
+@dataclass(frozen=True)
+class _ExactCallRawSegment:
+    """New token suffix introduced by one captured call."""
+
+    call_index: int
+    call_start: int
+    length: int
+    old_start: int
+    parent_old_node: int
+
+
+@dataclass(frozen=True)
+class _ExactCallTreePiece:
+    """A non-branching slice of a raw suffix."""
+
+    raw_segment_index: int
+    local_start: int
+    local_end: int
+
+    @property
+    def length(self) -> int:
+        return self.local_end - self.local_start
+
+
+@dataclass(frozen=True)
+class _ExactCallTreeResult:
+    """Materialized unique nodes and sampled-edge metadata for one rollout."""
+
+    unique_message_log: list[dict[str, Any]]
+    edge_message_log: list[dict[str, Any]]
+    layout: TreeAttentionLayout
+
+
+def _slice_exact_call_range(
+    call: _ExactCallSequence, start: int, end: int
+) -> list[dict[str, Any]]:
+    """Slice a flattened call range back into token-aligned message pieces."""
+    if start < 0 or end < start or end > call.length:
+        raise ValueError(
+            f"invalid exact-call range [{start}, {end}) for length {call.length}"
+        )
+    output: list[dict[str, Any]] = []
+    message_start = 0
+    for message in call.messages:
+        message_length = int(cast(torch.Tensor, message["token_ids"]).shape[0])
+        message_end = message_start + message_length
+        overlap_start = max(start, message_start)
+        overlap_end = min(end, message_end)
+        if overlap_start < overlap_end:
+            output.append(
+                _slice_exact_call_message(
+                    message,
+                    overlap_start - message_start,
+                    overlap_end - message_start,
+                )
+            )
+        message_start = message_end
+    if sum(int(cast(torch.Tensor, msg["token_ids"]).shape[0]) for msg in output) != (
+        end - start
+    ):
+        raise RuntimeError(
+            "exact-call range slicing did not cover the requested tokens"
+        )
+    return output
+
+
+def _replace_message_log_route_row(
+    messages: list[dict[str, Any]], offset: int, route: torch.Tensor
+) -> None:
+    """Replace one route row in a materialized message list."""
+    for message in messages:
+        token_count = int(cast(torch.Tensor, message["token_ids"]).shape[0])
+        if offset < token_count:
+            routes = message.get("routed_experts")
+            if not isinstance(routes, torch.Tensor):
+                raise ValueError(
+                    "route override requires routed_experts on the message"
+                )
+            routes = routes.clone()
+            routes[offset] = route.to(device=routes.device, dtype=routes.dtype)
+            message["routed_experts"] = routes
+            return
+        offset -= token_count
+    raise IndexError("route override offset is outside the message list")
+
+
+def _build_exact_call_tree(
+    rollout_calls: list[list[dict[str, Any]]],
+) -> _ExactCallTreeResult:
+    """Build a route-aware compressed execution tree for one rollout."""
+    calls = [
+        _flatten_exact_call(call, call_index)
+        for call_index, call in enumerate(rollout_calls)
+    ]
+    attachments: list[_ExactCallAttachment] = []
+    raw_segments: list[_ExactCallRawSegment] = []
+    next_old_node = 0
+
+    def resolve_old_node(call_index: int, token_position: int) -> int:
+        if token_position < 0 or token_position >= calls[call_index].length:
+            raise IndexError("exact-call token position is out of range")
+        attachment = attachments[call_index]
+        if (
+            attachment.raw_segment_index is not None
+            and token_position >= attachment.shared_length
+        ):
+            raw = raw_segments[attachment.raw_segment_index]
+            return raw.old_start + token_position - attachment.shared_length
+        if attachment.parent_call_index < 0:
+            raise RuntimeError("root exact call did not materialize its token")
+        return resolve_old_node(attachment.parent_call_index, token_position)
+
+    for call_index, call in enumerate(calls):
+        parent_call_index = -1
+        shared_length = 0
+        for candidate_index in range(call_index):
+            candidate_shared = _shared_execution_prefix_length(
+                calls[candidate_index], call
+            )
+            if candidate_shared > shared_length or (
+                candidate_shared == shared_length
+                and candidate_shared > 0
+                and candidate_index > parent_call_index
+            ):
+                parent_call_index = candidate_index
+                shared_length = candidate_shared
+
+        raw_segment_index = None
+        if shared_length < call.length:
+            parent_old_node = (
+                -1
+                if shared_length == 0
+                else resolve_old_node(parent_call_index, shared_length - 1)
+            )
+            raw_segment_index = len(raw_segments)
+            raw_segments.append(
+                _ExactCallRawSegment(
+                    call_index=call_index,
+                    call_start=shared_length,
+                    length=call.length - shared_length,
+                    old_start=next_old_node,
+                    parent_old_node=parent_old_node,
+                )
+            )
+            next_old_node += call.length - shared_length
+        elif parent_call_index < 0:
+            raise RuntimeError(
+                "non-empty exact call produced neither a root nor a parent"
+            )
+        attachments.append(
+            _ExactCallAttachment(
+                parent_call_index=parent_call_index,
+                shared_length=shared_length,
+                raw_segment_index=raw_segment_index,
+            )
+        )
+
+    def raw_and_local_for_old_node(old_node: int) -> tuple[int, int]:
+        for raw_index, raw in enumerate(raw_segments):
+            if raw.old_start <= old_node < raw.old_start + raw.length:
+                return raw_index, old_node - raw.old_start
+        raise IndexError("tree node does not belong to a raw segment")
+
+    breakpoints = [{0, raw.length} for raw in raw_segments]
+    for raw in raw_segments:
+        if raw.parent_old_node < 0:
+            continue
+        parent_raw_index, parent_local = raw_and_local_for_old_node(raw.parent_old_node)
+        breakpoints[parent_raw_index].add(parent_local + 1)
+
+    pieces: list[_ExactCallTreePiece] = []
+    raw_piece_indices: list[list[int]] = []
+    for raw_index, raw_breakpoints in enumerate(breakpoints):
+        piece_indices = []
+        ordered = sorted(raw_breakpoints)
+        for start, end in zip(ordered, ordered[1:]):
+            piece_indices.append(len(pieces))
+            pieces.append(
+                _ExactCallTreePiece(
+                    raw_segment_index=raw_index,
+                    local_start=start,
+                    local_end=end,
+                )
+            )
+        raw_piece_indices.append(piece_indices)
+
+    def piece_for_old_node(old_node: int) -> int:
+        raw_index, local = raw_and_local_for_old_node(old_node)
+        for piece_index in raw_piece_indices[raw_index]:
+            piece = pieces[piece_index]
+            if piece.local_start <= local < piece.local_end:
+                return piece_index
+        raise RuntimeError("tree node was not covered by a split segment")
+
+    piece_parents: list[int] = [-1] * len(pieces)
+    for raw_index, piece_indices in enumerate(raw_piece_indices):
+        raw = raw_segments[raw_index]
+        for index_in_raw, piece_index in enumerate(piece_indices):
+            if index_in_raw:
+                piece_parents[piece_index] = piece_indices[index_in_raw - 1]
+            elif raw.parent_old_node >= 0:
+                piece_parents[piece_index] = piece_for_old_node(raw.parent_old_node)
+
+    children: list[list[int]] = [[] for _ in pieces]
+    roots: list[int] = []
+    for piece_index, parent in enumerate(piece_parents):
+        if parent < 0:
+            roots.append(piece_index)
+        else:
+            children[parent].append(piece_index)
+
+    dfs_piece_indices: list[int] = []
+
+    def visit(piece_index: int) -> None:
+        dfs_piece_indices.append(piece_index)
+        for child in children[piece_index]:
+            visit(child)
+
+    for root in roots:
+        visit(root)
+    if len(dfs_piece_indices) != len(pieces):
+        raise RuntimeError("exact-call tree contains an unreachable or cyclic segment")
+
+    dfs_index_by_piece = {
+        piece_index: dfs_index
+        for dfs_index, piece_index in enumerate(dfs_piece_indices)
+    }
+    new_starts: list[int] = []
+    total_unique_tokens = 0
+    for piece_index in dfs_piece_indices:
+        new_starts.append(total_unique_tokens)
+        total_unique_tokens += pieces[piece_index].length
+
+    def new_node_for_old_node(old_node: int) -> int:
+        raw_index, local = raw_and_local_for_old_node(old_node)
+        piece_index = piece_for_old_node(old_node)
+        piece = pieces[piece_index]
+        if piece.raw_segment_index != raw_index:
+            raise RuntimeError("tree piece/raw mapping is inconsistent")
+        dfs_index = dfs_index_by_piece[piece_index]
+        return new_starts[dfs_index] + local - piece.local_start
+
+    route_overrides: dict[int, torch.Tensor] = {}
+    for call_index, call in enumerate(calls):
+        if call.routed_expert_parts is None:
+            continue
+        terminal_position = call.length - 1
+        terminal_route = _tensor_parts_row(call.routed_expert_parts, terminal_position)
+        if not bool(
+            terminal_route.eq(ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL).any().item()
+        ):
+            continue
+        old_node = resolve_old_node(call_index, terminal_position)
+        for descendant_index, descendant in enumerate(calls):
+            if descendant_index == call_index or descendant.length <= terminal_position:
+                continue
+            if (
+                resolve_old_node(descendant_index, terminal_position) != old_node
+                or descendant.routed_expert_parts is None
+            ):
+                continue
+            descendant_route = _tensor_parts_row(
+                descendant.routed_expert_parts, terminal_position
+            )
+            if not bool(
+                descendant_route.eq(ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL).any().item()
+            ):
+                route_overrides[old_node] = descendant_route
+                break
+
+    unique_message_log: list[dict[str, Any]] = []
+    for piece_index in dfs_piece_indices:
+        piece = pieces[piece_index]
+        raw = raw_segments[piece.raw_segment_index]
+        call = calls[raw.call_index]
+        messages = _slice_exact_call_range(
+            call,
+            raw.call_start + piece.local_start,
+            raw.call_start + piece.local_end,
+        )
+        for old_node, route in route_overrides.items():
+            if (
+                raw.old_start + piece.local_start
+                <= old_node
+                < (raw.old_start + piece.local_end)
+            ):
+                _replace_message_log_route_row(
+                    messages,
+                    old_node - raw.old_start - piece.local_start,
+                    route,
+                )
+        unique_message_log.extend(messages)
+
+    if not unique_message_log:
+        raise RuntimeError("exact-call tree materialized no unique tokens")
+    first_token = cast(torch.Tensor, unique_message_log[0]["token_ids"])[0:1]
+    edge_message_log: list[dict[str, Any]] = [
+        {"role": "user", "token_ids": first_token.clone()}
+    ]
+    edge_source_indices: list[int] = []
+    for call_index, call in enumerate(calls):
+        for span in call.generated_spans:
+            edge_message = _slice_exact_call_message(
+                span.message,
+                0,
+                span.end - span.start,
+            )
+            edge_message.pop("routed_experts", None)
+            edge_message_log.append(edge_message)
+            for token_position in range(span.start, span.end):
+                if token_position == 0:
+                    raise ValueError(
+                        "generated exact-call token has no autoregressive predecessor"
+                    )
+                source_old_node = resolve_old_node(call_index, token_position - 1)
+                edge_source_indices.append(new_node_for_old_node(source_old_node))
+
+    # Collapse unary chains so the final metadata contains maximal
+    # non-branching segments rather than preserving arbitrary request boundaries.
+    segment_lengths_list: list[int] = []
+    segment_parents_list: list[int] = []
+    segment_by_piece: dict[int, int] = {}
+    for piece_index in dfs_piece_indices:
+        parent_piece = piece_parents[piece_index]
+        if parent_piece >= 0 and len(children[parent_piece]) == 1:
+            segment_index = segment_by_piece[parent_piece]
+            segment_lengths_list[segment_index] += pieces[piece_index].length
+        else:
+            segment_index = len(segment_lengths_list)
+            segment_lengths_list.append(pieces[piece_index].length)
+            segment_parents_list.append(
+                -1 if parent_piece < 0 else segment_by_piece[parent_piece]
+            )
+        segment_by_piece[piece_index] = segment_index
+
+    segment_lengths = tuple(segment_lengths_list)
+    segment_parents = tuple(segment_parents_list)
+    segment_depths_list: list[int] = []
+    for segment_index, parent in enumerate(segment_parents):
+        segment_depths_list.append(
+            0 if parent < 0 else segment_depths_list[parent] + segment_lengths[parent]
+        )
+    layout = TreeAttentionLayout(
+        segment_lengths=segment_lengths,
+        segment_parents=segment_parents,
+        segment_depths=tuple(segment_depths_list),
+        edge_source_indices=tuple(edge_source_indices),
+        original_token_count=sum(call.length for call in calls),
+    )
+    layout.validate()
+    return _ExactCallTreeResult(
+        unique_message_log=unique_message_log,
+        edge_message_log=edge_message_log,
+        layout=layout,
+    )
+
+
 def _compact_exact_call_sequences(
     rollout_calls: list[list[dict[str, Any]]],
 ) -> tuple[list[dict[str, Any]], list[int]]:
@@ -2540,19 +3142,21 @@ def _compact_exact_call_sequences(
 
 
 def _use_exact_nemo_gym_call_sequences(repeated_batch: BatchedDataDict) -> None:
-    """Compact exact calls into route-aware trie leaves and retain boundaries."""
+    """Compact exact calls into unique tree nodes and sampled loss edges."""
     training_message_logs = repeated_batch.get("training_message_logs")
     if training_message_logs is None:
         return
 
-    combined_message_logs = []
-    segment_lengths = []
+    edge_message_logs = []
+    unique_message_logs = []
+    tree_layouts = []
     input_call_count = 0
     input_token_count = 0
     page_fork_count = 0
     page_shared_token_count = 0
     cross_replica_rollouts = 0
     max_replicas_per_rollout = 0
+    baseline_attention_pairs = 0
     for rollout_calls in training_message_logs:
         if not rollout_calls:
             raise ValueError("NeMo-Gym produced no exact training calls for a rollout")
@@ -2566,6 +3170,9 @@ def _use_exact_nemo_gym_call_sequences(repeated_batch: BatchedDataDict) -> None:
             _flatten_exact_call(call, call_index)
             for call_index, call in enumerate(rollout_calls)
         ]
+        baseline_attention_pairs += sum(
+            call.length * (call.length + 1) // 2 for call in flattened_calls
+        )
         page_forks, page_shared_tokens, replicas = _exact_call_trie_diagnostics(
             flattened_calls
         )
@@ -2573,19 +3180,25 @@ def _use_exact_nemo_gym_call_sequences(repeated_batch: BatchedDataDict) -> None:
         page_shared_token_count += page_shared_tokens
         cross_replica_rollouts += int(len(replicas) > 1)
         max_replicas_per_rollout = max(max_replicas_per_rollout, len(replicas))
-        combined, lengths = _compact_exact_call_sequences(rollout_calls)
-        combined_message_logs.append(combined)
-        segment_lengths.append(lengths)
+        tree = _build_exact_call_tree(rollout_calls)
+        edge_message_logs.append(tree.edge_message_log)
+        unique_message_logs.append(tree.unique_message_log)
+        tree_layouts.append(tree.layout)
 
-    repeated_batch["message_log"] = combined_message_logs
-    repeated_batch[PACKED_ATTENTION_SEGMENT_LENGTHS] = segment_lengths
-    output_path_count = sum(len(lengths) for lengths in segment_lengths)
-    output_token_count = sum(sum(lengths) for lengths in segment_lengths)
+    repeated_batch["message_log"] = edge_message_logs
+    repeated_batch[TREE_ATTENTION_UNIQUE_MESSAGE_LOGS] = unique_message_logs
+    repeated_batch[TREE_ATTENTION_LAYOUTS] = tree_layouts
+    repeated_batch.pop(PACKED_ATTENTION_SEGMENT_LENGTHS, None)
+    output_segment_count = sum(len(layout.segment_lengths) for layout in tree_layouts)
+    output_token_count = sum(layout.unique_token_count for layout in tree_layouts)
+    tree_attention_pairs = sum(layout.valid_attention_pairs for layout in tree_layouts)
     print(
         "NeMo-Gym exact-call trie: "
-        f"calls={input_call_count}, paths={output_path_count}, "
+        f"calls={input_call_count}, segments={output_segment_count}, "
         f"tokens_before={input_token_count}, tokens_after={output_token_count}, "
         f"token_reduction={1 - output_token_count / input_token_count:.4f}, "
+        f"attention_pair_reduction="
+        f"{1 - tree_attention_pairs / baseline_attention_pairs:.4f}, "
         f"page_forks={page_fork_count}, "
         f"page_shared_tokens={page_shared_token_count}, "
         f"cross_replica_rollouts={cross_replica_rollouts}, "
@@ -3192,9 +3805,21 @@ def _maybe_log_token_logprob_diagnostics(
     if not config.enabled or per_sequence_mult_prob_error is None:
         return
 
+    diagnostic_input_ids = train_data["input_ids"]
+    diagnostic_input_lengths = train_data["input_lengths"]
+    if TREE_ATTENTION_LAYOUTS in train_data:
+        # Tree logits are aligned to sampled edges, not to physical DFS nodes.
+        # Preserve the logger's conventional one-token shift while ensuring
+        # every reported token ID is the target whose logprob was compared.
+        edge_targets = train_data[TREE_ATTENTION_EDGE_TARGET_IDS]
+        diagnostic_input_ids = torch.cat(
+            [edge_targets.new_zeros((edge_targets.shape[0], 1)), edge_targets], dim=1
+        )
+        diagnostic_input_lengths = train_data[TREE_ATTENTION_EDGE_LENGTHS] + 1
+
     diagnostic_data = {
-        "input_ids": train_data["input_ids"],
-        "input_lengths": train_data["input_lengths"],
+        "input_ids": diagnostic_input_ids,
+        "input_lengths": diagnostic_input_lengths,
         "generation_logprobs": train_data["generation_logprobs"],
         "prev_logprobs": train_data["prev_logprobs"],
         "token_mask": train_data["token_mask"],
@@ -3703,40 +4328,29 @@ def grpo_train(
                         ],
                     )
 
+                    model_flat_messages, model_input_lengths = (
+                        _flatten_tree_model_inputs(
+                            repeated_batch,
+                            flat_messages,
+                            input_lengths,
+                            pad_token_id=tokenizer.pad_token_id,
+                            make_sequence_length_divisible_by=master_config.policy[
+                                "make_sequence_length_divisible_by"
+                            ],
+                        )
+                    )
+
                     # Create training data from flattened messages
                     # Note: advantages will be computed and added after logprobs are available
-                    train_data = BatchedDataDict[ClippedPGLossDataDict](
-                        {
-                            "input_ids": flat_messages["token_ids"],
-                            "input_lengths": input_lengths,
-                            "generation_logprobs": flat_messages["generation_logprobs"],
-                            "token_mask": flat_messages["token_loss_mask"],
-                            "sample_mask": repeated_batch["loss_multiplier"],
-                        }
+                    train_data = _build_async_grpo_train_data(
+                        flat_messages,
+                        model_input_lengths,
+                        repeated_batch,
+                        master_config.policy,
+                        model_flat_messages=model_flat_messages,
                     )
-                    if PACKED_ATTENTION_SEGMENT_LENGTHS in repeated_batch:
-                        segment_lengths = repeated_batch[
-                            PACKED_ATTENTION_SEGMENT_LENGTHS
-                        ]
-                        validate_packed_attention_segment_lengths(
-                            segment_lengths, input_lengths
-                        )
-                        train_data[PACKED_ATTENTION_SEGMENT_LENGTHS] = segment_lengths
-                    # this will be mini-batched inside the policy, so maintain the packed multimodal structure
-                    # This is also used to populate part of the downstream logprob calculation data
                     extra_multimodal_data = flat_messages.get_multimodal_dict(
                         as_tensors=False
-                    )
-                    train_data.update(extra_multimodal_data)
-                    # Router replay (R3) on the legacy data_plane.enabled=false
-                    # driver path: routed_experts already rides flat_messages
-                    # (attached to message_log during rollout, then batched into
-                    # a [B, S, L, K] tensor by batched_message_log_to_flat_message),
-                    # but the train_data whitelist above drops it. Copy it back so
-                    # the Megatron worker's train-stage router-replay guard finds
-                    # it. Mirrors the TQ producer (sync_rollout_actor.py).
-                    _preserve_router_replay_routed_experts(
-                        train_data, flat_messages, master_config.policy
                     )
                     train_data.to("cpu")
 
@@ -3762,8 +4376,8 @@ def grpo_train(
                         {
                             "input_ids": train_data["input_ids"],
                             "input_lengths": train_data["input_lengths"],
-                            "token_mask": flat_messages["token_loss_mask"],
-                            "sample_mask": repeated_batch["loss_multiplier"],
+                            "token_mask": train_data["token_mask"],
+                            "sample_mask": train_data["sample_mask"],
                             **extra_multimodal_data,
                         }
                     )
@@ -3774,9 +4388,15 @@ def grpo_train(
                     # intentionally ignores routed_experts (require_router_replay
                     # =False short-circuits before the field is read), so a
                     # present-but-unused field here is safe.
-                    _preserve_router_replay_routed_experts(
-                        logprob_data, flat_messages, master_config.policy
-                    )
+                    for key in (
+                        "routed_experts",
+                        TREE_ATTENTION_LAYOUTS,
+                        TREE_ATTENTION_EDGE_SOURCE_INDICES,
+                        TREE_ATTENTION_EDGE_TARGET_IDS,
+                        TREE_ATTENTION_EDGE_LENGTHS,
+                    ):
+                        if key in train_data:
+                            logprob_data[key] = train_data[key]
 
                     if not skip_prev_logprobs:
                         train_data["prev_logprobs"] = policy.get_logprobs(
@@ -5208,12 +5828,25 @@ def async_grpo_train(
                         ],
                     )
 
+                    model_flat_messages, model_input_lengths = (
+                        _flatten_tree_model_inputs(
+                            repeated_batch,
+                            flat_messages,
+                            input_lengths,
+                            pad_token_id=tokenizer.pad_token_id,
+                            make_sequence_length_divisible_by=master_config.policy[
+                                "make_sequence_length_divisible_by"
+                            ],
+                        )
+                    )
+
                     # Create training data. Advantages are added after logprobs.
                     train_data = _build_async_grpo_train_data(
                         flat_messages,
-                        input_lengths,
+                        model_input_lengths,
                         repeated_batch,
                         master_config.policy,
+                        model_flat_messages=model_flat_messages,
                     )
                     train_data.to("cpu")
 
@@ -5294,6 +5927,11 @@ def async_grpo_train(
 
                 # Pad teacher logprobs to match train_data sequence length.
                 if trajectory_teacher_logprobs is not None:
+                    if TREE_ATTENTION_LAYOUTS in train_data:
+                        raise NotImplementedError(
+                            "OPD teacher logprobs are linear-sequence aligned and "
+                            "cannot supervise sampled tree edges"
+                        )
                     trajectory_teacher_logprobs = _pad_teacher_logprobs(
                         trajectory_teacher_logprobs, train_data["input_ids"].shape[1]
                     )

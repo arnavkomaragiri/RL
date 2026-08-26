@@ -16,7 +16,12 @@ from __future__ import annotations
 
 import torch
 
-from nemo_rl.data.packed_rollouts import PACKED_ATTENTION_SEGMENT_LENGTHS
+from nemo_rl.data.packed_rollouts import (
+    TREE_ATTENTION_EDGE_LENGTHS,
+    TREE_ATTENTION_EDGE_SOURCE_INDICES,
+    TREE_ATTENTION_EDGE_TARGET_IDS,
+    TREE_ATTENTION_LAYOUTS,
+)
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
 
@@ -133,7 +138,10 @@ def test_record_to_train_batch_preserves_routed_experts_in_tq_payload() -> None:
     packed_rows = list(packed_routes.unbind())
     assert torch.equal(packed_rows[0], expected_routes[0])
     assert torch.equal(packed_rows[1], expected_routes[1])
-    assert tags == [{"weight_version": 3}, {"weight_version": 3}]
+    assert tags == [
+        {"weight_version": 3, "group_id": "group", "rollout_index": 0},
+        {"weight_version": 3, "group_id": "group", "rollout_index": 1},
+    ]
 
 
 def test_record_to_train_batch_omits_routed_experts_when_absent() -> None:
@@ -193,7 +201,7 @@ def test_record_to_train_batch_backfills_routes_for_failed_completion() -> None:
     assert list(fields["routed_experts"].unbind())[1].shape == (2, 2, 2)
 
 
-def test_record_to_train_batch_preserves_exact_call_boundaries() -> None:
+def test_record_to_train_batch_builds_tree_nodes_and_sampled_edges() -> None:
     call_1 = [
         {"role": "user", "content": "p", "token_ids": torch.tensor([10, 11])},
         {
@@ -229,7 +237,9 @@ def test_record_to_train_batch_preserves_exact_call_boundaries() -> None:
         pad_value_dict={"token_ids": 0, "input_ids": 0},
     )
 
-    assert train_batch[PACKED_ATTENTION_SEGMENT_LENGTHS] == [[4, 5]]
+    layout = train_batch[TREE_ATTENTION_LAYOUTS][0]
+    assert layout.segment_lengths == (4, 5)
+    assert layout.segment_parents == (-1, -1)
     assert train_batch["input_lengths"].tolist() == [9]
     assert train_batch["input_ids"][0, :9].tolist() == [
         10,
@@ -242,7 +252,26 @@ def test_record_to_train_batch_preserves_exact_call_boundaries() -> None:
         40,
         41,
     ]
+    assert train_batch["prompt_ids_for_adv"][0, :3].tolist() == [30, 31, 32]
+    assert train_batch[TREE_ATTENTION_EDGE_LENGTHS].tolist() == [4]
+    assert train_batch[TREE_ATTENTION_EDGE_SOURCE_INDICES][0, :4].tolist() == [
+        1,
+        2,
+        6,
+        7,
+    ]
+    assert train_batch[TREE_ATTENTION_EDGE_TARGET_IDS][0, :4].tolist() == [
+        20,
+        21,
+        40,
+        41,
+    ]
     assert int(train_batch["token_mask"].sum().item()) == 4
 
     _, fields, _ = pack_payload(train_batch, weight_version=0, group_id="group")
-    assert PACKED_ATTENTION_SEGMENT_LENGTHS not in fields
+    assert TREE_ATTENTION_LAYOUTS not in fields
+    assert [row.shape[0] for row in fields["input_ids"].unbind()] == [9]
+    assert [row.shape[0] for row in fields["generation_logprobs"].unbind()] == [5]
+    assert [
+        row.shape[0] for row in fields[TREE_ATTENTION_EDGE_SOURCE_INDICES].unbind()
+    ] == [4]

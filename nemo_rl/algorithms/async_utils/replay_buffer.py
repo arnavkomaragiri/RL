@@ -29,7 +29,10 @@ import ray
 import torch
 
 from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
-from nemo_rl.data.packed_rollouts import PACKED_ATTENTION_SEGMENT_LENGTHS
+from nemo_rl.data.packed_rollouts import (
+    PACKED_ATTENTION_SEGMENT_LENGTHS,
+    TREE_ATTENTION_LAYOUTS,
+)
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
 from nemo_rl.experience.interfaces import PromptGroupRecord
@@ -850,22 +853,28 @@ class TQReplayBuffer:
                 data_plane=(dp_snapshot() if callable(dp_snapshot) else None),
             )
 
-            # mirrors kv_first_write
+            # Mirrors kv_first_write. Attention metadata is control-plane state;
+            # losing it here would make consumers reinterpret the stored physical
+            # token stream with ordinary causal attention.
+            attention_extra_info = {}
+            for attention_field in (
+                PACKED_ATTENTION_SEGMENT_LENGTHS,
+                TREE_ATTENTION_LAYOUTS,
+            ):
+                if attention_field in train_batch:
+                    attention_extra_info[attention_field] = train_batch[attention_field]
+            if len(attention_extra_info) > 1:
+                raise ValueError(
+                    "rollout payload cannot contain both packed and tree attention "
+                    "metadata"
+                )
             meta = KVBatchMeta(
                 partition_id=self._partition_id,
                 task_name="train",
                 sample_ids=list(sample_ids),
                 fields=list(fields.keys()),
                 sequence_lengths=[int(s) for s in lengths.tolist()],
-                extra_info=(
-                    {
-                        PACKED_ATTENTION_SEGMENT_LENGTHS: train_batch[
-                            PACKED_ATTENTION_SEGMENT_LENGTHS
-                        ]
-                    }
-                    if PACKED_ATTENTION_SEGMENT_LENGTHS in train_batch
-                    else {}
-                ),
+                extra_info=attention_extra_info,
                 tags=[dict(t) for t in tags],
             )
 
@@ -879,9 +888,7 @@ class TQReplayBuffer:
                 "error",
                 group_id,
                 wall_ms=(
-                    (time.perf_counter() - put_start) * 1000.0
-                    if put_attempted
-                    else 0.0
+                    (time.perf_counter() - put_start) * 1000.0 if put_attempted else 0.0
                 ),
                 error_type=type(commit_error).__name__,
             )
