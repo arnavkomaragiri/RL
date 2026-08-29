@@ -87,9 +87,14 @@ def test_rollout_pump_stamps_target_steps(
             self._buffer = buffer
 
         async def generate_and_push(
-            self, prompt: Any, *, target_step: int | None = None
+            self,
+            prompt: Any,
+            *,
+            target_step: int | None = None,
+            source_batch_index: int | None = None,
+            source_prompt_index: int | None = None,
         ) -> None:
-            del prompt
+            del prompt, source_batch_index, source_prompt_index
             self._buffer.reserve(target_step=target_step)
 
     buffer = _RecordingBuffer()
@@ -117,12 +122,81 @@ def test_rollout_pump_stamps_target_steps(
     ctrl._inflight_rollouts = 0
     ctrl._dispatched_rollouts = set()
     ctrl._trainer_version = 0
+    ctrl._train_steps = 0
+    ctrl._dataloader_batch_index = 0
+    ctrl._restored_source_positions = set()
     ctrl._current_epoch = 0
 
     asyncio.run(ctrl._rollout_pump())
 
     assert buffer.target_step_list == expected_target_steps
     assert ctrl._rollout_exhausted.is_set()
+
+
+def test_rollout_pump_regenerates_only_missing_restored_prompt_positions() -> None:
+    calls: list[tuple[int | None, int | None, int | None, str]] = []
+
+    class _RecordingRolloutManager:
+        async def generate_and_push(
+            self,
+            prompt: Any,
+            *,
+            target_step: int | None = None,
+            source_batch_index: int | None = None,
+            source_prompt_index: int | None = None,
+        ) -> None:
+            calls.append(
+                (
+                    target_step,
+                    source_batch_index,
+                    source_prompt_index,
+                    prompt["message_log"][0]["content"],
+                )
+            )
+
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._async_cfg = SimpleNamespace(max_inflight_prompts=2, diagnostics=False)
+    ctrl._master_config = SimpleNamespace(
+        grpo=GRPOConfig.model_construct(max_num_epochs=1)
+    )
+    ctrl._rollout_manager = _RecordingRolloutManager()
+    ctrl._sampler = InOrderSampler(None, max_lookahead_versions=1)
+    ctrl._sampler.restore_dispatch_index(0)
+    ctrl._dataloader = [
+        BatchedDataDict(
+            {
+                "message_log": [
+                    [{"role": "user", "content": "trained-0"}],
+                    [{"role": "user", "content": "trained-1"}],
+                ]
+            }
+        ),
+        BatchedDataDict(
+            {
+                "message_log": [
+                    [{"role": "user", "content": "restored"}],
+                    [{"role": "user", "content": "missing"}],
+                ]
+            }
+        ),
+    ]
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._rollout_exhausted = asyncio.Event()
+    ctrl._buffer_capacity = asyncio.Semaphore(1)
+    ctrl._inflight_rollouts = 0
+    ctrl._dispatched_rollouts = set()
+    ctrl._trainer_version = 1
+    ctrl._train_steps = 1
+    ctrl._dataloader_batch_index = 0
+    ctrl._restored_source_positions = {(1, 0)}
+    ctrl._current_epoch = 0
+
+    asyncio.run(ctrl._rollout_pump())
+
+    assert calls == [(1, 1, 1, "missing")]
+    assert ctrl._restored_source_positions == set()
 
 
 def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
@@ -133,9 +207,14 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
             self.sibling_cancelled = False
 
         async def generate_and_push(
-            self, prompt: Any, *, target_step: int | None = None
+            self,
+            prompt: Any,
+            *,
+            target_step: int | None = None,
+            source_batch_index: int | None = None,
+            source_prompt_index: int | None = None,
         ) -> None:
-            del target_step
+            del target_step, source_batch_index, source_prompt_index
             self._started += 1
             if self._started == 2:
                 self._both_started.set()
@@ -182,6 +261,9 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
         ctrl._inflight_rollouts = 0
         ctrl._dispatched_rollouts = set()
         ctrl._trainer_version = 0
+        ctrl._train_steps = 0
+        ctrl._dataloader_batch_index = 0
+        ctrl._restored_source_positions = set()
         ctrl._current_epoch = 0
 
         with pytest.raises(ExceptionGroup) as exc_info:
@@ -200,9 +282,14 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
 def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> None:
     class _NeverCalledRolloutManager:
         async def generate_and_push(
-            self, prompt: Any, *, target_step: int | None = None
+            self,
+            prompt: Any,
+            *,
+            target_step: int | None = None,
+            source_batch_index: int | None = None,
+            source_prompt_index: int | None = None,
         ) -> None:
-            del prompt, target_step
+            del prompt, target_step, source_batch_index, source_prompt_index
             raise AssertionError("cancelled child unexpectedly started")
 
     class _CancelBeforeStartTaskGroup:
@@ -256,6 +343,9 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
         ctrl._inflight_rollouts = 0
         ctrl._dispatched_rollouts = set()
         ctrl._trainer_version = 0
+        ctrl._train_steps = 0
+        ctrl._dataloader_batch_index = 0
+        ctrl._restored_source_positions = set()
         ctrl._current_epoch = 0
 
         await ctrl._rollout_pump()
@@ -266,6 +356,106 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
         assert ctrl._inflight_rollouts == 0
         assert ctrl._dispatched_rollouts == set()
         assert ctrl._rollout_exhausted.is_set()
+
+    asyncio.run(_main())
+
+
+def test_terminal_rollout_drain_cancels_and_quiesces_admitted_tasks() -> None:
+    async def _main() -> None:
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        ctrl = object.__new__(controller_cls)
+        ctrl._rollout_permitted = asyncio.Event()
+        ctrl._inflight_rollouts = 0
+        ctrl._dispatched_rollouts = set()
+        both_started = asyncio.Event()
+
+        async def _blocked_rollout() -> None:
+            ctrl._inflight_rollouts += 1
+            if ctrl._inflight_rollouts == 2:
+                both_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                ctrl._inflight_rollouts -= 1
+
+        for _ in range(2):
+            task = asyncio.create_task(_blocked_rollout())
+            ctrl._dispatched_rollouts.add(task)
+            task.add_done_callback(ctrl._dispatched_rollouts.discard)
+
+        await both_started.wait()
+        metrics = await ctrl._cancel_inflight_rollouts()
+
+        assert metrics["cancelled_inflight_rollouts"] == 2
+        assert metrics["late_registered_rollouts"] == 0
+        assert metrics["rollout_cancellation_rounds"] == 1
+        assert metrics["rollout_cleanup_errors"] == 0
+        assert metrics["remaining_inflight_rollouts"] == 0
+        assert metrics["remaining_tracked_rollouts"] == 0
+        assert ctrl._inflight_rollouts == 0
+        assert ctrl._dispatched_rollouts == set()
+
+    asyncio.run(_main())
+
+
+def test_rollout_permission_rechecks_after_stale_event_wakeup() -> None:
+    async def _main() -> None:
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        ctrl = object.__new__(controller_cls)
+        ctrl._rollout_permitted = asyncio.Event()
+
+        waiter = asyncio.create_task(ctrl._wait_for_rollout_permission())
+        await asyncio.sleep(0)
+        ctrl._rollout_permitted.set()
+        ctrl._rollout_permitted.clear()
+        await asyncio.sleep(0)
+
+        assert not waiter.done()
+        ctrl._rollout_permitted.set()
+        await waiter
+
+    asyncio.run(_main())
+
+
+def test_terminal_rollout_drain_cancels_late_registered_task() -> None:
+    async def _main() -> None:
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        ctrl = object.__new__(controller_cls)
+        ctrl._rollout_permitted = asyncio.Event()
+        ctrl._inflight_rollouts = 0
+        ctrl._dispatched_rollouts = set()
+
+        async def _blocked_rollout() -> None:
+            ctrl._inflight_rollouts += 1
+            try:
+                await asyncio.Event().wait()
+            finally:
+                ctrl._inflight_rollouts -= 1
+
+        async def _spawn_late_rollout_on_cancel() -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                late_task = asyncio.create_task(_blocked_rollout())
+                ctrl._dispatched_rollouts.add(late_task)
+                late_task.add_done_callback(ctrl._dispatched_rollouts.discard)
+                raise
+
+        first_task = asyncio.create_task(_spawn_late_rollout_on_cancel())
+        ctrl._dispatched_rollouts.add(first_task)
+        first_task.add_done_callback(ctrl._dispatched_rollouts.discard)
+        await asyncio.sleep(0)
+
+        metrics = await ctrl._cancel_inflight_rollouts()
+
+        assert metrics["cancelled_inflight_rollouts"] == 2
+        assert metrics["late_registered_rollouts"] == 1
+        assert metrics["rollout_cancellation_rounds"] == 2
+        assert metrics["rollout_cleanup_errors"] == 0
+        assert metrics["remaining_inflight_rollouts"] == 0
+        assert metrics["remaining_tracked_rollouts"] == 0
+        assert ctrl._inflight_rollouts == 0
+        assert ctrl._dispatched_rollouts == set()
 
     asyncio.run(_main())
 

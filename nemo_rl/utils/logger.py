@@ -51,6 +51,8 @@ class WandbConfig(TypedDict):
     project: NotRequired[str]
     name: NotRequired[str]
     entity: NotRequired[str]
+    id: NotRequired[str]
+    resume: NotRequired[str]
     # Log complete NeMo Gym result payloads as W&B Tables. These payloads can be
     # very large, so the recommended default is false.
     log_nemo_gym_full_result_tables: NotRequired[bool]
@@ -1508,9 +1510,7 @@ class Logger(LoggerInterface):
                         generation_length * bin_index + relative_position_bins - 1
                     ) // relative_position_bins
                     bin_end = (
-                        generation_length * (bin_index + 1)
-                        + relative_position_bins
-                        - 1
+                        generation_length * (bin_index + 1) + relative_position_bins - 1
                     )
                     bin_end //= relative_position_bins
                     if bin_end > bin_start:
@@ -1550,9 +1550,7 @@ class Logger(LoggerInterface):
                     return_counts=True,
                 )
                 total_abs_diff = torch.zeros(unique_ids.numel(), dtype=torch.float64)
-                total_signed_diff = torch.zeros(
-                    unique_ids.numel(), dtype=torch.float64
-                )
+                total_signed_diff = torch.zeros(unique_ids.numel(), dtype=torch.float64)
                 total_abs_diff.scatter_add_(0, inverse, qualified_abs_diffs)
                 total_signed_diff.scatter_add_(0, inverse, qualified_signed_diffs)
                 top_id_indices = torch.argsort(total_abs_diff, descending=True)[

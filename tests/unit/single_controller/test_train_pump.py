@@ -133,6 +133,8 @@ def _prepopulate_buffer(
     buffer.start_weight_list.append(int(weight_version))
     buffer.end_weight_list.append(int(weight_version))
     buffer.target_step_list.append(None)
+    buffer.source_batch_index_list.append(0)
+    buffer.source_prompt_index_list.append(len(buffer.meta_list) - 1)
     buffer.ready_list.append(True)
     # Group id follows pack_payload's "{group_uuid}_g{i}" convention.
     group_id = meta.sample_ids[0].rpartition("_g")[0]

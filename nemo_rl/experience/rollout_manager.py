@@ -24,12 +24,12 @@ from wandb import Table
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.environments.nemo_gym import NemoGymRolloutFailure
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.nemo_gym import NemoGymRolloutFailure
 from nemo_rl.experience.interfaces import (
-    Completion,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
+    Completion,
     PromptGroupRecord,
 )
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
@@ -898,20 +898,30 @@ class RolloutManager:
         return await self._impl.run_rollout(input_sample)
 
     async def generate_and_push(
-        self, input_sample: DatumSpec, *, target_step: Optional[int] = None
+        self,
+        input_sample: DatumSpec,
+        *,
+        target_step: Optional[int] = None,
+        source_batch_index: Optional[int] = None,
+        source_prompt_index: Optional[int] = None,
     ) -> None:
         """Reserve a buffer slot, run one prompt's rollout, then commit the slot.
 
         Args:
             input_sample: A single prompt (one DatumSpec entry).
             target_step: Training step this rollout targets; stamped on the buffer slot for StalenessSampler.force_in_order.
+            source_batch_index: Absolute dataloader batch containing this prompt.
+            source_prompt_index: Prompt position within the source batch.
         """
         assert self._tq_buffer is not None, (
             "generate_and_push requires tq_buffer to be set at __init__"
         )
         start_version = self._weight_version
         group_id = self._tq_buffer.reserve(
-            weight_version=start_version, target_step=target_step
+            weight_version=start_version,
+            target_step=target_step,
+            source_batch_index=source_batch_index,
+            source_prompt_index=source_prompt_index,
         )
         try:
             record = await self.run_rollout(input_sample)

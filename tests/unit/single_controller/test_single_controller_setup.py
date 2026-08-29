@@ -218,6 +218,53 @@ class TestSetup:
         with pytest.raises(NotImplementedError, match="use_multiple_dataloader"):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
+    def test_checkpoint_resume_requires_stable_source_order(self):
+        mc = _make_master_config()
+        mc.data["shuffle"] = True
+        mc.checkpointing = {"enabled": True}
+
+        with pytest.raises(NotImplementedError, match="data.shuffle=false"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    def test_checkpoint_resume_paths_and_state_reach_actor_and_trainer(
+        self, patched_factories
+    ):
+        mc = _make_master_config()
+        mc.checkpointing = {
+            "enabled": True,
+            "checkpoint_dir": "/tmp/sc-checkpoints",
+            "metric_name": None,
+            "higher_is_better": True,
+            "save_period": 8,
+            "keep_top_k": None,
+            "ft_keep_latest_k": 1,
+            "ft_save_period": 1,
+            "save_optimizer": True,
+        }
+        checkpointer = MagicMock()
+        checkpointer.get_latest_checkpoint_path.return_value = "/tmp/step_3"
+        checkpointer.load_training_info.return_value = {
+            "train_steps": 3,
+            "trainer_version": 3,
+            "consumed_prompt_batches": 3,
+            "consumed_samples": 12,
+            "total_valid_tokens": 123,
+        }
+        checkpointer.get_resume_paths.return_value = (
+            "/tmp/step_3/policy/weights",
+            "/tmp/step_3/policy/optimizer",
+        )
+
+        with patch.object(sc_setup_mod, "CheckpointManager", return_value=checkpointer):
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert actor_args.last_checkpoint_path == "/tmp/step_3"
+        assert actor_args.resume_state.train_steps == 3
+        assert actor_args.resume_state.total_valid_tokens == 123
+        _, trainer_kwargs = patched_factories["_build_trainer"].call_args
+        assert trainer_kwargs["weights_path"] == "/tmp/step_3/policy/weights"
+        assert trainer_kwargs["optimizer_path"] == "/tmp/step_3/policy/optimizer"
+
     @pytest.mark.parametrize(
         ("invalid_case", "match"),
         [
@@ -285,9 +332,7 @@ class TestSetup:
         assert actor_args.tq_buffer._partition_id == "rollout_data"
         assert actor_args.tq_buffer._require_routed_experts is False
 
-    def test_zero_kl_auto_skips_uninitialized_reference_model(
-        self, patched_factories
-    ):
+    def test_zero_kl_auto_skips_uninitialized_reference_model(self, patched_factories):
         mc = _make_master_config(colocated=True)
         mc.loss_fn.reference_policy_kl_penalty = 0
         mc.grpo.skip_reference_policy_logprobs_calculation = False

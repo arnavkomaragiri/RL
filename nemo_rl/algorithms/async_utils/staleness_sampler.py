@@ -104,6 +104,10 @@ class PromptGroupSampler(Protocol):
         """Buffer-capacity the policy needs, or ``None`` if unconstrained."""
         ...
 
+    def restore_dispatch_index(self, last_dispatched_index: int) -> None:
+        """Restore the last admitted source-batch index after a checkpoint."""
+        ...
+
 
 class BaseSampler(abc.ABC):
     """Shared machinery for the built-in policies.
@@ -160,6 +164,14 @@ class BaseSampler(abc.ABC):
 
     def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
         return None
+
+    def restore_dispatch_index(self, last_dispatched_index: int) -> None:
+        """Restore admission state before the rollout pump resumes dispatch."""
+        if last_dispatched_index < -1:
+            raise ValueError(
+                f"last_dispatched_index must be >= -1, got {last_dispatched_index}"
+            )
+        self._dispatch_index = last_dispatched_index
 
     # ── shared helpers ───────────────────────────────────────────────────
     def _eviction_window(self) -> int:

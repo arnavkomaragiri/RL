@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -155,3 +156,37 @@ class AdvantageConfig:
     repeated_batch_fields: list[str] = field(default_factory=list)
     policy_logprobs_field: str = "prev_logprobs"
     reference_logprobs_field: str = "reference_policy_logprobs"
+
+
+@dataclass
+class SingleControllerSaveState:
+    """Completed training state restored independently of speculative rollout work."""
+
+    consumed_samples: int = 0
+    consumed_prompt_batches: int = 0
+    current_step: int = 0
+    current_epoch: int = 0
+    train_steps: int = 0
+    trainer_version: int = 0
+    total_valid_tokens: int = 0
+
+    @classmethod
+    def from_training_info(
+        cls, training_info: Optional[Mapping[str, Any]]
+    ) -> "SingleControllerSaveState":
+        """Load known fields while remaining compatible with partial checkpoints."""
+        if training_info is None:
+            return cls()
+        defaults = cls()
+        values = {
+            field_name: training_info.get(field_name, getattr(defaults, field_name))
+            for field_name in cls.__dataclass_fields__
+        }
+        # Early SingleController checkpoints may use GRPO's total_steps key.
+        if "train_steps" not in training_info and "total_steps" in training_info:
+            values["train_steps"] = int(training_info["total_steps"])
+        if "trainer_version" not in training_info:
+            values["trainer_version"] = int(values["train_steps"])
+        if "consumed_prompt_batches" not in training_info:
+            values["consumed_prompt_batches"] = int(values["train_steps"])
+        return cls(**{key: int(value) for key, value in values.items()})

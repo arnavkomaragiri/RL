@@ -41,6 +41,8 @@ MAX_PARALLEL_ENVS=${MAX_PARALLEL_ENVS:-1024}
 RUN_ID=${RUN_ID:-$(date -u +%Y%m%d-%H%M%S)}
 EXP_NAME=${EXP_NAME:-harbor-bbh-tokcap-${RUN_ID}}
 RUN_ROOT=${RUN_ROOT:-${REPO_LOCATION}/results/${EXP_NAME}}
+WANDB_RUN_ID=${WANDB_RUN_ID:-${EXP_NAME}}
+WANDB_RESUME=${WANDB_RESUME:-allow}
 HARBOR_JOBS_DIR=${HARBOR_JOBS_DIR:-${RUN_ROOT}/harbor-jobs}
 NRL_MEGATRON_CHECKPOINT_DIR=${NRL_MEGATRON_CHECKPOINT_DIR:-${RUN_ROOT}/megatron-checkpoints}
 NEMO_GYM_VENV_DIR=${NEMO_GYM_VENV_DIR:-${RUN_ROOT}/nemo-gym-venvs}
@@ -256,6 +258,17 @@ if [[ -z "${MODEL_PATH}" ]]; then
     echo "MODEL_PATH is required and must point to a Hugging Face checkpoint." >&2
     exit 2
 fi
+if [[ ! "${WANDB_RUN_ID}" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    echo "WANDB_RUN_ID must contain only letters, digits, '_', or '-'." >&2
+    exit 2
+fi
+case "${WANDB_RESUME}" in
+    allow|must|never|auto) ;;
+    *)
+        echo "WANDB_RESUME must be allow, must, never, or auto." >&2
+        exit 2
+        ;;
+esac
 if [[ -z "${HARBOR_DATASET_PATH}" ]]; then
     echo "HARBOR_DATASET_PATH is required." >&2
     exit 2
@@ -630,12 +643,15 @@ uv run python -u ${TRAIN_ENTRYPOINT} \\
     "env.nemo_gym.config_paths=${GYM_CONFIG_PATHS}" \\
     logger.log_dir=${RUN_ROOT}/logs \\
     logger.wandb.name=${EXP_NAME} \\
+    ++logger.wandb.id=${WANDB_RUN_ID} \\
+    ++logger.wandb.resume=${WANDB_RESUME} \\
     ++logger.token_logprob_diagnostics.enabled=${TOKEN_LOGPROB_DIAGNOSTICS} \\
     checkpointing.checkpoint_dir=${RUN_ROOT}/checkpoints \\
     ++env.nemo_gym.skip_venv_if_present=false
 EOF
 
 echo "Run name:             ${EXP_NAME}"
+echo "W&B run ID:           ${WANDB_RUN_ID} (resume=${WANDB_RESUME})"
 echo "Container:            ${CONTAINER}"
 echo "Container source:     ${REPO_LOCATION} -> ${CONTAINER_REPO_LOCATION}"
 echo "Recipe:               ${RECIPE}"

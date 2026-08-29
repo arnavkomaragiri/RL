@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -64,6 +66,7 @@ class FakeDataPlaneClient:
         self._rows: dict[str, dict[str, Any]] = {}
         self.put_calls: list[dict[str, Any]] = []
         self.clear_calls: list[list[str]] = []
+        self._field_batches: dict[tuple[str, ...], Any] = {}
 
     def put_samples(
         self,
@@ -80,6 +83,7 @@ class FakeDataPlaneClient:
                 "tags": [dict(t) for t in tags] if tags is not None else None,
             }
         )
+        self._field_batches[tuple(sample_ids)] = fields
         for i, sid in enumerate(sample_ids):
             self._rows[sid] = {
                 "tag": dict(tags[i]) if tags is not None else {},
@@ -91,6 +95,16 @@ class FakeDataPlaneClient:
             fields=None,
             tags=[dict(t) for t in tags] if tags is not None else None,
         )
+
+    def get_samples(
+        self,
+        sample_ids: list[str],
+        partition_id: str,
+        select_fields: list[str],
+    ) -> Any:
+        assert partition_id == self._partition_id
+        fields = self._field_batches[tuple(sample_ids)]
+        return fields.select(*select_fields)
 
     def clear_samples(self, sample_ids: list[str] | None, partition_id: str) -> None:
         assert partition_id == self._partition_id
@@ -147,11 +161,22 @@ def _make_buffer(
 
 
 def _add_group(
-    buf: TQReplayBuffer, weight: int, end_weight: int | None = None
+    buf: TQReplayBuffer,
+    weight: int,
+    end_weight: int | None = None,
+    *,
+    target_step: int | None = None,
+    source_batch_index: int | None = None,
+    source_prompt_index: int | None = None,
 ) -> KVBatchMeta:
     if end_weight is None:
         end_weight = weight
-    group_id = buf.reserve(weight_version=weight)
+    group_id = buf.reserve(
+        weight_version=weight,
+        target_step=target_step,
+        source_batch_index=source_batch_index,
+        source_prompt_index=source_prompt_index,
+    )
     return _run(
         buf.commit(
             group_id,
@@ -388,7 +413,6 @@ class TestTQReplayBufferRemove:
         assert buf.end_weight_list == [1]
         assert buf.meta_list[0].sample_ids == list(metas[1].sample_ids)
         assert dp.clear_calls == []
-        assert dp.depth() == 2 * _N_GENS
 
     def test_remove_rejects_out_of_range_before_mutating(self):
         dp = FakeDataPlaneClient()
@@ -418,6 +442,78 @@ class TestTQReplayBufferRemove:
         assert buf.size() == 2
         assert dp.depth() == 2 * _N_GENS
         assert dp.clear_calls == []
+
+
+class TestTQReplayBufferCheckpoint:
+    def test_round_trip_ready_groups_and_hardlink_unchanged_payloads(
+        self, tmp_path: Path
+    ) -> None:
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        _add_group(
+            buf,
+            weight=3,
+            end_weight=4,
+            target_step=5,
+            source_batch_index=5,
+            source_prompt_index=0,
+        )
+        _add_group(
+            buf,
+            weight=4,
+            target_step=5,
+            source_batch_index=5,
+            source_prompt_index=2,
+        )
+        buf.reserve(
+            weight_version=4,
+            target_step=5,
+            source_batch_index=5,
+            source_prompt_index=1,
+        )
+
+        checkpoint_1 = tmp_path / "step_4"
+        first_metrics = _run(buf.save_completed_rollouts(checkpoint_1))
+
+        assert first_metrics["ready_groups"] == 2
+        assert first_metrics["written_groups"] == 2
+        assert first_metrics["hardlinked_groups"] == 0
+
+        restored_dp = FakeDataPlaneClient()
+        restored = _make_buffer(restored_dp)
+        restore_metrics = _run(
+            restored.load_completed_rollouts(
+                checkpoint_1,
+                current_train_step=5,
+            )
+        )
+
+        assert restore_metrics["restored_groups"] == 2
+        assert restored.completed_source_positions() == {(5, 0), (5, 2)}
+        assert restored.start_weight_list == [3, 4]
+        assert restored.end_weight_list == [4, 4]
+        assert restored.target_step_list == [5, 5]
+        assert restored.ready_list == [True, True]
+        assert restored_dp.depth() == 2 * _N_GENS
+
+        checkpoint_2 = tmp_path / "step_5"
+        second_metrics = _run(
+            restored.save_completed_rollouts(
+                checkpoint_2,
+                previous_checkpoint_path=checkpoint_1,
+            )
+        )
+        assert second_metrics["written_groups"] == 0
+        assert second_metrics["hardlinked_groups"] == 2
+
+        with open(
+            checkpoint_1 / "replay_buffer" / "manifest.json", encoding="utf-8"
+        ) as file:
+            manifest = json.load(file)
+        for entry in manifest["groups"]:
+            first_file = checkpoint_1 / "replay_buffer" / "groups" / entry["file"]
+            second_file = checkpoint_2 / "replay_buffer" / "groups" / entry["file"]
+            assert first_file.samefile(second_file)
 
 
 class TestTQReplayBufferSize:

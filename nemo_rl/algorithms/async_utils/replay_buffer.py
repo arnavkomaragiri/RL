@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import hashlib
 import json
 import os
 import resource
@@ -22,6 +23,8 @@ import time
 import uuid
 from collections import Counter
 from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterable, Optional
 
 import numpy as np
@@ -38,6 +41,21 @@ from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
 from nemo_rl.experience.interfaces import PromptGroupRecord
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
 from nemo_rl.utils.r3_trace import trace_rollout_payload
+
+_TQ_CHECKPOINT_FORMAT_VERSION = 1
+
+
+@dataclass(frozen=True)
+class _ReadyTQGroup:
+    """Immutable descriptor captured before checkpoint payload I/O begins."""
+
+    group_id: str
+    meta: KVBatchMeta
+    start_weight_version: int
+    end_weight_version: int
+    target_step: Optional[int]
+    source_batch_index: int
+    source_prompt_index: int
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
@@ -676,6 +694,10 @@ class TQReplayBuffer:
         self.end_weight_list: list[int] = []
         # Per-slot target training step (set when force_in_order=True, else None).
         self.target_step_list: list[Optional[int]] = []
+        # Stable source coordinates allow ready groups from a partially completed
+        # dispatch batch to be restored without regenerating duplicate prompts.
+        self.source_batch_index_list: list[Optional[int]] = []
+        self.source_prompt_index_list: list[Optional[int]] = []
         self.ready_list: list[bool] = []
         self._group_ids: list[str] = []
 
@@ -726,6 +748,8 @@ class TQReplayBuffer:
         *,
         weight_version: int,
         target_step: Optional[int] = None,
+        source_batch_index: Optional[int] = None,
+        source_prompt_index: Optional[int] = None,
         group_id: Optional[str] = None,
     ) -> str:
         """Append an unready slot tagged with weight_version.
@@ -733,6 +757,8 @@ class TQReplayBuffer:
         Args:
             weight_version: Weight version stamped on the slot.
             target_step: Training step this slot targets; only consulted by StalenessSampler.force_in_order.
+            source_batch_index: Absolute dataloader batch containing this prompt.
+            source_prompt_index: Prompt position within that source batch.
             group_id: Per-group sample_id prefix; defaults to a fresh uuid4.
 
         Returns:
@@ -744,6 +770,8 @@ class TQReplayBuffer:
         self.start_weight_list.append(weight_version)
         self.end_weight_list.append(-1)
         self.target_step_list.append(target_step)
+        self.source_batch_index_list.append(source_batch_index)
+        self.source_prompt_index_list.append(source_prompt_index)
         self.ready_list.append(False)
         self._group_ids.append(group_id)
         return group_id
@@ -964,6 +992,8 @@ class TQReplayBuffer:
             del self.start_weight_list[i]
             del self.end_weight_list[i]
             del self.target_step_list[i]
+            del self.source_batch_index_list[i]
+            del self.source_prompt_index_list[i]
             del self.ready_list[i]
             del self._group_ids[i]
 
@@ -975,6 +1005,250 @@ class TQReplayBuffer:
             )
 
         return len(drop_idxs)
+
+    def completed_source_positions(self) -> set[tuple[int, int]]:
+        """Return source coordinates for committed groups currently in the buffer."""
+        positions: set[tuple[int, int]] = set()
+        for ready, batch_index, prompt_index in zip(
+            self.ready_list,
+            self.source_batch_index_list,
+            self.source_prompt_index_list,
+        ):
+            if not ready:
+                continue
+            if batch_index is None or prompt_index is None:
+                raise RuntimeError(
+                    "committed TQ group is missing source batch/prompt coordinates"
+                )
+            position = (batch_index, prompt_index)
+            if position in positions:
+                raise RuntimeError(
+                    f"duplicate committed TQ source position detected: {position}"
+                )
+            positions.add(position)
+        return positions
+
+    def _snapshot_ready_groups(self) -> list[_ReadyTQGroup]:
+        """Capture ready descriptors before yielding for DataPlane reads."""
+        groups: list[_ReadyTQGroup] = []
+        for index, ready in enumerate(self.ready_list):
+            if not ready:
+                continue
+            meta = self.meta_list[index]
+            batch_index = self.source_batch_index_list[index]
+            prompt_index = self.source_prompt_index_list[index]
+            if meta is None:
+                raise RuntimeError(f"ready TQ slot {index} has no KVBatchMeta")
+            if batch_index is None or prompt_index is None:
+                raise RuntimeError(
+                    f"ready TQ slot {index} has no source batch/prompt coordinates"
+                )
+            groups.append(
+                _ReadyTQGroup(
+                    group_id=self._group_ids[index],
+                    meta=meta,
+                    start_weight_version=self.start_weight_list[index],
+                    end_weight_version=self.end_weight_list[index],
+                    target_step=self.target_step_list[index],
+                    source_batch_index=batch_index,
+                    source_prompt_index=prompt_index,
+                )
+            )
+        return groups
+
+    @staticmethod
+    def _checkpoint_group_filename(group_id: str) -> str:
+        digest = hashlib.sha256(group_id.encode("utf-8")).hexdigest()
+        return f"{digest}.pt"
+
+    @staticmethod
+    def _load_checkpoint_manifest(checkpoint_path: Path) -> dict[str, Any] | None:
+        manifest_path = checkpoint_path / "replay_buffer" / "manifest.json"
+        if not manifest_path.is_file():
+            return None
+        with open(manifest_path, encoding="utf-8") as manifest_file:
+            manifest = json.load(manifest_file)
+        if manifest.get("format_version") != _TQ_CHECKPOINT_FORMAT_VERSION:
+            raise ValueError(
+                "Unsupported TQ replay checkpoint format: "
+                f"{manifest.get('format_version')!r}"
+            )
+        if not isinstance(manifest.get("groups"), list):
+            raise ValueError(f"Invalid TQ replay manifest: {manifest_path}")
+        return manifest
+
+    async def save_completed_rollouts(
+        self,
+        checkpoint_path: str | os.PathLike[str],
+        *,
+        previous_checkpoint_path: str | os.PathLike[str] | None = None,
+    ) -> dict[str, int]:
+        """Persist committed groups while excluding reservations and in-flight work.
+
+        Group payload files are immutable. Groups retained from the preceding
+        checkpoint are hard-linked into the new checkpoint, so per-step fault
+        tolerance writes only newly committed experience.
+        """
+        ready_groups = self._snapshot_ready_groups()
+        replay_dir = Path(checkpoint_path) / "replay_buffer"
+        groups_dir = replay_dir / "groups"
+        groups_dir.mkdir(parents=True, exist_ok=True)
+
+        previous_files: dict[str, Path] = {}
+        if previous_checkpoint_path is not None:
+            previous_path = Path(previous_checkpoint_path)
+            previous_manifest = self._load_checkpoint_manifest(previous_path)
+            if previous_manifest is not None:
+                for entry in previous_manifest["groups"]:
+                    group_id = str(entry["group_id"])
+                    filename = str(entry["file"])
+                    source = previous_path / "replay_buffer" / "groups" / filename
+                    if source.is_file():
+                        previous_files[group_id] = source
+
+        manifest_groups: list[dict[str, Any]] = []
+        hardlinked_groups = 0
+        written_groups = 0
+        written_bytes = 0
+        for group in ready_groups:
+            filename = self._checkpoint_group_filename(group.group_id)
+            destination = groups_dir / filename
+            previous_file = previous_files.get(group.group_id)
+            if previous_file is not None:
+                await asyncio.to_thread(os.link, previous_file, destination)
+                hardlinked_groups += 1
+            else:
+                if group.meta.fields is None:
+                    raise RuntimeError(
+                        f"committed TQ group {group.group_id!r} has no field schema"
+                    )
+                fields = await self._call_dp(
+                    "get_samples",
+                    sample_ids=list(group.meta.sample_ids),
+                    partition_id=group.meta.partition_id,
+                    select_fields=list(group.meta.fields),
+                )
+                payload = {
+                    "format_version": _TQ_CHECKPOINT_FORMAT_VERSION,
+                    "group_id": group.group_id,
+                    "meta": group.meta,
+                    "start_weight_version": group.start_weight_version,
+                    "end_weight_version": group.end_weight_version,
+                    "target_step": group.target_step,
+                    "source_batch_index": group.source_batch_index,
+                    "source_prompt_index": group.source_prompt_index,
+                    "fields": fields,
+                }
+                await asyncio.to_thread(torch.save, payload, destination)
+                written_groups += 1
+                written_bytes += destination.stat().st_size
+                del fields, payload
+            manifest_groups.append({"group_id": group.group_id, "file": filename})
+
+        manifest = {
+            "format_version": _TQ_CHECKPOINT_FORMAT_VERSION,
+            "partition_id": self._partition_id,
+            "groups": manifest_groups,
+        }
+
+        def _write_manifest() -> None:
+            with open(replay_dir / "manifest.json", "w", encoding="utf-8") as file:
+                json.dump(manifest, file, sort_keys=True)
+
+        await asyncio.to_thread(_write_manifest)
+        return {
+            "ready_groups": len(ready_groups),
+            "hardlinked_groups": hardlinked_groups,
+            "written_groups": written_groups,
+            "written_bytes": written_bytes,
+        }
+
+    async def load_completed_rollouts(
+        self,
+        checkpoint_path: str | os.PathLike[str],
+        *,
+        current_train_step: int,
+    ) -> dict[str, int]:
+        """Rehydrate committed checkpoint groups into a fresh DataPlane."""
+        if self.meta_list:
+            raise RuntimeError("TQ replay restore requires an empty buffer")
+        root = Path(checkpoint_path)
+        manifest = self._load_checkpoint_manifest(root)
+        if manifest is None:
+            return {"restored_groups": 0, "restored_bytes": 0}
+        if manifest.get("partition_id") != self._partition_id:
+            raise ValueError(
+                "TQ replay checkpoint partition mismatch: "
+                f"{manifest.get('partition_id')!r} != {self._partition_id!r}"
+            )
+
+        restored_positions: set[tuple[int, int]] = set()
+        restored_bytes = 0
+        for entry in manifest["groups"]:
+            filename = str(entry["file"])
+            if Path(filename).name != filename:
+                raise ValueError(f"Invalid TQ replay group filename: {filename!r}")
+            group_path = root / "replay_buffer" / "groups" / filename
+            payload = await asyncio.to_thread(
+                torch.load,
+                group_path,
+                map_location="cpu",
+                weights_only=False,
+            )
+            if payload.get("format_version") != _TQ_CHECKPOINT_FORMAT_VERSION:
+                raise ValueError(f"Invalid TQ replay group file: {group_path}")
+            group_id = str(payload["group_id"])
+            if group_id != str(entry["group_id"]):
+                raise ValueError(f"TQ replay group identity mismatch: {group_path}")
+            meta = payload["meta"]
+            if not isinstance(meta, KVBatchMeta):
+                raise TypeError(f"TQ replay group has invalid metadata: {group_path}")
+            target_step = payload["target_step"]
+            if target_step is not None and int(target_step) < current_train_step:
+                raise ValueError(
+                    f"restored group {group_id!r} targets completed step {target_step}"
+                )
+            source_position = (
+                int(payload["source_batch_index"]),
+                int(payload["source_prompt_index"]),
+            )
+            if source_position[0] < current_train_step or source_position[1] < 0:
+                raise ValueError(
+                    f"restored group {group_id!r} has invalid source position "
+                    f"{source_position} for train step {current_train_step}"
+                )
+            if source_position in restored_positions:
+                raise ValueError(
+                    f"duplicate TQ replay source position: {source_position}"
+                )
+            restored_positions.add(source_position)
+
+            await self._call_dp(
+                "put_samples",
+                sample_ids=list(meta.sample_ids),
+                partition_id=self._partition_id,
+                fields=payload["fields"],
+                tags=(
+                    [dict(tag) for tag in meta.tags] if meta.tags is not None else None
+                ),
+            )
+            self.meta_list.append(meta)
+            self.start_weight_list.append(int(payload["start_weight_version"]))
+            self.end_weight_list.append(int(payload["end_weight_version"]))
+            self.target_step_list.append(
+                int(target_step) if target_step is not None else None
+            )
+            self.source_batch_index_list.append(source_position[0])
+            self.source_prompt_index_list.append(source_position[1])
+            self.ready_list.append(True)
+            self._group_ids.append(group_id)
+            restored_bytes += group_path.stat().st_size
+            del payload
+
+        return {
+            "restored_groups": len(restored_positions),
+            "restored_bytes": restored_bytes,
+        }
 
     def size(self) -> int:
         """Return the number of prompt-group entries currently held."""

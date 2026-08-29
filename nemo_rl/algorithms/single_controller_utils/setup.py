@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Callable, Optional, cast
 
@@ -45,6 +45,7 @@ from nemo_rl.algorithms.metric_utils import (
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
+    SingleControllerSaveState,
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.utils import set_seed
@@ -71,6 +72,7 @@ from nemo_rl.models.megatron.router_replay import (
     router_replay_enabled,
 )
 from nemo_rl.models.policy.tq_policy import TQPolicy
+from nemo_rl.utils.checkpoint import CheckpointManager, PathLike
 from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
 
 
@@ -95,6 +97,10 @@ class SingleControllerActorArgs:
     rollout_manager: RolloutManager
     tq_buffer: TQReplayBuffer
     partition_id: str
+    resume_state: SingleControllerSaveState = field(
+        default_factory=SingleControllerSaveState
+    )
+    last_checkpoint_path: Optional[str] = None
 
 
 def _build_clusters(
@@ -248,6 +254,8 @@ def _build_trainer(
     master_config: MasterConfig,
     tokenizer,
     processor,
+    weights_path: Optional[PathLike] = None,
+    optimizer_path: Optional[PathLike] = None,
 ) -> tuple[Any, float]:
     """Build the TQ-mediated trainer (driver-side TQPolicy).
 
@@ -256,6 +264,8 @@ def _build_trainer(
         master_config: SC MasterConfig.
         tokenizer: Tokenizer used by the policy.
         processor: Optional AutoProcessor for VLM paths.
+        weights_path: Policy checkpoint weights to restore, if any.
+        optimizer_path: Optimizer/scheduler checkpoint to restore, if any.
 
     Returns:
         A tuple of (TQPolicy trainer, wall time spent in this call).
@@ -268,8 +278,8 @@ def _build_trainer(
         config=master_config.policy,
         tokenizer=tokenizer,
         processor=processor,
-        weights_path=None,
-        optimizer_path=None,
+        weights_path=weights_path,
+        optimizer_path=optimizer_path,
         init_optimizer=True,
         init_reference_model=init_reference_model,
         dp_cfg=master_config.data_plane,
@@ -393,11 +403,42 @@ def setup_single_controller(
             "SingleController doesn't support validation now, will support "
             "later. Set grpo.val_period=0, val_at_start=false, val_at_end=false."
         )
+
+    resume_state = SingleControllerSaveState()
+    last_checkpoint_path: Optional[str] = None
+    weights_path: Optional[PathLike] = None
+    optimizer_path: Optional[PathLike] = None
     if master_config.checkpointing["enabled"]:
-        raise NotImplementedError(
-            "SingleController doesn't support checkpointing now, will support "
-            "later. Set checkpointing.enabled=false."
+        if data_config["shuffle"]:
+            raise NotImplementedError(
+                "SingleController checkpoint resume currently requires "
+                "data.shuffle=false so source batch/prompt coordinates are stable."
+            )
+        if master_config.async_rl.sampler.name != "in_order":
+            raise NotImplementedError(
+                "SingleController committed-experience checkpoint resume currently "
+                "requires async_rl.sampler.name=in_order."
+            )
+        metric_name = master_config.checkpointing["metric_name"]
+        if metric_name is not None and not metric_name.startswith("train:"):
+            raise ValueError(
+                "SingleController checkpointing.metric_name must be null or use "
+                "the train:<metric> namespace because validation is unsupported."
+            )
+        resume_checkpointer = CheckpointManager(master_config.checkpointing)
+        last_checkpoint_path = resume_checkpointer.get_latest_checkpoint_path()
+        resume_state = SingleControllerSaveState.from_training_info(
+            resume_checkpointer.load_training_info(last_checkpoint_path)
         )
+        weights_path, optimizer_path = resume_checkpointer.get_resume_paths(
+            last_checkpoint_path
+        )
+        if last_checkpoint_path is not None:
+            print(
+                "Resuming SingleController from "
+                f"{last_checkpoint_path} at train step {resume_state.train_steps}",
+                flush=True,
+            )
 
     if dp_config is None or not dp_config.get("enabled", False):
         raise ValueError(
@@ -497,7 +538,12 @@ def setup_single_controller(
 
         # trainer
         trainer, time_metrics["trainer_time"] = _build_trainer(
-            train_cluster, master_config, tokenizer, processor
+            train_cluster=train_cluster,
+            master_config=master_config,
+            tokenizer=tokenizer,
+            processor=processor,
+            weights_path=weights_path,
+            optimizer_path=optimizer_path,
         )
 
         return generation, trainer, time_metrics
@@ -543,6 +589,8 @@ def setup_single_controller(
             master_config=master_config,
             tokenizer=tokenizer,
             processor=processor,
+            weights_path=weights_path,
+            optimizer_path=optimizer_path,
         )
 
     # Submit build tasks and get results
@@ -604,9 +652,7 @@ def setup_single_controller(
         pad_value_dict={"token_ids": pad_id, "input_ids": pad_id},
         require_routed_experts=router_replay_enabled(policy_config),
         packing_memory_diagnostics=bool(
-            (dp_config.get("observability") or {}).get(
-                "packing_memory_enabled", False
-            )
+            (dp_config.get("observability") or {}).get("packing_memory_enabled", False)
         ),
     )
     rollout_manager = RolloutManager(
@@ -648,5 +694,7 @@ def setup_single_controller(
         rollout_manager=rollout_manager,
         tq_buffer=tq_buffer,
         partition_id=partition_id,
+        resume_state=resume_state,
+        last_checkpoint_path=last_checkpoint_path,
     )
     return actor_args, setup_timing_metrics

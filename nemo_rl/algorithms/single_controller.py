@@ -35,6 +35,7 @@ Data flow:
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from functools import partial
 from typing import Any, Optional, Union
@@ -43,11 +44,15 @@ import ray
 import torch
 
 from nemo_rl.algorithms.async_utils.staleness_sampler import create_sampler
-from nemo_rl.algorithms.grpo import compute_and_apply_seq_logprob_error_masking
+from nemo_rl.algorithms.grpo import (
+    _write_latest_checkpoint_status,
+    compute_and_apply_seq_logprob_error_masking,
+)
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     MasterConfig,
+    SingleControllerSaveState,
     validate_sampler_buffer_capacity,
     validate_single_controller_config,
 )
@@ -67,10 +72,53 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
+from nemo_rl.utils.checkpoint import CheckpointManager
 from nemo_rl.utils.logger import Logger
-from nemo_rl.utils.timer import Timer
+from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 Generation = Union[VllmGeneration, SGLangGeneration]
+
+
+def _process_memory_metrics(phase: str) -> dict[str, float]:
+    """Read process memory counters from procfs, expressed in GiB."""
+    metrics: dict[str, float] = {}
+    sources = {
+        "/proc/self/status": {
+            "VmHWM": "rss_high_water",
+            "RssAnon": "rss_anon",
+            "RssFile": "rss_file",
+            "RssShmem": "rss_shmem",
+        },
+        "/proc/self/smaps_rollup": {
+            "Rss": "rss",
+            "Pss": "pss",
+            "Pss_Anon": "pss_anon",
+            "Pss_File": "pss_file",
+            "Pss_Shmem": "pss_shmem",
+            "Private_Clean": "private_clean",
+            "Private_Dirty": "private_dirty",
+            "Shared_Clean": "shared_clean",
+            "Shared_Dirty": "shared_dirty",
+        },
+    }
+    for path, fields in sources.items():
+        try:
+            with open(path) as proc_file:
+                for line in proc_file:
+                    key, separator, value = line.partition(":")
+                    metric_name = fields.get(key)
+                    if not separator or metric_name is None:
+                        continue
+                    value_parts = value.split()
+                    if not value_parts:
+                        continue
+                    # Linux exposes these counters in KiB.
+                    metrics[f"{phase}_{metric_name}_gib"] = float(value_parts[0]) / (
+                        1024**2
+                    )
+        except OSError:
+            continue
+    return metrics
 
 
 @ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
@@ -131,9 +179,31 @@ class SingleControllerActor:
         self._logger = Logger(master_config.logger)  # type: ignore
         self._logger.log_hyperparams(master_config.model_dump())
         self._logger.log_metrics(
-            setup_timing_metrics.to_metrics_dict(), step=0, prefix="timing/setup"
+            setup_timing_metrics.to_metrics_dict(),
+            step=getattr(
+                actor_args, "resume_state", SingleControllerSaveState()
+            ).train_steps,
+            prefix="timing/setup",
         )
         self._timer = Timer()
+
+        self._checkpointing_cfg = getattr(
+            master_config, "checkpointing", {"enabled": False}
+        )
+        self._checkpointer = (
+            CheckpointManager(self._checkpointing_cfg)
+            if self._checkpointing_cfg["enabled"]
+            else None
+        )
+        self._checkpoint_timeout = (
+            TimeoutChecker(
+                self._checkpointing_cfg.get("checkpoint_must_save_by"),
+                fit_last_save_time=True,
+            )
+            if self._checkpointer is not None
+            else None
+        )
+        self._last_checkpoint_path = getattr(actor_args, "last_checkpoint_path", None)
 
         # Pin clusters so RayVirtualCluster.__del__ doesn't remove the PGs.
         self._train_cluster = actor_args.train_cluster
@@ -174,8 +244,12 @@ class SingleControllerActor:
             self._async_cfg.max_buffered_rollouts
         )
 
-        self._trainer_version: int = 0
-        self._train_steps: int = 0
+        resume_state = getattr(actor_args, "resume_state", SingleControllerSaveState())
+        self._trainer_version = resume_state.trainer_version
+        self._train_steps = resume_state.train_steps
+        self._total_valid_tokens = resume_state.total_valid_tokens
+        self._dataloader_batch_index = 0
+        self._restored_source_positions: set[tuple[int, int]] = set()
         self._current_epoch: int = 0
         self._step_log_dict: dict[str, list] = {
             "rewards": [],
@@ -197,6 +271,30 @@ class SingleControllerActor:
 
     async def run(self) -> dict[str, Any]:
         """Main entry point. Runs until max_train_steps is reached."""
+        if self._last_checkpoint_path is not None:
+            restore_metrics = await self._buffer.load_completed_rollouts(
+                self._last_checkpoint_path,
+                current_train_step=self._train_steps,
+            )
+            self._restored_source_positions = self._buffer.completed_source_positions()
+            restored_groups = len(self._buffer)
+            available_slots = self._async_cfg.max_buffered_rollouts - restored_groups
+            if available_slots < 0:
+                raise RuntimeError(
+                    "restored TQ groups exceed async_rl.max_buffered_rollouts: "
+                    f"{restored_groups} > {self._async_cfg.max_buffered_rollouts}"
+                )
+            self._buffer_capacity = asyncio.Semaphore(available_slots)
+            print(
+                "Restored committed TQ experience: "
+                f"{restore_metrics['restored_groups']} group(s), "
+                f"{restore_metrics['restored_bytes']} byte(s)",
+                flush=True,
+            )
+        self._sampler.restore_dispatch_index(self._train_steps - 1)
+        if self._checkpoint_timeout is not None:
+            self._checkpoint_timeout.start_iterations()
+
         # Synchronize weights before starting the pumps
         await self._sync_weights()
 
@@ -216,6 +314,8 @@ class SingleControllerActor:
             rollout_task.cancel()
             train_task.cancel()
             await asyncio.gather(rollout_task, train_task, return_exceptions=True)
+            if self._checkpointer is not None:
+                await asyncio.to_thread(self._checkpointer.shutdown)
             self._logger.finish()
 
         return {
@@ -251,6 +351,18 @@ class SingleControllerActor:
             return await result
         return result
 
+    async def _wait_for_rollout_permission(self) -> None:
+        """Wait until rollout admission is currently enabled.
+
+        ``asyncio.Event.clear`` does not revoke waiter futures already completed
+        by ``set``. Rechecking after wakeup prevents such a stale wakeup from
+        dispatching a rollout after a terminal pause.
+        """
+        while True:
+            await self._rollout_permitted.wait()
+            if self._rollout_permitted.is_set():
+                return
+
     # ── the three pumps + the inline advantage stage ───────────────────────
 
     async def _rollout_pump(self) -> None:
@@ -276,13 +388,18 @@ class SingleControllerActor:
         async def _dispatch_one_prompt(
             prompt: DatumSpec,
             target_step: Optional[int],
+            source_batch_index: int,
+            source_prompt_index: int,
             task_started_event: asyncio.Event,
         ) -> None:
             task_started_event.set()
             self._inflight_rollouts += 1
             try:
                 await self._rollout_manager.generate_and_push(
-                    prompt, target_step=target_step
+                    prompt,
+                    target_step=target_step,
+                    source_batch_index=source_batch_index,
+                    source_prompt_index=source_prompt_index,
                 )
             except BaseException:
                 # On success ownership transfers to the train pump, which
@@ -314,11 +431,26 @@ class SingleControllerActor:
         async with asyncio.TaskGroup() as rollout_tasks:
             while max_epochs is None or self._current_epoch < max_epochs:
                 for prompt_batch in self._dataloader:
+                    source_batch_index = self._dataloader_batch_index
+                    self._dataloader_batch_index += 1
+                    if source_batch_index < self._train_steps:
+                        continue
+
                     target_step = await self._sampler.admit(
                         trainer_version_fn=lambda: self._trainer_version
                     )
+                    if target_step is not None and target_step != source_batch_index:
+                        raise RuntimeError(
+                            "in-order sampler/source cursor mismatch after resume: "
+                            f"target_step={target_step}, "
+                            f"source_batch_index={source_batch_index}"
+                        )
 
                     for prompt_idx in range(prompt_batch.size):
+                        source_position = (source_batch_index, prompt_idx)
+                        if source_position in self._restored_source_positions:
+                            self._restored_source_positions.remove(source_position)
+                            continue
                         prompt: DatumSpec = {  # type: ignore
                             k: v[prompt_idx] for k, v in prompt_batch.items()
                         }
@@ -328,13 +460,17 @@ class SingleControllerActor:
                         # check if inflight rollouts is full
                         await sem.acquire()
                         # wait for rollout to be permitted
-                        await self._rollout_permitted.wait()
+                        await self._wait_for_rollout_permission()
 
                         task_started_event = asyncio.Event()
                         # dispatch rollout
                         task = rollout_tasks.create_task(
                             _dispatch_one_prompt(
-                                prompt, target_step, task_started_event
+                                prompt,
+                                target_step,
+                                source_batch_index,
+                                prompt_idx,
+                                task_started_event,
                             )
                         )
                         self._dispatched_rollouts.add(task)
@@ -346,6 +482,17 @@ class SingleControllerActor:
                             )
                         )
 
+                    unresolved_for_batch = [
+                        position
+                        for position in self._restored_source_positions
+                        if position[0] == source_batch_index
+                    ]
+                    if unresolved_for_batch:
+                        raise RuntimeError(
+                            "restored TQ source positions exceed the prompt batch: "
+                            f"{unresolved_for_batch}"
+                        )
+
                 self._current_epoch += 1
 
         # Drain in-flight so return implies "all rollouts in TQ".
@@ -355,6 +502,79 @@ class SingleControllerActor:
 
         self._rollout_exhausted.set()
         print(f"rollout_pump: completed {self._current_epoch} epoch(s)", flush=True)
+
+    async def _cancel_inflight_rollouts(self) -> dict[str, int | float]:
+        """Cancel admitted rollouts before a terminal checkpoint.
+
+        ``RolloutManager.generate_and_push`` owns reservation and partial-write
+        cleanup, so awaiting the cancelled dispatch tasks establishes a stable
+        completed-only replay-buffer boundary before checkpoint serialization.
+        The rollout admission gate must be cleared before calling this method.
+        """
+        if self._rollout_permitted.is_set():
+            raise RuntimeError(
+                "in-flight rollout cancellation requires rollout admission to be paused"
+            )
+
+        started_at = time.monotonic()
+        cancelled_tasks: set[asyncio.Task[None]] = set()
+        unexpected_errors: list[BaseException] = []
+        initial_active_tasks = sum(
+            not task.done() for task in self._dispatched_rollouts
+        )
+        cancellation_rounds = 0
+        while True:
+            tasks = [task for task in self._dispatched_rollouts if not task.done()]
+            if not tasks:
+                # Let pending done callbacks and any stale admission waiter run
+                # before declaring the tracked task set stable.
+                await asyncio.sleep(0)
+                tasks = [task for task in self._dispatched_rollouts if not task.done()]
+                if not tasks:
+                    break
+
+            cancellation_rounds += 1
+            cancelled_tasks.update(tasks)
+            for task in tasks:
+                task.cancel()
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            unexpected_errors.extend(
+                result
+                for result in results
+                if isinstance(result, BaseException)
+                and not isinstance(result, asyncio.CancelledError)
+            )
+
+        self._dispatched_rollouts.difference_update(
+            task for task in self._dispatched_rollouts if task.done()
+        )
+        if unexpected_errors:
+            error_types = sorted(type(error).__name__ for error in unexpected_errors)
+            print(
+                f"terminal rollout drain observed cleanup error(s): {error_types}",
+                flush=True,
+            )
+        if self._inflight_rollouts != 0 or self._dispatched_rollouts:
+            raise RuntimeError(
+                "terminal rollout drain did not quiesce admitted work: "
+                f"inflight={self._inflight_rollouts}, "
+                f"tracked_tasks={len(self._dispatched_rollouts)}"
+            )
+
+        metrics: dict[str, int | float] = {
+            "initial_inflight_rollouts": initial_active_tasks,
+            "cancelled_inflight_rollouts": len(cancelled_tasks),
+            "late_registered_rollouts": max(
+                0, len(cancelled_tasks) - initial_active_tasks
+            ),
+            "rollout_cancellation_rounds": cancellation_rounds,
+            "rollout_cleanup_errors": len(unexpected_errors),
+            "remaining_inflight_rollouts": self._inflight_rollouts,
+            "remaining_tracked_rollouts": len(self._dispatched_rollouts),
+            "rollout_drain_time_s": time.monotonic() - started_at,
+        }
+        print(f"terminal rollout drain: {metrics}", flush=True)
+        return metrics
 
     async def _train_pump(self) -> None:
         """Per-prompt-group streaming train loop.
@@ -559,8 +779,6 @@ class SingleControllerActor:
                 percent = (v / total_time * 100) if total_time > 0 else 0.0
                 print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
 
-            # TODO: checkpointing (save_period/top-k metric_name,
-            #   policy.save_checkpoint, dataloader state, TQReplayBuffer state).
             # TODO: per-step train_data jsonl dump, vllm metrics logger,
             #   histogram log, rollout_metrics, seq_logprob_error_metrics,
             #   pretty-print "Training Results" block, print_performance_metrics.
@@ -582,6 +800,143 @@ class SingleControllerActor:
                 f"lag={lag}  ",
                 flush=True,
             )
+
+            self._total_valid_tokens += int(step_metrics.get("global_valid_toks", 0))
+            should_save_by_timeout = False
+            if self._checkpoint_timeout is not None:
+                self._checkpoint_timeout.mark_iteration()
+                should_save_by_timeout = self._checkpoint_timeout.check_save()
+
+            is_last_step = self._train_steps >= grpo_cfg.max_num_steps
+            should_save_by_step = False
+            if self._checkpointer is not None:
+                ft_save_period = self._checkpointing_cfg.get("ft_save_period")
+                should_save_by_step = (
+                    is_last_step
+                    or self._train_steps % self._checkpointer.save_period == 0
+                    or (
+                        ft_save_period is not None
+                        and self._train_steps % int(ft_save_period) == 0
+                    )
+                )
+                if should_save_by_step or should_save_by_timeout:
+                    terminal_drain_metrics: dict[str, int | float] = {}
+                    if is_last_step or should_save_by_timeout:
+                        self._rollout_permitted.clear()
+                        terminal_drain_metrics.update(
+                            _process_memory_metrics("pre_terminal_drain")
+                        )
+                        terminal_drain_metrics.update(
+                            await self._cancel_inflight_rollouts()
+                        )
+                        terminal_drain_metrics.update(
+                            _process_memory_metrics("post_terminal_drain")
+                        )
+                    checkpoint_start = time.monotonic()
+                    replay_metrics = await self._save_checkpoint(step_metrics)
+                    checkpoint_metrics = {
+                        **replay_metrics,
+                        **terminal_drain_metrics,
+                        "save_time_s": time.monotonic() - checkpoint_start,
+                    }
+                    self._logger.log_metrics(
+                        checkpoint_metrics,
+                        step=self._train_steps,
+                        prefix="checkpoint",
+                    )
+                    print(
+                        f"checkpoint step {self._train_steps}: "
+                        f"{replay_metrics['ready_groups']} committed TQ group(s), "
+                        f"{replay_metrics['written_groups']} newly written, "
+                        f"{replay_metrics['hardlinked_groups']} hard-linked",
+                        flush=True,
+                    )
+
+            if should_save_by_timeout:
+                print("Checkpoint deadline reached; ending this stage", flush=True)
+                return
+
+    async def _save_checkpoint(
+        self, step_metrics: dict[str, Any]
+    ) -> dict[str, int | float]:
+        """Save trainer state and all committed, unconsumed TQ groups."""
+        if self._checkpointer is None:
+            raise RuntimeError(
+                "checkpoint save requested while checkpointing is disabled"
+            )
+
+        checkpoint_memory_metrics = _process_memory_metrics("checkpoint_start")
+        await asyncio.to_thread(self._checkpointer.finalize_pending)
+        checkpoint_memory_metrics.update(
+            _process_memory_metrics("checkpoint_after_finalize_pending")
+        )
+        previous_checkpoint_path = self._checkpointer.get_latest_checkpoint_path()
+        dataloader_length = len(self._dataloader)
+        save_state = SingleControllerSaveState(
+            consumed_samples=(
+                self._train_steps * self._master_config.grpo.num_prompts_per_step
+            ),
+            consumed_prompt_batches=self._train_steps,
+            current_step=(
+                self._train_steps % dataloader_length if dataloader_length else 0
+            ),
+            current_epoch=(
+                self._train_steps // dataloader_length if dataloader_length else 0
+            ),
+            train_steps=self._train_steps,
+            trainer_version=self._trainer_version,
+            total_valid_tokens=self._total_valid_tokens,
+        )
+        training_info: dict[str, Any] = {
+            **vars(save_state),
+            # Preserve the legacy GRPO key for checkpoint inspection tooling.
+            "total_steps": self._train_steps,
+        }
+        metric_name = self._checkpointing_cfg["metric_name"]
+        if metric_name is not None:
+            _, train_metric_name = metric_name.split(":", 1)
+            if train_metric_name not in step_metrics:
+                raise ValueError(
+                    f"Metric {train_metric_name!r} not found in train metrics"
+                )
+            training_info[metric_name] = step_metrics[train_metric_name]
+
+        checkpoint_path = self._checkpointer.init_tmp_checkpoint(
+            self._train_steps,
+            training_info,
+            self._master_config,
+        )
+        await asyncio.to_thread(self._trainer.prepare_for_training)
+        await asyncio.to_thread(
+            self._trainer.save_checkpoint,
+            weights_path=os.path.join(checkpoint_path, "policy", "weights"),
+            optimizer_path=(
+                os.path.join(checkpoint_path, "policy", "optimizer")
+                if self._checkpointer.save_optimizer
+                else None
+            ),
+            tokenizer_path=os.path.join(checkpoint_path, "policy", "tokenizer"),
+            checkpointing_cfg=self._checkpointing_cfg,
+        )
+        checkpoint_memory_metrics.update(
+            _process_memory_metrics("checkpoint_after_trainer_save")
+        )
+        replay_metrics = await self._buffer.save_completed_rollouts(
+            checkpoint_path,
+            previous_checkpoint_path=previous_checkpoint_path,
+        )
+        checkpoint_memory_metrics.update(
+            _process_memory_metrics("checkpoint_after_replay_save")
+        )
+        self._checkpointer.begin_finalization(
+            checkpoint_path,
+            wait_fn=self._trainer.finalize_async_save,
+        )
+        _write_latest_checkpoint_status(
+            self._checkpointer,
+            last_checkpoint_step=self._train_steps,
+        )
+        return {**replay_metrics, **checkpoint_memory_metrics}
 
     async def _sync_weights(
         self,
