@@ -36,6 +36,8 @@ import torch
 from nemo_rl.data.packed_rollouts import (
     PACKED_ATTENTION_SEGMENT_LENGTHS,
     PACKED_ATTENTION_SELECTED_SEGMENTS,
+    TREE_ATTENTION_LAYOUTS,
+    TreeAttentionLayout,
 )
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, ROUTED_EXPERTS_FIELD
@@ -159,6 +161,7 @@ def _make_tq_policy() -> tuple[TQPolicy, MagicMock]:
     p.cfg = {
         "train_global_batch_size": 8,
         "train_micro_batch_size": 2,
+        "max_total_sequence_length": 131072,
         "megatron_cfg": {"enabled": True},
     }
     p._router_replay_enabled = False
@@ -311,6 +314,52 @@ class TestTQPolicyExactCallPacking:
                     [30.0, 31.0, 32.0, 33.0, 0.0],
                 ]
             ),
+        )
+
+    def test_logprob_dispatch_reassembles_bounded_tree_fragments(self):
+        p, wg = _make_tq_policy()
+        layout = TreeAttentionLayout(
+            segment_lengths=(3, 2, 2),
+            segment_parents=(-1, 0, 0),
+            segment_depths=(0, 3, 3),
+            edge_source_indices=(1, 3, 5),
+            original_token_count=9,
+        )
+        meta = KVBatchMeta(
+            partition_id="train",
+            task_name="prev_lp",
+            sample_ids=["s0"],
+            fields=list(DP_TRAIN_FIELDS),
+            sequence_lengths=[7],
+            extra_info={TREE_ATTENTION_LAYOUTS: [layout]},
+        )
+        p.write_to_dataplane = MagicMock()
+        # DP concatenation is fragment 1 then fragment 0; the inverse
+        # permutation restores planner order before edge scattering.
+        wg.get_all_worker_results.return_value = [
+            BatchedDataDict({"logprobs": torch.tensor([[0.0, 30.0, 0.0]])}),
+            BatchedDataDict({"logprobs": torch.tensor([[0.0, 10.0, 20.0]])}),
+        ]
+        packing_args = {
+            "algorithm": "modified_first_fit_decreasing",
+            "input_key": "input_ids",
+            "input_lengths_key": "input_lengths",
+            "max_tokens_per_microbatch": 5,
+            "sequence_length_pad_multiple": 1,
+        }
+        with (
+            patch.object(TQPolicy, "_stamp_pad_seqlen"),
+            patch.object(TQPolicy, "_packing_args", return_value=(packing_args, None)),
+            patch(
+                "nemo_rl.models.policy.tq_policy.shard_meta_for_dp",
+                return_value=([meta, meta], [1, 0]),
+            ),
+        ):
+            p.get_logprobs_from_meta(meta)
+
+        assert torch.equal(
+            p.write_to_dataplane.call_args.kwargs["fields"]["prev_logprobs"],
+            torch.tensor([[0.0, 10.0, 20.0, 30.0]]),
         )
 
     def test_sync_train_counts_physical_calls_but_steps_logical_rollouts(self):

@@ -40,7 +40,7 @@ from typing import Any, Optional
 import ray
 import torch
 
-from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
 from nemo_rl.data.packed_rollouts import (
     PACKED_ATTENTION_SEGMENT_LENGTHS,
     PACKED_ATTENTION_SELECTED_SEGMENTS,
@@ -48,12 +48,16 @@ from nemo_rl.data.packed_rollouts import (
     TREE_ATTENTION_EDGE_SOURCE_INDICES,
     TREE_ATTENTION_EDGE_TARGET_IDS,
     TREE_ATTENTION_LAYOUTS,
+    TreeAttentionFragmentBatchLayout,
     reassemble_packed_attention_segments,
+    reassemble_tree_attention_edge_values,
 )
-
 from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta, build_data_plane_client
 from nemo_rl.data_plane.column_io import read_columns, round_up, write_columns
-from nemo_rl.data_plane.preshard import shard_meta_for_dp
+from nemo_rl.data_plane.preshard import (
+    expand_meta_for_tree_attention,
+    shard_meta_for_dp,
+)
 from nemo_rl.data_plane.schema import (
     DP_TRAIN_FIELDS,
     ELEM_COUNTS_PER_GB,
@@ -83,7 +87,7 @@ def _with_tree_attention_fields(
     return out
 
 
-def _allow_oversized_tree_rows(
+def _validate_tree_rows(
     meta: KVBatchMeta,
     sequence_packing_args: Optional[dict[str, Any]],
     *,
@@ -101,14 +105,6 @@ def _allow_oversized_tree_rows(
                 "tree rollout logical path exceeds configured context: "
                 f"{layout.max_path_length} > {max_context_length}"
             )
-    padded_physical_length = round_up(
-        max(meta.sequence_lengths),
-        int(sequence_packing_args["sequence_length_pad_multiple"]),
-    )
-    sequence_packing_args["max_tokens_per_microbatch"] = max(
-        int(sequence_packing_args["max_tokens_per_microbatch"]),
-        padded_physical_length,
-    )
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -259,6 +255,7 @@ class TQPolicy(Policy):
         self._router_replay_enabled = bool(
             (self.cfg.get("router_replay") or {}).get("enabled", False)
         )
+        self._open_train_loss_type: LossType | None = None
 
         # Forward to workers (replaces ``Policy.setup_data_plane`` call
         # site in the trainer — TQPolicy bundles bootstrap + worker
@@ -370,7 +367,7 @@ class TQPolicy(Policy):
         dp_metas: list[KVBatchMeta],
     ) -> None:
         """Report old logical-row vs expanded-call replica-broadcast padding."""
-        observability = self.dp_cfg.get("observability") or {}
+        observability = (getattr(self, "dp_cfg", {}) or {}).get("observability") or {}
         if not observability.get("packing_memory_enabled", False):
             return
         segment_lengths = (meta.extra_info or {}).get(PACKED_ATTENTION_SEGMENT_LENGTHS)
@@ -432,6 +429,43 @@ class TQPolicy(Policy):
             ),
         }
         print(f"tq_packed_padding: {json.dumps(event, sort_keys=True)}", flush=True)
+
+    def _emit_tree_fragmentation(
+        self,
+        *,
+        stage: str,
+        meta: KVBatchMeta,
+        layout: TreeAttentionFragmentBatchLayout | None,
+    ) -> None:
+        """Report the physical-token cost and bound of a fragmented tree batch."""
+        if layout is None:
+            return
+        original_layouts = meta.extra_info[TREE_ATTENTION_LAYOUTS]
+        real_fragments = [
+            fragment for fragment in layout.fragments if not fragment.is_padding
+        ]
+        event = {
+            "stage": stage,
+            "logical_rows": layout.original_batch_size,
+            "fragments": len(real_fragments),
+            "padding_fragments": len(layout.fragments) - len(real_fragments),
+            "original_physical_tokens": sum(
+                item.unique_token_count for item in original_layouts
+            ),
+            "fragment_physical_tokens": sum(
+                fragment.layout.unique_token_count for fragment in real_fragments
+            ),
+            "max_original_physical_tokens": max(
+                item.unique_token_count for item in original_layouts
+            ),
+            "max_fragment_physical_tokens": max(
+                fragment.layout.unique_token_count for fragment in real_fragments
+            ),
+            "owned_edges": sum(
+                len(fragment.edge_indices) for fragment in real_fragments
+            ),
+        }
+        print(f"tq_tree_fragmentation: {json.dumps(event, sort_keys=True)}", flush=True)
 
     def read_from_dataplane(
         self,
@@ -515,8 +549,25 @@ class TQPolicy(Policy):
         """
         self._stamp_pad_seqlen(meta)
         spa, dba = self._packing_args("logprob_mb_tokens")
-        _allow_oversized_tree_rows(
-            meta, spa, max_context_length=self.cfg["max_total_sequence_length"]
+        if TREE_ATTENTION_LAYOUTS in (meta.extra_info or {}):
+            _validate_tree_rows(
+                meta, spa, max_context_length=self.cfg["max_total_sequence_length"]
+            )
+        tree_fragment_layout = (
+            expand_meta_for_tree_attention(
+                meta,
+                max_physical_tokens=int(spa["max_tokens_per_microbatch"]),
+                fragment_count_multiple=self.sharding_annotations.get_axis_size(
+                    "data_parallel"
+                ),
+            )
+            if spa is not None
+            else None
+        )
+        self._emit_tree_fragmentation(
+            stage=task_name,
+            meta=meta,
+            layout=tree_fragment_layout,
         )
         seed_fields = _with_tree_attention_fields(LP_SEED_FIELDS, meta)
         lp_meta = replace(
@@ -559,7 +610,7 @@ class TQPolicy(Policy):
             )
         worker_results = self.worker_group.get_all_worker_results(futures)
         segment_lengths = (meta.extra_info or {}).get(PACKED_ATTENTION_SEGMENT_LENGTHS)
-        if segment_lengths is None:
+        if segment_lengths is None and tree_fragment_layout is None:
             return
 
         packed_results = _concatenate_packed_logprob_results(
@@ -568,15 +619,20 @@ class TQPolicy(Policy):
         )
         if unsorted_indices is not None:
             packed_results.reorder_data(unsorted_indices)
-        if not meta.sequence_lengths:
-            raise ValueError(
-                "packed attention logprob dispatch requires sequence_lengths"
+        if tree_fragment_layout is not None:
+            reassembled = reassemble_tree_attention_edge_values(
+                packed_results[result_key], tree_fragment_layout
             )
-        reassembled = reassemble_packed_attention_segments(
-            packed_results[result_key],
-            segment_lengths,
-            output_sequence_length=max(meta.sequence_lengths),
-        )
+        else:
+            if not meta.sequence_lengths:
+                raise ValueError(
+                    "packed attention logprob dispatch requires sequence_lengths"
+                )
+            reassembled = reassemble_packed_attention_segments(
+                packed_results[result_key],
+                segment_lengths,
+                output_sequence_length=max(meta.sequence_lengths),
+            )
         self.write_to_dataplane(meta, fields={tq_field: reassembled})
 
     def get_logprobs_from_meta(
@@ -664,9 +720,26 @@ class TQPolicy(Policy):
 
         self._stamp_pad_seqlen(meta)
         spa, dba = self._packing_args("train_mb_tokens")
-        _allow_oversized_tree_rows(
-            meta, spa, max_context_length=self.cfg["max_total_sequence_length"]
-        )
+        if TREE_ATTENTION_LAYOUTS in (meta.extra_info or {}):
+            _validate_tree_rows(
+                meta, spa, max_context_length=self.cfg["max_total_sequence_length"]
+            )
+        if (
+            spa is not None
+            and expand_meta_for_tree_attention(
+                meta,
+                max_physical_tokens=int(spa["max_tokens_per_microbatch"]),
+                fragment_count_multiple=self.sharding_annotations.get_axis_size(
+                    "data_parallel"
+                ),
+            )
+            is not None
+        ):
+            raise NotImplementedError(
+                "bounded tree fragmentation is supported by the async split TQ "
+                "training path; train_from_meta cannot preserve one optimizer step "
+                "across streamed fragments"
+            )
         # ``train_fields`` (rollout + logprob deltas + advantages + sample_mask;
         # default ``DP_TRAIN_FIELDS``) must be in TQ before this call — written
         # by workers + driver delta-writes. Caller may narrow to drop columns
@@ -781,6 +854,7 @@ class TQPolicy(Policy):
             mbs=micro_batch_size,
         )
         ray.get(futures)
+        self._open_train_loss_type = getattr(loss_fn, "loss_type", None)
 
     def train_microbatches_from_meta(
         self,
@@ -811,8 +885,32 @@ class TQPolicy(Policy):
             )
         self._stamp_pad_seqlen(meta)
         spa, dba = self._packing_args("train_mb_tokens")
-        _allow_oversized_tree_rows(
-            meta, spa, max_context_length=self.cfg["max_total_sequence_length"]
+        if TREE_ATTENTION_LAYOUTS in (meta.extra_info or {}):
+            _validate_tree_rows(
+                meta, spa, max_context_length=self.cfg["max_total_sequence_length"]
+            )
+        tree_fragment_layout = (
+            expand_meta_for_tree_attention(
+                meta,
+                max_physical_tokens=int(spa["max_tokens_per_microbatch"]),
+                fragment_count_multiple=self.sharding_annotations.get_axis_size(
+                    "data_parallel"
+                ),
+            )
+            if spa is not None
+            else None
+        )
+        if (
+            tree_fragment_layout is not None
+            and self._open_train_loss_type != LossType.TOKEN_LEVEL
+        ):
+            raise ValueError(
+                "bounded tree fragmentation currently supports token-level losses only"
+            )
+        self._emit_tree_fragmentation(
+            stage="train_microbatch",
+            meta=meta,
+            layout=tree_fragment_layout,
         )
         train_meta = replace(
             meta,
@@ -837,7 +935,14 @@ class TQPolicy(Policy):
         )
 
         if self.flops_tracker is not None:
-            self.flops_tracker.track_batch(_model_sequence_lengths(meta))
+            self.flops_tracker.track_batch(
+                [
+                    fragment.layout.unique_token_count
+                    for fragment in tree_fragment_layout.fragments
+                ]
+                if tree_fragment_layout is not None
+                else _model_sequence_lengths(meta)
+            )
 
         with (
             timer.time("policy_training/submit_microbatch_futures")
@@ -888,6 +993,7 @@ class TQPolicy(Policy):
             aggregated_results["total_flops"] = self.flops_tracker.total_flops
             aggregated_results["num_ranks"] = self.worker_group.cluster.world_size()
 
+        self._open_train_loss_type = None
         return aggregated_results
 
     def abort_train_step(self) -> None:
@@ -896,6 +1002,7 @@ class TQPolicy(Policy):
             "abort_train_step_presharded",
         )
         ray.get(futures)
+        self._open_train_loss_type = None
 
         if self.flops_tracker is not None:
             self.flops_tracker.reset()

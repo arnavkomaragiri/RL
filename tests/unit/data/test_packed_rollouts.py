@@ -17,9 +17,17 @@ import torch
 
 from nemo_rl.data.packed_rollouts import (
     PACKED_ATTENTION_SEGMENT_LENGTHS,
+    TREE_ATTENTION_EDGE_LENGTHS,
+    TREE_ATTENTION_EDGE_SOURCE_INDICES,
+    TREE_ATTENTION_EDGE_TARGET_IDS,
+    TREE_ATTENTION_LAYOUTS,
+    TreeAttentionLayout,
     expand_batched_data_for_packed_attention,
+    expand_batched_data_for_tree_attention,
     expand_selected_packed_attention_segments,
+    plan_tree_attention_fragments,
     reassemble_packed_attention_segments,
+    reassemble_tree_attention_edge_values,
     split_tensor_at_packed_attention_segments,
     validate_packed_attention_segment_lengths,
 )
@@ -205,3 +213,97 @@ def test_validate_packed_attention_segment_lengths_rejects_invalid_metadata(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         validate_packed_attention_segment_lengths(segment_lengths, input_lengths)
+
+
+def _branching_tree_layout() -> TreeAttentionLayout:
+    return TreeAttentionLayout(
+        segment_lengths=(3, 2, 2),
+        segment_parents=(-1, 0, 0),
+        segment_depths=(0, 3, 3),
+        edge_source_indices=(1, 3, 5),
+        original_token_count=9,
+    )
+
+
+def test_plan_tree_fragments_is_bounded_ancestor_closed_and_edge_disjoint() -> None:
+    fragments = plan_tree_attention_fragments(
+        _branching_tree_layout(), max_physical_tokens=5
+    )
+
+    assert len(fragments) == 2
+    assert [fragment.node_indices for fragment in fragments] == [
+        (0, 1, 2, 3, 4),
+        (0, 1, 2, 5, 6),
+    ]
+    assert [fragment.edge_indices for fragment in fragments] == [(0, 1), (2,)]
+    assert [fragment.layout.segment_parents for fragment in fragments] == [
+        (-1, 0),
+        (-1, 0),
+    ]
+    assert [fragment.layout.edge_source_indices for fragment in fragments] == [
+        (1, 3),
+        (3,),
+    ]
+    assert all(fragment.layout.unique_token_count <= 5 for fragment in fragments)
+
+
+def test_tree_fragment_expansion_gathers_nodes_and_edges_then_reassembles() -> None:
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[10, 11, 12, 20, 21, 30, 31]]),
+            "input_lengths": torch.tensor([7]),
+            "routed_experts": torch.arange(14).reshape(1, 7, 2, 1),
+            "generation_logprobs": torch.tensor([[0.0, 1.0, 2.0, 3.0]]),
+            "token_mask": torch.tensor([[0, 1, 1, 1]]),
+            "sample_mask": torch.tensor([0.5]),
+            TREE_ATTENTION_EDGE_SOURCE_INDICES: torch.tensor([[1, 3, 5]]),
+            TREE_ATTENTION_EDGE_TARGET_IDS: torch.tensor([[101, 102, 103]]),
+            TREE_ATTENTION_EDGE_LENGTHS: torch.tensor([3]),
+            TREE_ATTENTION_LAYOUTS: [_branching_tree_layout()],
+        }
+    )
+
+    expanded, layout = expand_batched_data_for_tree_attention(
+        data, max_physical_tokens=5
+    )
+
+    assert layout is not None
+    assert expanded.size == 2
+    assert torch.equal(expanded["input_lengths"], torch.tensor([5, 5]))
+    assert torch.equal(
+        expanded["input_ids"],
+        torch.tensor(
+            [
+                [10, 11, 12, 20, 21],
+                [10, 11, 12, 30, 31],
+            ]
+        ),
+    )
+    assert torch.equal(
+        expanded[TREE_ATTENTION_EDGE_SOURCE_INDICES],
+        torch.tensor([[1, 3], [3, -1]]),
+    )
+    assert torch.equal(
+        expanded[TREE_ATTENTION_EDGE_TARGET_IDS],
+        torch.tensor([[101, 102], [103, 0]]),
+    )
+    assert torch.equal(expanded[TREE_ATTENTION_EDGE_LENGTHS], torch.tensor([2, 1]))
+    assert torch.equal(
+        expanded["generation_logprobs"],
+        torch.tensor([[0.0, 1.0, 2.0], [0.0, 3.0, 0.0]]),
+    )
+    assert torch.equal(expanded["sample_mask"], torch.tensor([0.5, 0.5]))
+    assert torch.equal(
+        expanded["routed_experts"][1], data["routed_experts"][0, [0, 1, 2, 5, 6]]
+    )
+
+    fragment_values = torch.tensor([[0.0, 10.0, 20.0], [0.0, 30.0, 0.0]])
+    assert torch.equal(
+        reassemble_tree_attention_edge_values(fragment_values, layout),
+        torch.tensor([[0.0, 10.0, 20.0, 30.0]]),
+    )
+
+
+def test_tree_fragment_plan_rejects_a_path_larger_than_budget() -> None:
+    with pytest.raises(ValueError, match="logical path exceeds"):
+        plan_tree_attention_fragments(_branching_tree_layout(), max_physical_tokens=4)

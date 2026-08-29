@@ -32,8 +32,16 @@ import torch
 from nemo_rl.data.packed_rollouts import (
     PACKED_ATTENTION_SEGMENT_LENGTHS,
     PACKED_ATTENTION_SELECTED_SEGMENTS,
+    TREE_ATTENTION_EDGE_LENGTHS,
+    TREE_ATTENTION_EDGE_SOURCE_INDICES,
+    TREE_ATTENTION_EDGE_TARGET_IDS,
+    TREE_ATTENTION_FRAGMENT_SELECTIONS,
+    TREE_ATTENTION_LAYOUTS,
+    TreeAttentionLayout,
     expand_batched_data_for_packed_attention,
+    expand_batched_data_for_tree_attention,
     expand_selected_packed_attention_segments,
+    materialize_tree_attention_fragments,
 )
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
@@ -41,6 +49,7 @@ from nemo_rl.data_plane.column_io import kv_first_write, read_columns
 from nemo_rl.data_plane.preshard import (
     shard_meta_for_dp,
     split_packed_attention_microbatch_metas,
+    split_tree_attention_microbatch_metas,
 )
 from nemo_rl.data_plane.schema import (
     DP_TRAIN_FIELDS,
@@ -244,14 +253,10 @@ def test_tq_selected_calls_match_legacy_expansion_including_routes() -> None:
     segment_lengths = [[3, 2], [4]]
     logical = BatchedDataDict(
         {
-            "input_ids": torch.tensor(
-                [[10, 11, 12, 20, 21], [30, 31, 32, 33, 0]]
-            ),
+            "input_ids": torch.tensor([[10, 11, 12, 20, 21], [30, 31, 32, 33, 0]]),
             "input_lengths": torch.tensor([5, 4]),
             "token_mask": torch.tensor([[0, 1, 1, 0, 1], [0, 1, 1, 1, 0]]),
-            "generation_logprobs": torch.arange(10, dtype=torch.float32).reshape(
-                2, 5
-            ),
+            "generation_logprobs": torch.arange(10, dtype=torch.float32).reshape(2, 5),
             "routed_experts": torch.arange(2 * 5 * 3 * 2, dtype=torch.int16).reshape(
                 2, 5, 3, 2
             ),
@@ -303,9 +308,7 @@ def test_tq_selected_calls_match_legacy_expansion_including_routes() -> None:
         rank_calls.append(
             expand_selected_packed_attention_segments(
                 fetched,
-                segment_lengths=rank_meta.extra_info[
-                    PACKED_ATTENTION_SEGMENT_LENGTHS
-                ],
+                segment_lengths=rank_meta.extra_info[PACKED_ATTENTION_SEGMENT_LENGTHS],
                 selected_segments=rank_meta.extra_info[
                     PACKED_ATTENTION_SELECTED_SEGMENTS
                 ],
@@ -331,14 +334,12 @@ def test_jagged_tq_selected_calls_match_dense_expansion() -> None:
     segment_lengths = [[3, 2], [4]]
     dense = BatchedDataDict(
         {
-            "input_ids": torch.tensor(
-                [[10, 11, 12, 20, 21], [30, 31, 32, 33, 0]]
-            ),
+            "input_ids": torch.tensor([[10, 11, 12, 20, 21], [30, 31, 32, 33, 0]]),
             "input_lengths": torch.tensor([5, 4]),
             "token_mask": torch.tensor([[0, 1, 1, 0, 1], [0, 1, 1, 1, 0]]),
-            "routed_experts": torch.arange(
-                2 * 5 * 3 * 2, dtype=torch.int16
-            ).reshape(2, 5, 3, 2),
+            "routed_experts": torch.arange(2 * 5 * 3 * 2, dtype=torch.int16).reshape(
+                2, 5, 3, 2
+            ),
         }
     )
     jagged = BatchedDataDict(
@@ -428,11 +429,135 @@ def test_split_packed_attention_metas_preserves_packer_bins() -> None:
             rank_meta.extra_info[PACKED_ATTENTION_SEGMENT_LENGTHS][parent][segment]
             for parent, segment in reconstructed_calls[-len(local_calls) :]
         )
-        assert (
-            micro_meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] == expected_width
-        )
+        assert micro_meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] == expected_width
 
     assert reconstructed_calls == original_calls
+
+
+def test_tq_tree_fragments_match_legacy_expansion() -> None:
+    layouts = [
+        TreeAttentionLayout(
+            segment_lengths=(3, 2, 2),
+            segment_parents=(-1, 0, 0),
+            segment_depths=(0, 3, 3),
+            edge_source_indices=(1, 3, 5),
+            original_token_count=9,
+        ),
+        TreeAttentionLayout(
+            segment_lengths=(4,),
+            segment_parents=(-1,),
+            segment_depths=(0,),
+            edge_source_indices=(1, 2),
+            original_token_count=4,
+        ),
+    ]
+    logical = BatchedDataDict(
+        {
+            "input_ids": torch.tensor(
+                [[10, 11, 12, 20, 21, 30, 31], [40, 41, 42, 43, 0, 0, 0]]
+            ),
+            "input_lengths": torch.tensor([7, 4]),
+            "routed_experts": torch.arange(2 * 7 * 2).reshape(2, 7, 2, 1),
+            "generation_logprobs": torch.tensor(
+                [[0.0, 1.0, 2.0, 3.0], [0.0, 4.0, 5.0, 0.0]]
+            ),
+            "token_mask": torch.tensor([[0, 1, 1, 1], [0, 1, 1, 0]]),
+            "sample_mask": torch.ones(2),
+            TREE_ATTENTION_EDGE_SOURCE_INDICES: torch.tensor([[1, 3, 5], [1, 2, -1]]),
+            TREE_ATTENTION_EDGE_TARGET_IDS: torch.tensor(
+                [[101, 102, 103], [201, 202, 0]]
+            ),
+            TREE_ATTENTION_EDGE_LENGTHS: torch.tensor([3, 2]),
+            TREE_ATTENTION_LAYOUTS: layouts,
+        }
+    )
+    legacy, legacy_layout = expand_batched_data_for_tree_attention(
+        logical, max_physical_tokens=5, fragment_count_multiple=2
+    )
+    assert legacy_layout is not None
+
+    meta = KVBatchMeta(
+        partition_id="train",
+        task_name="train",
+        sample_ids=["rollout-0", "rollout-1"],
+        fields=[key for key in logical if key != TREE_ATTENTION_LAYOUTS],
+        sequence_lengths=[7, 4],
+        extra_info={TREE_ATTENTION_LAYOUTS: layouts},
+    )
+    rank_metas, unsorted = shard_meta_for_dp(
+        meta,
+        dp_world=2,
+        sequence_packing_args={
+            "algorithm": "modified_first_fit_decreasing",
+            "input_key": "input_ids",
+            "input_lengths_key": "input_lengths",
+            "max_tokens_per_microbatch": 5,
+            "sequence_length_pad_multiple": 1,
+        },
+    )
+
+    sample_index = {"rollout-0": 0, "rollout-1": 1}
+    rank_fragments = []
+    dispatched_edges = []
+    for rank_meta in rank_metas:
+        assert len(rank_meta.sample_ids) == len(set(rank_meta.sample_ids))
+        selections = rank_meta.extra_info[TREE_ATTENTION_FRAGMENT_SELECTIONS]
+        parent_indices = torch.tensor(
+            [sample_index[sample_id] for sample_id in rank_meta.sample_ids]
+        )
+        fetched = BatchedDataDict(
+            {
+                key: value.index_select(0, parent_indices)
+                if torch.is_tensor(value)
+                else [value[index] for index in parent_indices.tolist()]
+                for key, value in logical.items()
+                if key != TREE_ATTENTION_LAYOUTS
+            }
+        )
+        rank_fragments.append(
+            materialize_tree_attention_fragments(
+                fetched,
+                fragments=[fragment for _, fragment in selections],
+                parent_indices=[parent for parent, _ in selections],
+            )
+        )
+        dispatched_edges.extend(fragment.edge_indices for _, fragment in selections)
+
+        micro_metas = split_tree_attention_microbatch_metas(rank_meta)
+        assert sum(
+            len(micro.extra_info[TREE_ATTENTION_FRAGMENT_SELECTIONS])
+            for micro in micro_metas
+        ) == len(selections)
+        assert all(
+            micro.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] <= 5 for micro in micro_metas
+        )
+
+    tq = BatchedDataDict.from_batches(
+        rank_fragments,
+        pad_value_dict={TREE_ATTENTION_EDGE_SOURCE_INDICES: -1},
+    )
+    if unsorted is not None:
+        tq.reorder_data(unsorted)
+    for field in (
+        "input_ids",
+        "input_lengths",
+        "routed_experts",
+        "generation_logprobs",
+        "token_mask",
+        "sample_mask",
+        TREE_ATTENTION_EDGE_SOURCE_INDICES,
+        TREE_ATTENTION_EDGE_TARGET_IDS,
+        TREE_ATTENTION_EDGE_LENGTHS,
+    ):
+        assert torch.equal(tq[field], legacy[field])
+    assert tq[TREE_ATTENTION_LAYOUTS] == legacy[TREE_ATTENTION_LAYOUTS]
+    assert sorted(edge for edges in dispatched_edges for edge in edges) == [
+        0,
+        0,
+        1,
+        1,
+        2,
+    ]
 
 
 # ── meta utility helpers ──────────────────────────────────────────────

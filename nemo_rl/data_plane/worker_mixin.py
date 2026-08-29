@@ -38,8 +38,10 @@ from nemo_rl.data.llm_message_utils import attach_message_log_view
 from nemo_rl.data.packed_rollouts import (
     PACKED_ATTENTION_SEGMENT_LENGTHS,
     PACKED_ATTENTION_SELECTED_SEGMENTS,
+    TREE_ATTENTION_FRAGMENT_SELECTIONS,
     TREE_ATTENTION_LAYOUTS,
     expand_selected_packed_attention_segments,
+    materialize_tree_attention_fragments,
 )
 from nemo_rl.data_plane.column_io import TREE_EDGE_ALIGNED_FIELDS, round_up
 from nemo_rl.data_plane.preshard import (
@@ -438,6 +440,24 @@ class TQWorkerMixin:
                 "packed attention preshard metadata requires both segment lengths "
                 "and selected segments"
             )
+        fragment_selections = extra.get(TREE_ATTENTION_FRAGMENT_SELECTIONS)
+        if fragment_selections is not None:
+            selected_fragments = list(fragment_selections)
+            if has_segments:
+                raise ValueError(
+                    "tree fragment and independent-call selections are mutually "
+                    "exclusive"
+                )
+            return self._fetch(
+                meta,
+                layout="jagged",
+                dp_aligned_seq_len=False,
+                preprocess=lambda _worker, data: materialize_tree_attention_fragments(
+                    data,
+                    fragments=[fragment for _, fragment in selected_fragments],
+                    parent_indices=[parent for parent, _ in selected_fragments],
+                ),
+            )
         if not has_segments:
             data = self._fetch(meta)
             tree_layouts = extra.get(TREE_ATTENTION_LAYOUTS)
@@ -491,6 +511,58 @@ class TQWorkerMixin:
                 if use_replica_broadcast
                 else 0
             )
+
+            fragment_selections = extra.get(TREE_ATTENTION_FRAGMENT_SELECTIONS)
+            if fragment_selections is not None:
+                logical_data: Optional[BatchedDataDict[Any]] = None
+                if is_leader:
+                    wire_data = self._require_dp_client().get_samples(
+                        sample_ids=meta.sample_ids,
+                        partition_id=meta.partition_id,
+                        select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
+                    )
+                    logical_data = materialize(
+                        wire_data,
+                        layout="jagged",
+                        pad_value_dict=self._pad_value_dict(),
+                    )
+                source_parent = {
+                    sample_id: index for index, sample_id in enumerate(meta.sample_ids)
+                }
+                for micro_meta in micro_metas:
+                    micro_data: Optional[BatchedDataDict[Any]] = None
+                    if is_leader:
+                        assert logical_data is not None
+                        selected = micro_meta.extra_info[
+                            TREE_ATTENTION_FRAGMENT_SELECTIONS
+                        ]
+                        fragments = [fragment for _, fragment in selected]
+                        parents = [
+                            source_parent[micro_meta.sample_ids[local_parent]]
+                            for local_parent, _ in selected
+                        ]
+                        micro_data = materialize_tree_attention_fragments(
+                            logical_data,
+                            fragments=fragments,
+                            parent_indices=parents,
+                        )
+
+                    if use_replica_broadcast:
+                        micro_data = _broadcast_batched_data_dict(
+                            micro_data,
+                            is_leader=is_leader,
+                            src=leader,
+                            group=replica_group,
+                        )
+                    assert micro_data is not None
+                    attach_message_log_view(micro_data)
+                    trace_tq_fetch_payload(
+                        stage=meta.task_name or "unknown",
+                        keys=micro_meta.sample_ids,
+                        data=micro_data,
+                    )
+                    yield micro_data, micro_meta
+                return
 
             dp_client = self._require_dp_client() if is_leader else None
             for micro_meta in micro_metas:
@@ -738,6 +810,7 @@ class TQWorkerMixin:
         their logical rollout rows before the single TQ write.
         """
         packed = PACKED_ATTENTION_SELECTED_SEGMENTS in (meta.extra_info or {})
+        fragmented_tree = TREE_ATTENTION_FRAGMENT_SELECTIONS in (meta.extra_info or {})
         results: list[BatchedDataDict[Any]] = []
         for data, micro_meta in self._iter_fetch_presharded_microbatches(meta):
             data = self._attach_or_repack_pack_metadata(data, micro_meta)
@@ -752,7 +825,7 @@ class TQWorkerMixin:
         result = (
             BatchedDataDict.from_batches(results) if len(results) > 1 else results[0]
         )
-        if packed:
+        if packed or fragmented_tree:
             return result.to("cpu")
         self._write_back_result_field(
             meta,
@@ -774,17 +847,19 @@ class TQWorkerMixin:
         See :meth:`get_logprobs_presharded` for the contract. Tensor
         lives in TQ under ``reference_policy_logprobs``.
         """
-        data = self._fetch_presharded(meta)
         packed = PACKED_ATTENTION_SELECTED_SEGMENTS in (meta.extra_info or {})
+        fragmented_tree = TREE_ATTENTION_FRAGMENT_SELECTIONS in (meta.extra_info or {})
+        data = self._fetch_presharded(meta)
         data = self._attach_or_repack_pack_metadata(data, meta)
-        # Keep reference-policy evaluation in one call. Some backends swap the
-        # reference weights onto CUDA for the duration of this method; invoking
-        # it once per packed bin would repeatedly offload/reload the model.
+        # Keep reference evaluation in one call so MCore swaps the reference
+        # weights exactly once. Unlike policy logprob/train, this fetch excludes
+        # routed-expert replay, so rank-local fragment materialization remains
+        # bounded to token and edge fields.
         result: BatchedDataDict[Any] = self.get_reference_policy_logprobs(  # type: ignore[attr-defined]
             data=data,
             micro_batch_size=micro_batch_size,
         )
-        if packed:
+        if packed or fragmented_tree:
             return result.to("cpu")
         self._write_back_result_field(
             meta,

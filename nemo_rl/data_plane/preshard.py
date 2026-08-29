@@ -31,7 +31,11 @@ import torch
 from nemo_rl.data.packed_rollouts import (
     PACKED_ATTENTION_SEGMENT_LENGTHS,
     PACKED_ATTENTION_SELECTED_SEGMENTS,
+    TREE_ATTENTION_FRAGMENT_SELECTIONS,
     TREE_ATTENTION_LAYOUTS,
+    TreeAttentionFragmentBatchLayout,
+    pad_tree_attention_fragments,
+    plan_tree_attention_fragments,
     validate_packed_attention_segment_lengths,
 )
 from nemo_rl.data_plane.interfaces import KVBatchMeta
@@ -55,6 +59,56 @@ class PackedAttentionCallMeta:
     sequence_lengths: list[int]
     parent_indices: list[int]
     segment_indices: list[int]
+
+
+def expand_meta_for_tree_attention(
+    meta: KVBatchMeta,
+    *,
+    max_physical_tokens: int,
+    fragment_count_multiple: int = 1,
+) -> TreeAttentionFragmentBatchLayout | None:
+    """Plan bounded virtual tree rows while leaving TQ payloads logical."""
+    layouts = (meta.extra_info or {}).get(TREE_ATTENTION_LAYOUTS)
+    if layouts is None:
+        return None
+    if len(layouts) != len(meta.sample_ids):
+        raise ValueError(
+            f"{TREE_ATTENTION_LAYOUTS} must align with sample_ids: "
+            f"{len(layouts)} != {len(meta.sample_ids)}"
+        )
+    if meta.sequence_lengths is None:
+        raise ValueError("tree attention metadata requires sequence lengths")
+    if all(layout.unique_token_count <= max_physical_tokens for layout in layouts):
+        for layout in layouts:
+            layout.validate()
+            if layout.max_path_length > max_physical_tokens:
+                raise ValueError(
+                    "tree logical path exceeds the physical fragment budget: "
+                    f"{layout.max_path_length} > {max_physical_tokens}"
+                )
+        return None
+
+    fragments = []
+    parent_indices: list[int] = []
+    edge_lengths: list[int] = []
+    for parent, layout in enumerate(layouts):
+        row_fragments = plan_tree_attention_fragments(
+            layout, max_physical_tokens=max_physical_tokens
+        )
+        fragments.extend(row_fragments)
+        parent_indices.extend([parent] * len(row_fragments))
+        edge_lengths.append(len(layout.edge_source_indices))
+    fragments, parent_indices = pad_tree_attention_fragments(
+        fragments,
+        parent_indices,
+        count_multiple=fragment_count_multiple,
+    )
+    return TreeAttentionFragmentBatchLayout(
+        fragments=tuple(fragments),
+        parent_indices=tuple(parent_indices),
+        original_batch_size=len(meta.sample_ids),
+        original_edge_lengths=tuple(edge_lengths),
+    )
 
 
 def expand_meta_for_packed_attention(
@@ -197,6 +251,7 @@ def split_tree_attention_microbatch_metas(meta: KVBatchMeta) -> list[KVBatchMeta
     """
     extra = meta.extra_info or {}
     layouts = extra.get(TREE_ATTENTION_LAYOUTS)
+    fragment_selections = extra.get(TREE_ATTENTION_FRAGMENT_SELECTIONS)
     micro_batch_indices = extra.get(MICRO_BATCH_INDICES)
     micro_batch_lengths = extra.get(MICRO_BATCH_LENGTHS)
     elem_counts = extra.get(ELEM_COUNTS_PER_GB)
@@ -210,6 +265,9 @@ def split_tree_attention_microbatch_metas(meta: KVBatchMeta) -> list[KVBatchMeta
             f"{TREE_ATTENTION_LAYOUTS} must align with sample_ids: "
             f"{len(layouts)} != {len(meta.sample_ids)}"
         )
+    if meta.sequence_lengths is None:
+        raise ValueError("tree attention metadata requires sequence lengths")
+    sequence_lengths = meta.sequence_lengths
     if len(micro_batch_indices) != len(micro_batch_lengths):
         raise ValueError(
             "tree attention microbatch index/length chunk counts differ: "
@@ -245,21 +303,53 @@ def split_tree_attention_microbatch_metas(meta: KVBatchMeta) -> list[KVBatchMeta
                     "invalid tree attention microbatch range "
                     f"[{start}, {stop}) for chunk size {chunk_count}"
                 )
-            row_indices = list(range(chunk_offset + start, chunk_offset + stop))
-            micro_meta = meta.subset(row_indices)
-            micro_meta.extra_info[MICRO_BATCH_INDICES] = [[[0, len(row_indices)]]]
+            if fragment_selections is None:
+                row_indices = list(range(chunk_offset + start, chunk_offset + stop))
+                micro_meta = meta.subset(row_indices)
+                physical_count = len(row_indices)
+                forward_pad_seqlen = max(
+                    int(sequence_lengths[index]) for index in row_indices
+                )
+            else:
+                selected = fragment_selections[
+                    chunk_offset + start : chunk_offset + stop
+                ]
+                if len(selected) != stop - start:
+                    raise ValueError(
+                        "tree fragment selection metadata ended before its "
+                        "microbatch ranges"
+                    )
+                parent_indices = list(
+                    dict.fromkeys(int(parent) for parent, _ in selected)
+                )
+                parent_to_local = {
+                    parent: local for local, parent in enumerate(parent_indices)
+                }
+                micro_meta = meta.subset(parent_indices)
+                micro_meta.extra_info[TREE_ATTENTION_FRAGMENT_SELECTIONS] = [
+                    (parent_to_local[int(parent)], fragment)
+                    for parent, fragment in selected
+                ]
+                physical_count = len(selected)
+                forward_pad_seqlen = max(
+                    fragment.layout.unique_token_count for _, fragment in selected
+                )
+            micro_meta.extra_info[MICRO_BATCH_INDICES] = [[[0, physical_count]]]
             micro_meta.extra_info[MICRO_BATCH_LENGTHS] = [[int(packed_length)]]
-            micro_meta.extra_info[ELEM_COUNTS_PER_GB] = [len(row_indices)]
-            micro_meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] = max(
-                int(meta.sequence_lengths[index]) for index in row_indices
-            )
+            micro_meta.extra_info[ELEM_COUNTS_PER_GB] = [physical_count]
+            micro_meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] = forward_pad_seqlen
             out.append(micro_meta)
         chunk_offset += chunk_count
 
-    if chunk_offset != len(meta.sample_ids):
+    expected_count = (
+        len(fragment_selections)
+        if fragment_selections is not None
+        else len(meta.sample_ids)
+    )
+    if chunk_offset != expected_count:
         raise ValueError(
             "tree attention packing metadata does not cover every row: "
-            f"covered={chunk_offset}, rows={len(meta.sample_ids)}"
+            f"covered={chunk_offset}, rows={expected_count}"
         )
     if not out:
         raise ValueError("tree attention packing metadata contains no microbatches")
@@ -322,6 +412,20 @@ def shard_meta_for_dp(
             f"{len(tree_layouts)} != {n}"
         )
     packed_call_meta = expand_meta_for_packed_attention(meta)
+    tree_fragment_layout = None
+    if tree_layouts is not None:
+        if dynamic_batching_args is not None:
+            raise NotImplementedError(
+                "tree attention metadata is not supported with dynamic batching; "
+                "use sequence packing"
+            )
+        if sequence_packing_args is None:
+            raise ValueError("tree rollouts require sequence packing")
+        tree_fragment_layout = expand_meta_for_tree_attention(
+            meta,
+            max_physical_tokens=int(sequence_packing_args["max_tokens_per_microbatch"]),
+            fragment_count_multiple=dp_world,
+        )
     if packed_call_meta is not None:
         if dynamic_batching_args is not None:
             raise NotImplementedError(
@@ -329,6 +433,11 @@ def shard_meta_for_dp(
                 "use sequence packing"
             )
         seq_lens = packed_call_meta.sequence_lengths
+    elif tree_fragment_layout is not None:
+        seq_lens = [
+            fragment.layout.unique_token_count
+            for fragment in tree_fragment_layout.fragments
+        ]
     else:
         seq_lens = logical_seq_lens
     # Skeleton BatchedDataDict — `shard_by_batch_size` only needs
@@ -368,12 +477,19 @@ def shard_meta_for_dp(
     elif sequence_packing_args is not None:
         sharded, _ = skeleton.shard_by_batch_size(
             dp_world,
-            batch_size=None if packed_segment_lengths is not None else batch_size,
-            allow_uneven_shards=packed_segment_lengths is not None,
+            batch_size=(
+                None
+                if packed_segment_lengths is not None
+                or tree_fragment_layout is not None
+                else batch_size
+            ),
+            allow_uneven_shards=(
+                packed_segment_lengths is not None or tree_fragment_layout is not None
+            ),
             # pyrefly: ignore  # bad-argument-type
             sequence_packing_args=sequence_packing_args,
         )
-    elif packed_segment_lengths is not None:
+    elif packed_segment_lengths is not None or tree_fragment_layout is not None:
         sharded = skeleton.shard_by_batch_size(
             dp_world,
             batch_size=None,
@@ -416,6 +532,35 @@ def shard_meta_for_dp(
             ]
             rank_tags = (
                 [meta.tags[i] for i in parent_indices]
+                if meta.tags is not None
+                else None
+            )
+        elif tree_fragment_layout is not None:
+            assert tree_layouts is not None
+            selected_global = [
+                (
+                    tree_fragment_layout.parent_indices[index],
+                    tree_fragment_layout.fragments[index],
+                )
+                for index in idx_list
+            ]
+            parent_indices = list(
+                dict.fromkeys(parent for parent, _ in selected_global)
+            )
+            parent_to_local = {
+                parent: local for local, parent in enumerate(parent_indices)
+            }
+            rank_sample_ids = [meta.sample_ids[index] for index in parent_indices]
+            rank_seqlens = [logical_seq_lens[index] for index in parent_indices]
+            rank_extra[TREE_ATTENTION_LAYOUTS] = [
+                tree_layouts[index] for index in parent_indices
+            ]
+            rank_extra[TREE_ATTENTION_FRAGMENT_SELECTIONS] = [
+                (parent_to_local[parent], fragment)
+                for parent, fragment in selected_global
+            ]
+            rank_tags = (
+                [meta.tags[index] for index in parent_indices]
                 if meta.tags is not None
                 else None
             )

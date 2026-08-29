@@ -25,7 +25,6 @@ import torch
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
-
 PACKED_ATTENTION_SEGMENT_LENGTHS = "packed_attention_segment_lengths"
 PACKED_ATTENTION_SELECTED_SEGMENTS = "packed_attention_selected_segments"
 TREE_ATTENTION_LAYOUTS = "tree_attention_layouts"
@@ -33,6 +32,7 @@ TREE_ATTENTION_UNIQUE_MESSAGE_LOGS = "tree_attention_unique_message_logs"
 TREE_ATTENTION_EDGE_SOURCE_INDICES = "tree_attention_edge_source_indices"
 TREE_ATTENTION_EDGE_TARGET_IDS = "tree_attention_edge_target_ids"
 TREE_ATTENTION_EDGE_LENGTHS = "tree_attention_edge_lengths"
+TREE_ATTENTION_FRAGMENT_SELECTIONS = "tree_attention_fragment_selections"
 
 # Tree model inputs are aligned to unique physical nodes, while policy-loss
 # fields retain the original sampled-edge stream. Shifted fields include the
@@ -140,6 +140,188 @@ class TreeAttentionLayout:
             raise ValueError(
                 "tree attention sampled-edge sources must reference unique tokens"
             )
+
+
+@dataclass(frozen=True)
+class TreeAttentionFragment:
+    """One bounded, ancestor-closed physical view of a logical tree row."""
+
+    layout: TreeAttentionLayout
+    node_indices: tuple[int, ...]
+    edge_indices: tuple[int, ...]
+    is_padding: bool = False
+
+
+@dataclass(frozen=True)
+class TreeAttentionFragmentBatchLayout:
+    """How virtual fragment rows map back to logical sampled-edge rows."""
+
+    fragments: tuple[TreeAttentionFragment, ...]
+    parent_indices: tuple[int, ...]
+    original_batch_size: int
+    original_edge_lengths: tuple[int, ...]
+
+
+def plan_tree_attention_fragments(
+    layout: TreeAttentionLayout,
+    *,
+    max_physical_tokens: int,
+) -> tuple[TreeAttentionFragment, ...]:
+    """Partition a tree into bounded ancestor-closed root-to-leaf unions.
+
+    The initial fragments are complete root-to-leaf paths. Compatible paths
+    are greedily merged by greatest shared-token saving. Context nodes may be
+    duplicated between fragments, but every sampled edge is owned exactly once.
+    """
+    layout.validate()
+    if max_physical_tokens <= 0:
+        raise ValueError("tree fragment token budget must be positive")
+    if layout.max_path_length > max_physical_tokens:
+        raise ValueError(
+            "tree logical path exceeds the physical fragment budget: "
+            f"{layout.max_path_length} > {max_physical_tokens}"
+        )
+
+    segment_count = len(layout.segment_lengths)
+    segment_sets: list[frozenset[int]] = []
+    if layout.unique_token_count <= max_physical_tokens:
+        segment_sets.append(frozenset(range(segment_count)))
+    else:
+        children: list[list[int]] = [[] for _ in range(segment_count)]
+        for segment, parent in enumerate(layout.segment_parents):
+            if parent >= 0:
+                children[parent].append(segment)
+
+        for leaf, leaf_children in enumerate(children):
+            if leaf_children:
+                continue
+            path: list[int] = []
+            segment = leaf
+            while segment >= 0:
+                path.append(segment)
+                segment = layout.segment_parents[segment]
+            segment_sets.append(frozenset(path))
+
+        def token_count(segments: frozenset[int]) -> int:
+            return sum(layout.segment_lengths[index] for index in segments)
+
+        while True:
+            best: tuple[tuple[int, int, int, int], int, int, frozenset[int]] | None = (
+                None
+            )
+            for left, left_segments in enumerate(segment_sets):
+                for right, right_segments in enumerate(segment_sets):
+                    if right <= left:
+                        continue
+                    union = left_segments | right_segments
+                    union_tokens = token_count(union)
+                    if union_tokens > max_physical_tokens:
+                        continue
+                    saved_tokens = (
+                        token_count(left_segments)
+                        + token_count(right_segments)
+                        - union_tokens
+                    )
+                    key = (
+                        saved_tokens,
+                        union_tokens,
+                        -min(left_segments),
+                        -min(right_segments),
+                    )
+                    if best is None or key > best[0]:
+                        best = (key, left, right, union)
+            if best is None:
+                break
+            _, left, right, union = best
+            segment_sets = [
+                segments
+                for index, segments in enumerate(segment_sets)
+                if index not in (left, right)
+            ]
+            segment_sets.append(union)
+
+        segment_sets.sort(key=lambda segments: tuple(sorted(segments)))
+
+    segment_starts: list[int] = []
+    offset = 0
+    node_to_segment: list[int] = []
+    for segment, length in enumerate(layout.segment_lengths):
+        segment_starts.append(offset)
+        node_to_segment.extend([segment] * length)
+        offset += length
+
+    edge_owners: list[list[int]] = [[] for _ in segment_sets]
+    for edge, source in enumerate(layout.edge_source_indices):
+        source_segment = node_to_segment[source]
+        owner = next(
+            (
+                fragment_index
+                for fragment_index, segments in enumerate(segment_sets)
+                if source_segment in segments
+            ),
+            None,
+        )
+        if owner is None:
+            raise RuntimeError("tree fragment plan did not cover a sampled edge source")
+        edge_owners[owner].append(edge)
+
+    fragments: list[TreeAttentionFragment] = []
+    for segments, owned_edges in zip(segment_sets, edge_owners, strict=True):
+        ordered_segments = sorted(segments)
+        segment_mapping = {
+            old_segment: new_segment
+            for new_segment, old_segment in enumerate(ordered_segments)
+        }
+        node_indices = tuple(
+            node
+            for segment in ordered_segments
+            for node in range(
+                segment_starts[segment],
+                segment_starts[segment] + layout.segment_lengths[segment],
+            )
+        )
+        node_mapping = {
+            old_node: new_node for new_node, old_node in enumerate(node_indices)
+        }
+        fragment_layout = TreeAttentionLayout(
+            segment_lengths=tuple(
+                layout.segment_lengths[segment] for segment in ordered_segments
+            ),
+            segment_parents=tuple(
+                -1
+                if layout.segment_parents[segment] < 0
+                else segment_mapping[layout.segment_parents[segment]]
+                for segment in ordered_segments
+            ),
+            segment_depths=tuple(
+                layout.segment_depths[segment] for segment in ordered_segments
+            ),
+            edge_source_indices=tuple(
+                node_mapping[layout.edge_source_indices[edge]] for edge in owned_edges
+            ),
+            original_token_count=len(node_indices),
+        )
+        fragment_layout.validate()
+        if fragment_layout.unique_token_count > max_physical_tokens:
+            raise RuntimeError(
+                "tree fragment planner exceeded its physical token budget"
+            )
+        fragments.append(
+            TreeAttentionFragment(
+                layout=fragment_layout,
+                node_indices=node_indices,
+                edge_indices=tuple(owned_edges),
+            )
+        )
+
+    covered_edges = sorted(
+        edge for fragment in fragments for edge in fragment.edge_indices
+    )
+    if covered_edges != list(range(len(layout.edge_source_indices))):
+        raise RuntimeError(
+            "tree fragment plan did not own every sampled edge exactly once"
+        )
+    return tuple(fragments)
 
 
 def validate_packed_attention_segment_lengths(
@@ -400,4 +582,239 @@ def reassemble_packed_attention_segments(
             "packed segment result count does not match metadata: "
             f"results={segments.shape[0]}, metadata={segment_index}"
         )
+    return output
+
+
+def materialize_tree_attention_fragments(
+    data: BatchedDataDict[Any],
+    *,
+    fragments: Sequence[TreeAttentionFragment],
+    parent_indices: Sequence[int],
+) -> BatchedDataDict[Any]:
+    """Gather bounded physical-node rows and their uniquely owned loss edges."""
+    if len(fragments) != len(parent_indices):
+        raise ValueError("tree fragments and parent indices must align")
+    if not fragments:
+        raise ValueError("tree fragment materialization requires at least one fragment")
+    if "input_ids" not in data or "input_lengths" not in data:
+        raise ValueError("tree fragment materialization requires model inputs")
+
+    input_ids = data["input_ids"]
+    if not torch.is_tensor(input_ids) or input_ids.ndim < 2:
+        raise ValueError("tree fragment input_ids must have shape [batch, sequence]")
+    batch_size = int(input_ids.shape[0])
+
+    fragment_batches: list[BatchedDataDict[Any]] = []
+    for fragment, parent in zip(fragments, parent_indices, strict=True):
+        if not 0 <= parent < batch_size:
+            raise ValueError(f"tree fragment parent row {parent} is out of range")
+        node_index = torch.tensor(
+            fragment.node_indices, dtype=torch.long, device=input_ids.device
+        )
+        edge_index = torch.tensor(
+            fragment.edge_indices, dtype=torch.long, device=input_ids.device
+        )
+        shifted_edge_index = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.long, device=input_ids.device),
+                edge_index + 1,
+            ]
+        )
+        one = BatchedDataDict[Any]()
+        for key, value in data.items():
+            if key == TREE_ATTENTION_LAYOUTS:
+                continue
+            if isinstance(value, PackedTensor):
+                raise NotImplementedError(
+                    "tree fragmentation does not yet support multimodal data"
+                )
+            if torch.is_tensor(value):
+                if key == "input_lengths":
+                    one[key] = torch.tensor(
+                        [fragment.layout.unique_token_count],
+                        dtype=value.dtype,
+                        device=value.device,
+                    )
+                elif key == TREE_ATTENTION_EDGE_LENGTHS:
+                    one[key] = torch.tensor(
+                        [len(fragment.edge_indices)],
+                        dtype=value.dtype,
+                        device=value.device,
+                    )
+                elif key in TREE_EDGE_SHIFTED_FIELDS:
+                    row = value[parent]
+                    one[key] = row.index_select(
+                        0, shifted_edge_index.to(row.device)
+                    ).unsqueeze(0)
+                elif key == TREE_ATTENTION_EDGE_SOURCE_INDICES:
+                    one[key] = torch.tensor(
+                        [fragment.layout.edge_source_indices],
+                        dtype=value.dtype,
+                        device=value.device,
+                    )
+                elif key in TREE_EDGE_UNSHIFTED_FIELDS:
+                    row = value[parent]
+                    one[key] = row.index_select(0, edge_index.to(row.device)).unsqueeze(
+                        0
+                    )
+                elif key == "sample_mask" and fragment.is_padding:
+                    one[key] = torch.zeros_like(value[parent : parent + 1])
+                elif value.is_nested:
+                    row = value[parent]
+                    one[key] = row.index_select(0, node_index.to(row.device)).unsqueeze(
+                        0
+                    )
+                elif (
+                    value.ndim > 1
+                    and not input_ids.is_nested
+                    and value.shape[1] == input_ids.shape[1]
+                ):
+                    row = value[parent]
+                    one[key] = row.index_select(0, node_index.to(row.device)).unsqueeze(
+                        0
+                    )
+                else:
+                    one[key] = value[parent : parent + 1]
+            else:
+                one[key] = [value[parent]]
+        one[TREE_ATTENTION_LAYOUTS] = [fragment.layout]
+        fragment_batches.append(one)
+
+    return BatchedDataDict[Any].from_batches(
+        fragment_batches,
+        pad_value_dict={TREE_ATTENTION_EDGE_SOURCE_INDICES: -1},
+    )
+
+
+def expand_batched_data_for_tree_attention(
+    data: BatchedDataDict[Any],
+    *,
+    max_physical_tokens: int,
+    fragment_count_multiple: int = 1,
+) -> tuple[BatchedDataDict[Any], TreeAttentionFragmentBatchLayout | None]:
+    """Expand oversized logical tree rows into bounded virtual fragment rows."""
+    if TREE_ATTENTION_LAYOUTS not in data:
+        return data, None
+    layouts = data[TREE_ATTENTION_LAYOUTS]
+    if len(layouts) != data.size:
+        raise ValueError("tree layouts must align with the input batch")
+    if all(layout.unique_token_count <= max_physical_tokens for layout in layouts):
+        for layout in layouts:
+            layout.validate()
+            if layout.max_path_length > max_physical_tokens:
+                raise ValueError(
+                    "tree logical path exceeds the physical fragment budget: "
+                    f"{layout.max_path_length} > {max_physical_tokens}"
+                )
+        return data, None
+
+    fragments: list[TreeAttentionFragment] = []
+    parent_indices: list[int] = []
+    original_edge_lengths: list[int] = []
+    for parent, layout in enumerate(layouts):
+        row_fragments = plan_tree_attention_fragments(
+            layout, max_physical_tokens=max_physical_tokens
+        )
+        fragments.extend(row_fragments)
+        parent_indices.extend([parent] * len(row_fragments))
+        original_edge_lengths.append(len(layout.edge_source_indices))
+
+    fragments, parent_indices = pad_tree_attention_fragments(
+        fragments,
+        parent_indices,
+        count_multiple=fragment_count_multiple,
+    )
+
+    expanded = materialize_tree_attention_fragments(
+        data,
+        fragments=fragments,
+        parent_indices=parent_indices,
+    )
+    return expanded, TreeAttentionFragmentBatchLayout(
+        fragments=tuple(fragments),
+        parent_indices=tuple(parent_indices),
+        original_batch_size=data.size,
+        original_edge_lengths=tuple(original_edge_lengths),
+    )
+
+
+def pad_tree_attention_fragments(
+    fragments: Sequence[TreeAttentionFragment],
+    parent_indices: Sequence[int],
+    *,
+    count_multiple: int,
+) -> tuple[list[TreeAttentionFragment], list[int]]:
+    """Append shortest-path, zero-edge rows so DP packing can balance bins."""
+    if len(fragments) != len(parent_indices):
+        raise ValueError("tree fragments and parent indices must align")
+    if count_multiple <= 0:
+        raise ValueError("tree fragment count multiple must be positive")
+    out_fragments = list(fragments)
+    out_parents = list(parent_indices)
+    padding_count = (-len(out_fragments)) % count_multiple
+    if not padding_count:
+        return out_fragments, out_parents
+    if not out_fragments:
+        raise ValueError("cannot pad an empty tree fragment batch")
+
+    source_index = min(
+        range(len(out_fragments)),
+        key=lambda index: out_fragments[index].layout.unique_token_count,
+    )
+    source = out_fragments[source_index]
+    padding_layout = TreeAttentionLayout(
+        segment_lengths=source.layout.segment_lengths,
+        segment_parents=source.layout.segment_parents,
+        segment_depths=source.layout.segment_depths,
+        edge_source_indices=(),
+        original_token_count=source.layout.original_token_count,
+    )
+    padding_fragment = TreeAttentionFragment(
+        layout=padding_layout,
+        node_indices=source.node_indices,
+        edge_indices=(),
+        is_padding=True,
+    )
+    out_fragments.extend([padding_fragment] * padding_count)
+    out_parents.extend([out_parents[source_index]] * padding_count)
+    return out_fragments, out_parents
+
+
+def reassemble_tree_attention_edge_values(
+    fragment_values: torch.Tensor,
+    layout: TreeAttentionFragmentBatchLayout,
+) -> torch.Tensor:
+    """Scatter fragment edge values back into their original logical rows."""
+    if int(fragment_values.shape[0]) != len(layout.fragments):
+        raise ValueError(
+            "tree fragment result count does not match its reassembly layout"
+        )
+    output_width = max(layout.original_edge_lengths, default=0) + 1
+    output = fragment_values.new_zeros(
+        (layout.original_batch_size, output_width, *fragment_values.shape[2:])
+    )
+    seen = [set() for _ in range(layout.original_batch_size)]
+    for fragment_row, (fragment, parent) in enumerate(
+        zip(layout.fragments, layout.parent_indices, strict=True)
+    ):
+        edge_count = len(fragment.edge_indices)
+        if edge_count:
+            target_index = torch.tensor(
+                [edge + 1 for edge in fragment.edge_indices],
+                dtype=torch.long,
+                device=output.device,
+            )
+            output[parent].index_copy_(
+                0,
+                target_index,
+                fragment_values[fragment_row, 1 : edge_count + 1],
+            )
+        for edge in fragment.edge_indices:
+            if edge in seen[parent]:
+                raise RuntimeError("tree fragment edge result was produced twice")
+            seen[parent].add(edge)
+
+    for parent, edge_length in enumerate(layout.original_edge_lengths):
+        if seen[parent] != set(range(edge_length)):
+            raise RuntimeError("tree fragment edge results did not cover a logical row")
     return output
