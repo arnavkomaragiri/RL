@@ -1613,6 +1613,7 @@ class MegatronPolicyWorkerImpl(
             if moe_metrics:
                 metrics["moe_metrics"] = moe_metrics
 
+        self._release_preserved_grad_host_buffers()
         self._train_step_state = None
         return metrics
 
@@ -1630,7 +1631,16 @@ class MegatronPolicyWorkerImpl(
             reset_model_temporary_tensors(model_config, [self.model])
         self.model.zero_grad_buffer()
         self.optimizer.zero_grad()
+        self._release_preserved_grad_host_buffers()
         self._train_step_state = None
+
+    def _release_preserved_grad_host_buffers(self) -> None:
+        """Release split-step host gradients once the step is closed."""
+        if not isinstance(self.model, DistributedDataParallel):
+            return
+        for buffers in [self.model.buffers, self.model.expert_parallel_buffers]:
+            for buffer in buffers:
+                buffer.release_grad_data_cpu()
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs")
     def get_logprobs(
@@ -2748,10 +2758,17 @@ class MegatronPolicyWorkerImpl(
         self.model = self.move_model(self.model, "cuda", move_grads=False)
         self.model.eval()
 
-        # offload grads to cpu
+        # A split train step may span several TQ batches. Preserve accumulated
+        # gradients when logprob inference runs between those batches; ordinary
+        # between-step inference keeps the cheaper discard-and-zero behavior.
+        preserve_grads = self._train_step_state is not None
         self.model = self.move_model(
-            self.model, "cpu", move_params=False, move_grads=True
-        )  # get rid of grad buffers
+            self.model,
+            "cpu",
+            move_params=False,
+            move_grads=True,
+            preserve_grads=preserve_grads,
+        )
 
         # offload optimizer to cpu
         torch.randn(1).cuda()  # wake up torch allocator
@@ -2945,6 +2962,7 @@ class MegatronPolicyWorkerImpl(
         device: str,
         move_params: bool = True,
         move_grads: bool = True,
+        preserve_grads: bool = False,
     ) -> torch.nn.Module:
         # move all param and grad buffers to the device
         if isinstance(model, DistributedDataParallel):
@@ -2953,7 +2971,9 @@ class MegatronPolicyWorkerImpl(
                 for buffer_idx in range(len(buffers)):
                     if device == "cpu":
                         buffers[buffer_idx].offload_to_cpu(
-                            move_params=move_params, move_grads=move_grads
+                            move_params=move_params,
+                            move_grads=move_grads,
+                            preserve_grad_data=preserve_grads,
                         )
                     elif device == "cuda":
                         buffers[buffer_idx].reload_from_cpu(
@@ -2964,6 +2984,11 @@ class MegatronPolicyWorkerImpl(
                             f"Invalid device: {device}. Only strings 'cpu' and 'cuda' are supported."
                         )
         elif isinstance(model, custom_FSDP):
+            if preserve_grads:
+                raise NotImplementedError(
+                    "preserving an open split-step gradient buffer across "
+                    "inference is not implemented for Megatron FSDP"
+                )
             if device == "cpu":
                 model.param_and_grad_buffer.offload_to_cpu(move_params, move_grads)
             elif device == "cuda":
@@ -3022,6 +3047,12 @@ class MegatronPolicyWorkerImpl(
             weights_path: The specific directory path where the checkpoint will be saved.
             optimizer_path: If not None, optimizer and scheduler states are saved if they exist.
         """
+        if self._train_step_state is not None:
+            raise RuntimeError(
+                "cannot save a checkpoint while a split train step is open; "
+                "finish or abort the step first"
+            )
+
         if not torch.distributed.is_initialized():
             raise RuntimeError(
                 "Distributed process group is not initialized. Cannot save checkpoint."
