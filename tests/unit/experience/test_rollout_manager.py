@@ -94,7 +94,10 @@ class _FakeBuffer:
         weight_version: int,
         target_step: int | None = None,
         group_id: str | None = None,
+        source_batch_index: int | None = None,
+        source_prompt_index: int | None = None,
     ) -> str:
+        del target_step, source_batch_index, source_prompt_index
         if group_id is None:
             group_id = str(uuid.uuid4())
         self.reserve_calls.append(weight_version)
@@ -428,6 +431,30 @@ def _successful_nemo_gym_result(rowidx: int) -> dict:
     }
 
 
+def _successful_nemo_gym_result_with_exact_calls(rowidx: int) -> dict:
+    prompt_routes = torch.arange(8, dtype=torch.int16).view(2, 2, 2)
+    generation_routes = torch.arange(8, 16, dtype=torch.int16).view(2, 2, 2)
+    call = [
+        {
+            "role": "user",
+            "token_ids": [1, 2],
+            "routed_experts": prompt_routes,
+        },
+        {
+            "role": "assistant",
+            "token_ids": [rowidx + 3, rowidx + 4],
+            "generation_logprobs": [0.0, 0.0],
+            "routed_experts": generation_routes,
+        },
+    ]
+    return {
+        "input_message_log": [call[0]],
+        "message_log": call,
+        "training_message_logs": [call],
+        "full_result": {"reward": float(rowidx)},
+    }
+
+
 def _nemo_gym_retry_inputs() -> list[dict]:
     return [{"_rowidx": rowidx, "agent_ref": {"name": "agent"}} for rowidx in range(2)]
 
@@ -506,6 +533,89 @@ def test_nemo_gym_prompt_manager_reports_exhausted_row_retry(monkeypatch):
         )
 
     assert run_rollouts.row_indices_by_call == [[0], [0]]
+
+
+def test_nemo_gym_result_is_compacted_before_group_completion() -> None:
+    first_result = _successful_nemo_gym_result_with_exact_calls(0)
+    second_result = _successful_nemo_gym_result_with_exact_calls(1)
+    release_second = asyncio.Event()
+    first_compacted = asyncio.Event()
+
+    class _BlockingResultStream:
+        def __init__(self):
+            self._index = 0
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._index == 0:
+                self._index += 1
+                return _ReadyResultRef((0, first_result, None))
+            if self._index == 1:
+                self._index += 1
+                await release_second.wait()
+                return _ReadyResultRef((1, second_result, None))
+            raise StopAsyncIteration
+
+    class _BlockingRunRollouts:
+        def options(self, *, num_returns):
+            assert num_returns == "streaming"
+            return self
+
+        def remote(self, rows, tokenizer, timer_prefix):
+            del rows, tokenizer, timer_prefix
+            return _BlockingResultStream()
+
+    impl = _nemo_gym_impl(
+        True,
+        num_generations=2,
+        task_to_env={"nemo_gym": SimpleNamespace(run_rollouts=_BlockingRunRollouts())},
+    )
+    original_convert = impl._result_to_completion
+
+    def convert_and_signal(result):
+        completion = original_convert(result)
+        first_compacted.set()
+        return completion
+
+    impl._result_to_completion = convert_and_signal  # type: ignore[method-assign]
+
+    async def run_test():
+        task = asyncio.create_task(
+            impl._run_rollouts(_nemo_gym_retry_inputs(), Timer(), "timing/rollout")
+        )
+        await asyncio.wait_for(first_compacted.wait(), timeout=1)
+        assert not task.done()
+        assert "training_message_logs" not in first_result
+        release_second.set()
+        completions, _, _ = await task
+        return completions
+
+    completions = asyncio.run(run_test())
+    assert all(completion.exact_call_tree is not None for completion in completions)
+
+
+def test_compacted_nemo_gym_result_owns_route_storage() -> None:
+    result = _successful_nemo_gym_result_with_exact_calls(0)
+    raw_route_pointers = {
+        message["routed_experts"].untyped_storage().data_ptr()
+        for call in result["training_message_logs"]
+        for message in call
+    }
+
+    completion = _nemo_gym_impl(True)._result_to_completion(result)
+
+    assert completion.training_message_logs is None
+    assert completion.exact_call_tree is not None
+    assert all("routed_experts" not in message for message in completion.message_log)
+    compact_route_pointers = {
+        message["routed_experts"].untyped_storage().data_ptr()
+        for message in completion.exact_call_tree.unique_message_log
+        if "routed_experts" in message
+    }
+    assert compact_route_pointers
+    assert compact_route_pointers.isdisjoint(raw_route_pointers)
 
 
 def _mask_gate_result():

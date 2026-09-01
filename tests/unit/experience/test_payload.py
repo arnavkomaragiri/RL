@@ -24,6 +24,7 @@ from nemo_rl.data.packed_rollouts import (
 )
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
+from nemo_rl.algorithms.grpo import _compact_exact_nemo_gym_call_sequences
 
 
 def _routes(start: int, count: int) -> torch.Tensor:
@@ -275,3 +276,52 @@ def test_record_to_train_batch_builds_tree_nodes_and_sampled_edges() -> None:
     assert [
         row.shape[0] for row in fields[TREE_ATTENTION_EDGE_SOURCE_INDICES].unbind()
     ] == [4]
+
+
+def test_record_to_train_batch_accepts_precompacted_exact_calls() -> None:
+    call_1 = [
+        {"role": "user", "content": "p", "token_ids": torch.tensor([10, 11])},
+        {
+            "role": "assistant",
+            "content": "a1",
+            "token_ids": torch.tensor([20, 21]),
+            "generation_logprobs": torch.tensor([-0.1, -0.2]),
+            "routed_experts": _routes(10, 2),
+        },
+    ]
+    call_2 = [
+        {
+            "role": "user",
+            "content": "p+a1+tool",
+            "token_ids": torch.tensor([30, 31, 32]),
+            "routed_experts": _routes(20, 3),
+        },
+        {
+            "role": "assistant",
+            "content": "a2",
+            "token_ids": torch.tensor([40, 41]),
+            "generation_logprobs": torch.tensor([-0.3, -0.4]),
+            "routed_experts": _routes(30, 2),
+        },
+    ]
+    tree = _compact_exact_nemo_gym_call_sequences(
+        [call_1, call_2],
+        materialize_storage=True,
+    )
+    completion = Completion(
+        message_log=call_2,
+        env_extras=None,
+        truncated=False,
+        reward=1.0,
+        exact_call_tree=tree,
+    )
+
+    train_batch = record_to_train_batch(
+        _record([completion]),
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+    )
+
+    assert train_batch[TREE_ATTENTION_LAYOUTS] == [tree.layout]
+    assert train_batch["input_lengths"].tolist() == [tree.layout.unique_token_count]
+    assert train_batch[TREE_ATTENTION_EDGE_LENGTHS].tolist() == [4]
+    assert int(train_batch["token_mask"].sum().item()) == 4

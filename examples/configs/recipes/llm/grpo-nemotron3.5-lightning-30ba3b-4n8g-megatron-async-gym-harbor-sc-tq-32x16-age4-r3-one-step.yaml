@@ -2,6 +2,10 @@
 # future rollout batches while preserving chronological training dispatch.
 defaults: ./grpo-nemotron3.5-lightning-30ba3b-4n8g-megatron-async-gym-harbor-stress-32x16-age4-r3-one-step.yaml
 
+data:
+  # Forking after replay-buffer restore pins the controller's large CPU heap.
+  num_workers: 0
+
 data_plane:
   enabled: true
   impl: transfer_queue

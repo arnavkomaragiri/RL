@@ -58,6 +58,7 @@ def record_to_train_batch(
     # Lazy imports: grpo and llm_message_utils transitively pull
     # experience.rollouts, so importing at module top risks a cycle.
     from nemo_rl.algorithms.grpo import (
+        _apply_exact_nemo_gym_call_trees,
         _flatten_tree_model_inputs,
         _use_exact_nemo_gym_call_sequences,
         add_grpo_token_loss_masks_and_generation_logprobs,
@@ -73,7 +74,22 @@ def record_to_train_batch(
     original_message_logs = [c.message_log for c in completions]
     rollout_batch = BatchedDataDict[Any]({"message_log": original_message_logs})
     exact_call_logs = [c.training_message_logs for c in completions]
-    if any(call_logs is not None for call_logs in exact_call_logs):
+    exact_call_trees = [c.exact_call_tree for c in completions]
+    if any(tree is not None for tree in exact_call_trees):
+        if any(tree is None for tree in exact_call_trees):
+            raise ValueError(
+                "precompacted exact-call metadata must be present for every "
+                "completion in a prompt group"
+            )
+        if any(call_logs is not None for call_logs in exact_call_logs):
+            raise ValueError(
+                "a completion cannot carry both raw and precompacted exact-call metadata"
+            )
+        _apply_exact_nemo_gym_call_trees(
+            rollout_batch,
+            [tree for tree in exact_call_trees if tree is not None],
+        )
+    elif any(call_logs is not None for call_logs in exact_call_logs):
         if any(call_logs is None for call_logs in exact_call_logs):
             raise ValueError(
                 "exact NeMo-Gym call metadata must be present for every completion "

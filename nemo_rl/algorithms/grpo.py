@@ -97,6 +97,8 @@ from nemo_rl.distributed.virtual_cluster import (
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
 from nemo_rl.experience.interfaces import (
+    ExactCallTreeDiagnostics,
+    ExactCallTreePayload,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
@@ -3147,43 +3149,84 @@ def _use_exact_nemo_gym_call_sequences(repeated_batch: BatchedDataDict) -> None:
     if training_message_logs is None:
         return
 
-    edge_message_logs = []
-    unique_message_logs = []
-    tree_layouts = []
-    input_call_count = 0
-    input_token_count = 0
-    page_fork_count = 0
-    page_shared_token_count = 0
-    cross_replica_rollouts = 0
-    max_replicas_per_rollout = 0
-    baseline_attention_pairs = 0
-    for rollout_calls in training_message_logs:
-        if not rollout_calls:
-            raise ValueError("NeMo-Gym produced no exact training calls for a rollout")
-        input_call_count += len(rollout_calls)
-        input_token_count += sum(
-            len(cast(torch.Tensor, message["token_ids"]))
-            for call in rollout_calls
-            for message in call
+    trees = [
+        _compact_exact_nemo_gym_call_sequences(
+            rollout_calls,
+            materialize_storage=False,
         )
-        flattened_calls = [
-            _flatten_exact_call(call, call_index)
-            for call_index, call in enumerate(rollout_calls)
-        ]
-        baseline_attention_pairs += sum(
-            call.length * (call.length + 1) // 2 for call in flattened_calls
-        )
-        page_forks, page_shared_tokens, replicas = _exact_call_trie_diagnostics(
-            flattened_calls
-        )
-        page_fork_count += page_forks
-        page_shared_token_count += page_shared_tokens
-        cross_replica_rollouts += int(len(replicas) > 1)
-        max_replicas_per_rollout = max(max_replicas_per_rollout, len(replicas))
-        tree = _build_exact_call_tree(rollout_calls)
-        edge_message_logs.append(tree.edge_message_log)
-        unique_message_logs.append(tree.unique_message_log)
-        tree_layouts.append(tree.layout)
+        for rollout_calls in training_message_logs
+    ]
+    _apply_exact_nemo_gym_call_trees(repeated_batch, trees)
+
+
+def _clone_message_log_tensors(
+    message_log: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Copy tensor leaves so compact messages do not pin raw-call storages."""
+    return [
+        {
+            key: value.clone() if isinstance(value, torch.Tensor) else value
+            for key, value in message.items()
+        }
+        for message in message_log
+    ]
+
+
+def _compact_exact_nemo_gym_call_sequences(
+    rollout_calls: list[list[dict[str, Any]]],
+    *,
+    materialize_storage: bool,
+) -> ExactCallTreePayload:
+    """Compact one rollout independently of its prompt-group siblings."""
+    if not rollout_calls:
+        raise ValueError("NeMo-Gym produced no exact training calls for a rollout")
+
+    flattened_calls = [
+        _flatten_exact_call(call, call_index)
+        for call_index, call in enumerate(rollout_calls)
+    ]
+    input_token_count = sum(call.length for call in flattened_calls)
+    baseline_attention_pairs = sum(
+        call.length * (call.length + 1) // 2 for call in flattened_calls
+    )
+    page_forks, page_shared_tokens, replicas = _exact_call_trie_diagnostics(
+        flattened_calls
+    )
+    tree = _build_exact_call_tree(rollout_calls)
+    edge_message_log = tree.edge_message_log
+    unique_message_log = tree.unique_message_log
+    if materialize_storage:
+        edge_message_log = _clone_message_log_tensors(edge_message_log)
+        unique_message_log = _clone_message_log_tensors(unique_message_log)
+
+    return ExactCallTreePayload(
+        edge_message_log=edge_message_log,
+        unique_message_log=unique_message_log,
+        layout=tree.layout,
+        diagnostics=ExactCallTreeDiagnostics(
+            input_call_count=len(rollout_calls),
+            input_token_count=input_token_count,
+            page_fork_count=page_forks,
+            page_shared_token_count=page_shared_tokens,
+            cross_replica_rollout=int(len(replicas) > 1),
+            replica_count=len(replicas),
+            baseline_attention_pairs=baseline_attention_pairs,
+        ),
+    )
+
+
+def _apply_exact_nemo_gym_call_trees(
+    repeated_batch: BatchedDataDict,
+    trees: list[ExactCallTreePayload],
+) -> None:
+    """Install precompacted rollout trees and emit aggregate diagnostics."""
+    if not trees:
+        raise ValueError("NeMo-Gym produced no exact-call trees")
+
+    edge_message_logs = [tree.edge_message_log for tree in trees]
+    unique_message_logs = [tree.unique_message_log for tree in trees]
+    tree_layouts = [tree.layout for tree in trees]
+    diagnostics = [tree.diagnostics for tree in trees]
 
     repeated_batch["message_log"] = edge_message_logs
     repeated_batch[TREE_ATTENTION_UNIQUE_MESSAGE_LOGS] = unique_message_logs
@@ -3192,6 +3235,11 @@ def _use_exact_nemo_gym_call_sequences(repeated_batch: BatchedDataDict) -> None:
     output_segment_count = sum(len(layout.segment_lengths) for layout in tree_layouts)
     output_token_count = sum(layout.unique_token_count for layout in tree_layouts)
     tree_attention_pairs = sum(layout.valid_attention_pairs for layout in tree_layouts)
+    input_call_count = sum(item.input_call_count for item in diagnostics)
+    input_token_count = sum(item.input_token_count for item in diagnostics)
+    baseline_attention_pairs = sum(
+        item.baseline_attention_pairs for item in diagnostics
+    )
     print(
         "NeMo-Gym exact-call trie: "
         f"calls={input_call_count}, segments={output_segment_count}, "
@@ -3199,10 +3247,13 @@ def _use_exact_nemo_gym_call_sequences(repeated_batch: BatchedDataDict) -> None:
         f"token_reduction={1 - output_token_count / input_token_count:.4f}, "
         f"attention_pair_reduction="
         f"{1 - tree_attention_pairs / baseline_attention_pairs:.4f}, "
-        f"page_forks={page_fork_count}, "
-        f"page_shared_tokens={page_shared_token_count}, "
-        f"cross_replica_rollouts={cross_replica_rollouts}, "
-        f"max_replicas_per_rollout={max_replicas_per_rollout}",
+        f"page_forks={sum(item.page_fork_count for item in diagnostics)}, "
+        f"page_shared_tokens="
+        f"{sum(item.page_shared_token_count for item in diagnostics)}, "
+        f"cross_replica_rollouts="
+        f"{sum(item.cross_replica_rollout for item in diagnostics)}, "
+        f"max_replicas_per_rollout="
+        f"{max(item.replica_count for item in diagnostics)}",
         flush=True,
     )
 

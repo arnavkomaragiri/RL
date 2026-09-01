@@ -539,7 +539,8 @@ class AsyncNemoGymRolloutImpl:
         # structured Gym failure is retried row-by-row; successful siblings are
         # retained so one fresh sandbox does not invalidate the whole group.
         with timer.time(f"{timer_prefix}/run_rollouts"):
-            results: list[dict[str, Any] | None] = [None for _ in inputs]
+            results: list[Completion | None] = [None for _ in inputs]
+            prompt_message_log: LLMMessageLogType | None = None
             retries_by_row = [0 for _ in inputs]
             retries_launched = 0
             retries_exhausted: dict[int, str] = {}
@@ -583,6 +584,7 @@ class AsyncNemoGymRolloutImpl:
                         num_returns="streaming"
                     ).remote(attempt_inputs, self._tokenizer, timer_prefix):
                         rowidx, result, timing_metrics = await result_ref
+                        del result_ref
                         if not isinstance(rowidx, int) or rowidx not in row_indices:
                             raise ValueError(
                                 f"NeMo-Gym returned invalid row index {rowidx!r}; "
@@ -605,6 +607,7 @@ class AsyncNemoGymRolloutImpl:
                                 (rowidx, result, timing_metrics),
                             )
                         )
+                        del result
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:  # noqa: BLE001 - missing rows are retried
@@ -679,7 +682,11 @@ class AsyncNemoGymRolloutImpl:
                             f"{result.failure_class}: {result.error or '<no error>'}",
                         )
                     else:
-                        results[rowidx] = result
+                        if prompt_message_log is None:
+                            prompt_message_log = result["input_message_log"]
+                            _tensorize_by_key(prompt_message_log, "token_ids")
+                        results[rowidx] = self._result_to_completion(result)
+                        del result, payload
             finally:
                 for task in attempt_tasks:
                     task.cancel()
@@ -695,21 +702,16 @@ class AsyncNemoGymRolloutImpl:
                     f"NeMo-Gym prompt group exhausted fresh-sandbox retries; {failures}"
                 )
 
-            completed_results: list[dict[str, Any]] = []
-            for rowidx, result in enumerate(results):
-                if result is None:
+            completions: list[Completion] = []
+            for rowidx, completion in enumerate(results):
+                if completion is None:
                     raise RuntimeError(
                         "NeMo-Gym rollout stream ended without a terminal result "
                         f"for rowidx={rowidx}"
                     )
-                completed_results.append(result)
-            # All N rollouts share the same input prompt; tensorize one copy.
-            prompt_message_log = completed_results[0]["input_message_log"]
-            _tensorize_by_key(prompt_message_log, "token_ids")
-            # Convert results to completions.
-            completions = [
-                self._result_to_completion(result) for result in completed_results
-            ]
+                completions.append(completion)
+            if prompt_message_log is None:
+                raise RuntimeError("NeMo-Gym rollout stream produced no prompt")
 
         # Compute rollout metrics.
         with timer.time(f"{timer_prefix}/compute_metrics"):
@@ -732,12 +734,30 @@ class AsyncNemoGymRolloutImpl:
             [m for m in result["message_log"] if m["role"] == "assistant"],
             "generation_logprobs",
         )
-        for message_log in result.get("training_message_logs", []):
+        training_message_logs = result.pop("training_message_logs", None)
+        for message_log in training_message_logs or []:
             _tensorize_by_key(message_log, "token_ids")
             _tensorize_by_key(
                 [m for m in message_log if m["role"] == "assistant"],
                 "generation_logprobs",
             )
+
+        exact_call_tree = None
+        if training_message_logs:
+            # Lazy import avoids the rollout_manager <-> grpo module cycle.
+            from nemo_rl.algorithms.grpo import (
+                _compact_exact_nemo_gym_call_sequences,
+            )
+
+            exact_call_tree = _compact_exact_nemo_gym_call_sequences(
+                training_message_logs,
+                materialize_storage=True,
+            )
+            # The compact tree now owns every tensor it needs. The ordinary
+            # trajectory is retained for metrics, but its route views would pin
+            # the raw exact-call storage while siblings finish.
+            for message in result["message_log"]:
+                message.pop("routed_experts", None)
 
         # Calculate truncation.
         truncated = (
@@ -756,7 +776,7 @@ class AsyncNemoGymRolloutImpl:
             env_extras=result["full_result"],
             truncated=truncated,
             reward=float(result["full_result"]["reward"]),
-            training_message_logs=result.get("training_message_logs"),
+            exact_call_tree=exact_call_tree,
         )
 
     def _compute_rollout_metrics(

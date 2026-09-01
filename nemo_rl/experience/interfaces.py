@@ -16,10 +16,34 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from nemo_rl.data.interfaces import LLMMessageLogType, VLMMessageLogType
+from nemo_rl.data.packed_rollouts import TreeAttentionLayout
 
 NEMO_GYM_TASK_INDEX_KEY = "_ng_task_index"
 NEMO_GYM_ROLLOUT_INDEX_KEY = "_ng_rollout_index"
 NEXT_NEMO_GYM_TASK_INDEX_KEY = "next_ng_task_index"
+
+
+@dataclass(frozen=True)
+class ExactCallTreeDiagnostics:
+    """Small counters retained after one rollout's exact calls are compacted."""
+
+    input_call_count: int
+    input_token_count: int
+    page_fork_count: int
+    page_shared_token_count: int
+    cross_replica_rollout: int
+    replica_count: int
+    baseline_attention_pairs: int
+
+
+@dataclass(frozen=True)
+class ExactCallTreePayload:
+    """Owned compact representation of one rollout's captured model calls."""
+
+    edge_message_log: LLMMessageLogType | VLMMessageLogType
+    unique_message_log: LLMMessageLogType | VLMMessageLogType
+    layout: TreeAttentionLayout
+    diagnostics: ExactCallTreeDiagnostics
 
 
 @dataclass
@@ -31,6 +55,7 @@ class Completion:
     truncated: bool
     reward: float
     training_message_logs: Optional[list[LLMMessageLogType | VLMMessageLogType]] = None
+    exact_call_tree: Optional[ExactCallTreePayload] = None
 
 
 @dataclass
