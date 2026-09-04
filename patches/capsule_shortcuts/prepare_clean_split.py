@@ -512,6 +512,11 @@ def task_data_dir(split: Path, task_id: str) -> Path:
     return split / f"{TASK_PREFIX}{task_id}" / "environment" / "data"
 
 
+def capsule_data_dir(root: Path, task_id: str) -> Path:
+    """Resolve a capsule in a raw ``capsule_<uuid>`` data root."""
+    return root / f"capsule_{task_id}"
+
+
 def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -675,17 +680,21 @@ def apply_patches(split: Path) -> None:
             path.unlink()
 
 
-def collect_patch_findings(split: Path) -> list[str]:
+def collect_patch_findings(
+    split: Path,
+    *,
+    data_dir_resolver: Callable[[Path, str], Path] = task_data_dir,
+) -> list[str]:
     findings: list[str] = []
     for task_id, relative_paths in DELETE_PATHS.items():
-        data_dir = task_data_dir(split, task_id)
+        data_dir = data_dir_resolver(split, task_id)
         if not data_dir.is_dir():
             continue
         for relative_path in relative_paths:
             if (data_dir / relative_path).exists():
                 findings.append(f"{task_id}: leaked file remains: {relative_path}")
     for task_id, patterns in DELETE_GLOBS.items():
-        data_dir = task_data_dir(split, task_id)
+        data_dir = data_dir_resolver(split, task_id)
         for pattern in patterns:
             for path in data_dir.glob(pattern):
                 if path.is_file():
@@ -701,7 +710,7 @@ def collect_patch_findings(split: Path) -> list[str]:
         "720852ec-500d-407e-9135-502db964be39": ("Data_Caecilian.zip",),
     }
     for task_id, names in caecilian_archives.items():
-        caecilian = task_data_dir(split, task_id)
+        caecilian = data_dir_resolver(split, task_id)
         if not caecilian.is_dir():
             continue
         for name in names:
@@ -713,13 +722,14 @@ def collect_patch_findings(split: Path) -> list[str]:
 
     for target_id, inputs in COPY_INPUTS.items():
         for _, _, target_name in inputs:
-            target = task_data_dir(split, target_id) / target_name
-            if task_data_dir(split, target_id).is_dir() and not target.is_file():
+            target_data_dir = data_dir_resolver(split, target_id)
+            target = target_data_dir / target_name
+            if target_data_dir.is_dir() and not target.is_file():
                 findings.append(
                     f"{target_id}: replacement input is missing: {target_name}"
                 )
 
-    rpkm = task_data_dir(split, "bf14e7d3-2afb-495b-9e16-b5961623cc04")
+    rpkm = data_dir_resolver(split, "bf14e7d3-2afb-495b-9e16-b5961623cc04")
     if rpkm.is_dir():
         for name in (
             "downloaded_only_GSE243613_gene_rpkm_table.txt",
@@ -738,7 +748,7 @@ def collect_patch_findings(split: Path) -> list[str]:
                     f"derived columns remain in {name}: {sorted(remaining)}"
                 )
 
-    micos = task_data_dir(split, "eb5d2fbe-30ca-4cdd-8705-734248c66e92")
+    micos = data_dir_resolver(split, "eb5d2fbe-30ca-4cdd-8705-734248c66e92")
     if micos.is_dir():
         path = micos / "media-2 (1).xlsx"
         if not path.is_file():
@@ -749,7 +759,7 @@ def collect_patch_findings(split: Path) -> list[str]:
                 "Significance column remains in workbook"
             )
 
-    ad_bxd = task_data_dir(split, "79d5a5bc-0469-4a85-87d1-fe5d255b9823")
+    ad_bxd = data_dir_resolver(split, "79d5a5bc-0469-4a85-87d1-fe5d255b9823")
     if ad_bxd.is_dir():
         for name in (
             "GxE_all_phenotypes_plus_resid_indiv_20240826_filteredforGxEstrains.csv",
@@ -770,7 +780,7 @@ def collect_patch_findings(split: Path) -> list[str]:
                     f"derived columns remain in {name}: {remaining}"
                 )
 
-    soapberry = task_data_dir(split, "98ca02a3-9cf7-4997-ae5a-9e8f939c01b0")
+    soapberry = data_dir_resolver(split, "98ca02a3-9cf7-4997-ae5a-9e8f939c01b0")
     if soapberry.is_dir():
         path = soapberry / "data_and_code.zip"
         if not path.is_file():
@@ -783,7 +793,7 @@ def collect_patch_findings(split: Path) -> list[str]:
                 "analysis or figure files remain in data_and_code.zip"
             )
 
-    blast = task_data_dir(split, "a33a7c14-d960-4f5e-8d31-2fc41f9bd4f1")
+    blast = data_dir_resolver(split, "a33a7c14-d960-4f5e-8d31-2fc41f9bd4f1")
     if blast.is_dir():
         leaked = sorted(
             path.name
