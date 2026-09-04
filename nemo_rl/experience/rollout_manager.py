@@ -50,6 +50,21 @@ from nemo_rl.utils.timer import Timer
 TokenizerType = PreTrainedTokenizerBase
 
 
+def _snapshot_exact_call_message_log(
+    message_log: LLMMessageLogType,
+) -> LLMMessageLogType:
+    """Own tensor storage for a model call before later turns mutate the log."""
+    return [
+        {
+            key: value.clone()
+            if isinstance(value, torch.Tensor)
+            else copy.deepcopy(value)
+            for key, value in message.items()
+        }
+        for message in message_log
+    ]
+
+
 class AsyncRolloutImpl:
     """Manages per-prompt multi-turn rollouts, producing a PromptGroupRecord per call.
 
@@ -65,6 +80,7 @@ class AsyncRolloutImpl:
         max_seq_len: int,
         max_rollout_turns: int,
         policy_generation: GenerationInterface,
+        native_exact_call_tree: bool = False,
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
@@ -73,6 +89,7 @@ class AsyncRolloutImpl:
         self._max_seq_len = max_seq_len
         self._max_rollout_turns = max_rollout_turns
         self._policy_generation = policy_generation
+        self._native_exact_call_tree = native_exact_call_tree
 
     async def run_rollout(self, input_sample: DatumSpec) -> PromptGroupRecord:
         """Run num_generations_per_prompt rollouts for one prompt.
@@ -142,6 +159,7 @@ class AsyncRolloutImpl:
         turn_total_tokens = []
         # Track per-turn per-worker token accounting if available
         per_worker_token_counts = {}  # worker_idx -> token_count
+        training_message_logs = [] if self._native_exact_call_tree else None
 
         for _ in range(self._max_rollout_turns):
             if terminated or truncated:
@@ -160,6 +178,10 @@ class AsyncRolloutImpl:
                     current_stop_strings,
                 )
                 current_message_log.append(assistant_message)
+                if training_message_logs is not None:
+                    training_message_logs.append(
+                        _snapshot_exact_call_message_log(current_message_log)
+                    )
 
                 # Check if response was truncated (hit max_tokens without stop token)
                 response_truncated = gen_metrics.pop("_response_truncated", None)
@@ -255,11 +277,17 @@ class AsyncRolloutImpl:
             # Reached max turns without termination or truncation.
             max_turns_reached = True
 
+        if training_message_logs is not None and not training_message_logs:
+            training_message_logs.append(
+                _snapshot_exact_call_message_log(current_message_log)
+            )
+
         completion = Completion(
             message_log=current_message_log,
             env_extras=current_extra_env_info,
             truncated=truncated,
             reward=total_reward,
+            training_message_logs=training_message_logs,
         )
         sample_metrics = {
             "turn_count": turn_count,
@@ -872,6 +900,7 @@ class RolloutManager:
         use_nemo_gym: bool = False,
         mask_env_flagged_samples: bool = True,
         max_rollout_retries: int = 0,
+        native_exact_call_tree: bool = False,
         tq_buffer: Optional[TQReplayBuffer] = None,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
@@ -884,6 +913,10 @@ class RolloutManager:
                 "policy_generation is required for the native async path"
             )
         else:
+            if native_exact_call_tree:
+                raise ValueError(
+                    "native_exact_call_tree cannot be enabled for NeMo-Gym rollouts"
+                )
             rollout_cls = AsyncNemoGymRolloutImpl
             assert generation_config is not None, (
                 "generation_config is required for the NeMo-Gym path"
@@ -900,6 +933,7 @@ class RolloutManager:
             # Only used by AsyncNemoGymRolloutImpl; AsyncRolloutImpl ignores it.
             mask_env_flagged_samples=mask_env_flagged_samples,
             max_rollout_retries=max_rollout_retries,
+            native_exact_call_tree=native_exact_call_tree,
         )
         self._tokenizer = tokenizer
         self._num_generations_per_prompt = num_generations_per_prompt

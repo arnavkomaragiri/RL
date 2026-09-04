@@ -241,7 +241,7 @@ class TestTQReplayBufferReserveCommit:
             buf.commit(
                 group_id,
                 _make_record(),
-                start_weight_version=3,
+                start_weight_version=2,
                 end_weight_version=4,
             )
         )
@@ -253,14 +253,14 @@ class TestTQReplayBufferReserveCommit:
         assert all(sid.startswith(group_id + "_g") for sid in meta.sample_ids)
         assert dp.depth() == _N_GENS
         assert buf.size() == 1
-        assert buf.start_weight_list == [3]
+        assert buf.start_weight_list == [2]
         assert buf.end_weight_list == [4]
         assert buf.ready_list == [True]
         assert buf.meta_list[0].sample_ids == meta.sample_ids
-        # TQ tags retain dispatch version and explicit rollout-group identity.
+        # TQ tags retain the earliest observed version and group identity.
         assert meta.tags == [
             {
-                "weight_version": 3,
+                "weight_version": 2,
                 "group_id": group_id,
                 "rollout_index": rollout_index,
             }

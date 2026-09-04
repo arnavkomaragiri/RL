@@ -2185,8 +2185,10 @@ class _ExactCallSequence:
     generated_spans: list[_ExactCallGeneratedSpan]
     generation_replica_id: str | None
     generation_weight_version: int | None
+    generation_weight_version_end: int | None
     kv_cache_scheduler_block_size: int | None
     kv_cache_hash_block_size: int | None
+    kv_cache_num_cached_tokens: int | None
 
 
 @dataclass
@@ -2282,10 +2284,14 @@ def _flatten_exact_call(
         generated_spans=generated_spans,
         generation_replica_id=call_metadata("ng_generation_replica_id", str),
         generation_weight_version=call_metadata("ng_generation_weight_version", int),
+        generation_weight_version_end=call_metadata(
+            "ng_generation_weight_version_end", int
+        ),
         kv_cache_scheduler_block_size=call_metadata(
             "ng_kv_cache_scheduler_block_size", int
         ),
         kv_cache_hash_block_size=call_metadata("ng_kv_cache_hash_block_size", int),
+        kv_cache_num_cached_tokens=call_metadata("ng_kv_cache_num_cached_tokens", int),
     )
 
 
@@ -2417,10 +2423,9 @@ def _tensor_parts_first_row_containing(
 def _matching_execution_metadata(
     left: _ExactCallSequence, right: _ExactCallSequence
 ) -> bool:
-    """Return whether cache reuse metadata proves a shared execution domain."""
+    """Return whether calls can refer to the same runtime KV-cache domain."""
     metadata = (
         (left.generation_replica_id, right.generation_replica_id),
-        (left.generation_weight_version, right.generation_weight_version),
         (
             left.kv_cache_scheduler_block_size,
             right.kv_cache_scheduler_block_size,
@@ -2449,21 +2454,37 @@ def _shared_execution_prefix_length(
     has_execution_metadata = (
         left.generation_replica_id is not None
         or right.generation_replica_id is not None
-        or left.generation_weight_version is not None
-        or right.generation_weight_version is not None
+        or left.kv_cache_scheduler_block_size is not None
+        or right.kv_cache_scheduler_block_size is not None
     )
     if has_execution_metadata and not _matching_execution_metadata(left, right):
         return 0
+
+    share_limit = token_prefix
+    if left.generation_weight_version != right.generation_weight_version:
+        if (
+            left.generation_weight_version is None
+            or right.generation_weight_version is None
+            or not _matching_execution_metadata(left, right)
+            or right.kv_cache_num_cached_tokens is None
+            or right.kv_cache_num_cached_tokens <= 0
+        ):
+            return 0
+        share_limit = min(share_limit, right.kv_cache_num_cached_tokens)
+        block_size = cast(int, right.kv_cache_scheduler_block_size)
+        share_limit = (share_limit // block_size) * block_size
+        if share_limit <= 0:
+            return 0
     if left.has_incomplete_routes or right.has_incomplete_routes:
         return 0
     if (left.routed_expert_parts is None) != (right.routed_expert_parts is None):
         return 0
     if left.routed_expert_parts is None:
-        return token_prefix
+        return share_limit
 
     left_routes = left.routed_expert_parts
     right_routes = cast(list[torch.Tensor], right.routed_expert_parts)
-    executed_prefix = min(token_prefix, left.length - 1, right.length - 1)
+    executed_prefix = min(share_limit, left.length - 1, right.length - 1)
     route_prefix = _tensor_parts_common_prefix_length(
         left_routes,
         right_routes,
@@ -2486,7 +2507,7 @@ def _shared_execution_prefix_length(
             block_size = cast(int, left.kv_cache_scheduler_block_size)
             return (route_prefix // block_size) * block_size
         return route_prefix
-    return token_prefix
+    return share_limit
 
 
 def _tensor_parts_prefix_contains_value(
@@ -2564,8 +2585,6 @@ def _page_aligned_execution_prefix_length(
     if (
         prefix.generation_replica_id is None
         or prefix.generation_replica_id != descendant.generation_replica_id
-        or prefix.generation_weight_version is None
-        or prefix.generation_weight_version != descendant.generation_weight_version
     ):
         return None
     block_size = prefix.kv_cache_scheduler_block_size
@@ -2584,7 +2603,11 @@ def _page_aligned_execution_prefix_length(
     if prefix.routed_expert_parts is None or descendant.routed_expert_parts is None:
         return None
 
-    reusable_length = ((prefix.length - 1) // block_size) * block_size
+    if descendant.kv_cache_num_cached_tokens is None:
+        return None
+    reusable_length = (
+        min(prefix.length - 1, descendant.kv_cache_num_cached_tokens) // block_size
+    ) * block_size
     if reusable_length <= 0:
         return None
     descendant_routes = cast(list[torch.Tensor], descendant.routed_expert_parts)
@@ -3185,6 +3208,15 @@ def _compact_exact_nemo_gym_call_sequences(
         _flatten_exact_call(call, call_index)
         for call_index, call in enumerate(rollout_calls)
     ]
+    generation_weight_versions = [
+        version
+        for call in flattened_calls
+        for version in (
+            call.generation_weight_version,
+            call.generation_weight_version_end,
+        )
+        if version is not None
+    ]
     input_token_count = sum(call.length for call in flattened_calls)
     baseline_attention_pairs = sum(
         call.length * (call.length + 1) // 2 for call in flattened_calls
@@ -3211,6 +3243,12 @@ def _compact_exact_nemo_gym_call_sequences(
             cross_replica_rollout=int(len(replicas) > 1),
             replica_count=len(replicas),
             baseline_attention_pairs=baseline_attention_pairs,
+            min_generation_weight_version=(
+                min(generation_weight_versions) if generation_weight_versions else None
+            ),
+            max_generation_weight_version=(
+                max(generation_weight_versions) if generation_weight_versions else None
+            ),
         ),
     )
 

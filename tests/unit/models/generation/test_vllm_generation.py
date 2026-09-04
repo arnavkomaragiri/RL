@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import importlib.util
 import json
 import os
 import sys
+import threading
 import types
 from copy import deepcopy
 from pathlib import Path
@@ -44,6 +46,7 @@ from nemo_rl.models.generation.vllm.vllm_worker import (
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
+    _AsyncLLMHTTPClient,
 )
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
@@ -189,6 +192,32 @@ def test_sampling_params_preserve_bad_words():
     assert sampling_params["bad_words"] == ["<image>", "<img>"]
 
 
+def test_worker_accepts_absolute_generation_weight_version():
+    worker = object.__new__(VllmGenerationWorkerImpl)
+    worker._generation_weight_version = 1
+
+    worker.set_generation_weight_version(59)
+
+    assert worker._generation_weight_version == 59
+
+
+def test_generation_publishes_weight_version_to_replica_leaders(monkeypatch):
+    generation = types.SimpleNamespace(worker_group=MagicMock())
+    futures = [object(), object()]
+    generation.worker_group.run_all_workers_single_data.return_value = futures
+    ray_get = MagicMock()
+    monkeypatch.setattr(ray, "get", ray_get)
+
+    VllmGeneration.set_generation_weight_version(generation, 59)
+
+    generation.worker_group.run_all_workers_single_data.assert_called_once_with(
+        "set_generation_weight_version",
+        version=59,
+        run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+    )
+    ray_get.assert_called_once_with(futures)
+
+
 def test_resolve_enable_prefix_caching_respects_explicit_config(monkeypatch):
     def raise_if_called():
         raise AssertionError("CUDA capability should not be queried")
@@ -222,6 +251,74 @@ basic_lora_test_config: LoRAConfig = {
     "lora_A_init": "xavier",
     "use_triton": False,
 }
+
+
+@pytest.mark.asyncio
+async def test_async_vllm_http_client_runs_generation_on_owner_loop() -> None:
+    owner_loop = asyncio.get_running_loop()
+    owner_thread = threading.get_ident()
+    calls = []
+
+    class FakeEngine:
+        model_config = None
+        renderer = None
+        input_processor = None
+        vllm_config = None
+
+        async def generate(self, *_args, **_kwargs):
+            calls.append((asyncio.get_running_loop(), threading.get_ident()))
+            yield "output"
+
+    client = _AsyncLLMHTTPClient(FakeEngine(), owner_loop)
+
+    def consume_from_http_thread():
+        async def consume():
+            return [item async for item in client.generate(None, None, "request")]
+
+        return asyncio.run(consume())
+
+    assert await asyncio.to_thread(consume_from_http_thread) == ["output"]
+    assert calls == [(owner_loop, owner_thread)]
+
+
+@pytest.mark.asyncio
+async def test_async_vllm_http_client_aborts_cancelled_generation() -> None:
+    owner_loop = asyncio.get_running_loop()
+    started = threading.Event()
+    aborts = []
+
+    class FakeEngine:
+        model_config = None
+        renderer = None
+        input_processor = None
+        vllm_config = None
+
+        async def generate(self, *_args, **_kwargs):
+            started.set()
+            await asyncio.Event().wait()
+            yield None
+
+        async def abort(self, request_id):
+            aborts.append((request_id, asyncio.get_running_loop()))
+
+    client = _AsyncLLMHTTPClient(FakeEngine(), owner_loop)
+
+    def cancel_from_http_thread():
+        async def cancel():
+            async def consume():
+                async for _ in client.generate(None, None, "cancelled-request"):
+                    pass
+
+            task = asyncio.create_task(consume())
+            await asyncio.to_thread(started.wait)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(cancel())
+
+    await asyncio.to_thread(cancel_from_http_thread)
+    assert aborts == [("cancelled-request", owner_loop)]
 
 
 def skip_fp8_known_failures() -> None:
@@ -377,6 +474,9 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
         },
     }
     worker.llm = MagicMock(model_config="model-config", renderer="renderer")
+    worker._http_engine_client = MagicMock(
+        model_config="http-model-config", renderer="http-renderer"
+    )
     model_config = MagicMock(served_model_name="served-model", model="model-path")
     worker.llm_async_engine_args = MagicMock()
     worker.llm_async_engine_args.create_model_config.return_value = model_config
@@ -391,6 +491,10 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
         "/plugins/reasoning_parser.py"
     )
     assert openai_serving_chat.instances[0].kwargs["reasoning_parser"] == "nano_v3"
+    assert (
+        openai_serving_chat.instances[0].kwargs["engine_client"]
+        is worker._http_engine_client
+    )
     # make sure that the config attribute does not leak into `http_server_serving_chat_kwargs`
     assert "reasoning_parser_plugin" not in openai_serving_chat.instances[0].kwargs
 

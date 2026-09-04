@@ -554,10 +554,13 @@ def test_sync_sparse_refit_server_shutdown_cleans_transport_resources(
 async def test_async_sparse_refit_post_init_records_worker_locality() -> None:
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
     worker._sparse_refit_receiver = MagicMock()
+    worker.cfg = {"vllm_cfg": {"expose_http_server": False}}
     worker._mtp_load_from_disk = False
     worker.report_device_id_async = AsyncMock(return_value=["0"])
     worker.llm = MagicMock()
-    worker.llm.collective_rpc = AsyncMock(return_value=["node-0", "node-0"])
+    worker.llm.collective_rpc = AsyncMock(
+        side_effect=[None, [{"block_size": 16}], ["node-0", "node-0"]]
+    )
 
     await worker.post_init_async()
 
@@ -565,8 +568,12 @@ async def test_async_sparse_refit_post_init_records_worker_locality() -> None:
     worker._sparse_refit_receiver.set_worker_hostnames.assert_called_once_with(
         ["node-0", "node-0"]
     )
+    worker._sparse_refit_receiver.set_async_loop.assert_called_once_with(
+        asyncio.get_running_loop()
+    )
     assert worker.llm.collective_rpc.await_args_list == [
         call("bind_numa", args=()),
+        call("report_kv_cache_block_metadata", args=()),
         call("report_node_hostname", args=()),
     ]
 

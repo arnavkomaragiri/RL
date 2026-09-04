@@ -908,6 +908,7 @@ class TQReplayBuffer:
 
             idx = self._group_ids.index(group_id)
             self.meta_list[idx] = meta
+            self.start_weight_list[idx] = start_weight_version
             self.end_weight_list[idx] = end_weight_version
             self.ready_list[idx] = True
             return meta

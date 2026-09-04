@@ -1063,6 +1063,32 @@ def from_parallel_tree_logits_to_logprobs(
 
     if local_edge_count:
         if need_top_k_or_top_p_filtering(sampling_params):
+            # Tree edges are selected after the model-forward padding has been
+            # removed, so their count is not constrained by the configured
+            # sequence-length multiple. The sampled-logprob all-to-all shards
+            # this dimension across TP ranks and therefore needs its own local
+            # padding. These dummy rows are discarded before edge writeback.
+            tp_size = torch.distributed.get_world_size(tp_group)
+            sampling_pad = (-local_edge_count) % tp_size
+            if sampling_pad:
+                local_logits = torch.cat(
+                    [
+                        local_logits,
+                        local_logits.new_zeros(
+                            local_logits.shape[0],
+                            sampling_pad,
+                            local_logits.shape[2],
+                        ),
+                    ],
+                    dim=1,
+                )
+                local_targets = torch.cat(
+                    [
+                        local_targets,
+                        local_targets.new_zeros(local_targets.shape[0], sampling_pad),
+                    ],
+                    dim=1,
+                )
             if chunk_size is not None:
                 local_logprobs = ChunkedDistributedLogprobWithSampling.apply(  # type: ignore
                     local_logits,
@@ -1082,6 +1108,7 @@ def from_parallel_tree_logits_to_logprobs(
                     sampling_params.top_p,
                     inference_only,
                 )
+            local_logprobs = local_logprobs[:, :local_edge_count]
         elif chunk_size is not None:
             local_logprobs = ChunkedDistributedLogprob.apply(  # type: ignore
                 local_logits,

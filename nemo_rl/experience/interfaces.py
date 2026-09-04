@@ -34,6 +34,8 @@ class ExactCallTreeDiagnostics:
     cross_replica_rollout: int
     replica_count: int
     baseline_attention_pairs: int
+    min_generation_weight_version: int | None = None
+    max_generation_weight_version: int | None = None
 
 
 @dataclass(frozen=True)

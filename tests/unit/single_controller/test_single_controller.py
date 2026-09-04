@@ -192,7 +192,8 @@ def test_sync_weights_honors_recompute_kv_cache_config(
     ctrl._rollout_permitted.set()
     ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
     ctrl._gen = SimpleNamespace(
-        invalidate_kv_cache=MagicMock(),
+        invalidate_kv_cache=MagicMock(return_value=True),
+        set_generation_weight_version=MagicMock(),
         requires_kv_scale_sync=False,
     )
     ctrl._rollout_manager = SimpleNamespace(set_weight_version=MagicMock())
@@ -202,8 +203,32 @@ def test_sync_weights_honors_recompute_kv_cache_config(
 
     ctrl._weight_synchronizer.sync_weights.assert_called_once_with(kv_scales=None)
     assert ctrl._gen.invalidate_kv_cache.call_count == expected_invalidation_calls
+    ctrl._gen.set_generation_weight_version.assert_called_once_with(3)
     ctrl._rollout_manager.set_weight_version.assert_called_once_with(3)
     assert ctrl._rollout_permitted.is_set()
+
+
+def test_sync_weights_does_not_resume_after_cache_invalidation_failure() -> None:
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._async_cfg = AsyncRLConfig(recompute_kv_cache_after_weight_updates=True)
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
+    ctrl._gen = SimpleNamespace(
+        invalidate_kv_cache=MagicMock(return_value=False),
+        set_generation_weight_version=MagicMock(),
+        requires_kv_scale_sync=False,
+    )
+    ctrl._rollout_manager = SimpleNamespace(set_weight_version=MagicMock())
+    ctrl._trainer_version = 3
+
+    with pytest.raises(RuntimeError, match="KV-cache invalidation failed"):
+        asyncio.run(ctrl._sync_weights())
+
+    ctrl._gen.set_generation_weight_version.assert_not_called()
+    ctrl._rollout_manager.set_weight_version.assert_not_called()
+    assert not ctrl._rollout_permitted.is_set()
 
 
 def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
@@ -215,6 +240,7 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
     ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
     ctrl._gen = SimpleNamespace(
         invalidate_kv_cache=MagicMock(),
+        set_generation_weight_version=MagicMock(),
         requires_kv_scale_sync=True,
     )
     ctrl._trainer = SimpleNamespace(

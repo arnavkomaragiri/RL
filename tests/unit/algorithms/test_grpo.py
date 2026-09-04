@@ -355,6 +355,7 @@ def test_exact_calls_classify_runtime_page_aligned_route_fork(capsys) -> None:
         "ng_generation_weight_version": 2,
         "ng_kv_cache_scheduler_block_size": 4,
         "ng_kv_cache_hash_block_size": 4,
+        "ng_kv_cache_num_cached_tokens": 4,
     }
     batch = BatchedDataDict(
         {
@@ -363,25 +364,37 @@ def test_exact_calls_classify_runtime_page_aligned_route_fork(capsys) -> None:
                 [
                     [
                         {
-                            "role": "assistant",
-                            "token_ids": torch.tensor([10, 11, 12, 13, 14, 15]),
-                            "generation_logprobs": torch.tensor(
-                                [-1.0, -1.1, -1.2, -1.3, -1.4, -1.5]
-                            ),
-                            "routed_experts": routes([1, 2, 3, 4, 9, 99]),
+                            "role": "user",
+                            "token_ids": torch.tensor([10]),
+                            "routed_experts": routes([1]),
                             **metadata,
-                        }
+                        },
+                        {
+                            "role": "assistant",
+                            "token_ids": torch.tensor([11, 12, 13, 14, 15]),
+                            "generation_logprobs": torch.tensor(
+                                [-1.1, -1.2, -1.3, -1.4, -1.5]
+                            ),
+                            "routed_experts": routes([2, 3, 4, 9, 99]),
+                            **metadata,
+                        },
                     ],
                     [
                         {
-                            "role": "assistant",
-                            "token_ids": torch.tensor([10, 11, 12, 13, 14, 15, 16]),
-                            "generation_logprobs": torch.tensor(
-                                [-2.0, -2.1, -2.2, -2.3, -2.4, -2.5, -2.6]
-                            ),
-                            "routed_experts": routes([1, 2, 3, 4, 8, 10, 99]),
+                            "role": "user",
+                            "token_ids": torch.tensor([10]),
+                            "routed_experts": routes([1]),
                             **metadata,
-                        }
+                        },
+                        {
+                            "role": "assistant",
+                            "token_ids": torch.tensor([11, 12, 13, 14, 15, 16]),
+                            "generation_logprobs": torch.tensor(
+                                [-2.1, -2.2, -2.3, -2.4, -2.5, -2.6]
+                            ),
+                            "routed_experts": routes([2, 3, 4, 8, 10, 99]),
+                            **metadata,
+                        },
                     ],
                 ]
             ],
@@ -398,6 +411,69 @@ def test_exact_calls_classify_runtime_page_aligned_route_fork(capsys) -> None:
     assert "page_forks=1" in diagnostics
     assert "page_shared_tokens=4" in diagnostics
     assert "cross_replica_rollouts=0" in diagnostics
+
+
+def test_exact_calls_share_observed_cached_prefix_across_weight_versions() -> None:
+    def routes(values: list[int]) -> torch.Tensor:
+        return torch.tensor(values, dtype=torch.int16).view(-1, 1, 1)
+
+    cache_metadata = {
+        "ng_generation_replica_id": "vllm-3",
+        "ng_kv_cache_scheduler_block_size": 2,
+        "ng_kv_cache_hash_block_size": 2,
+    }
+    first_call = [
+        {
+            "role": "user",
+            "token_ids": torch.tensor([10]),
+            "routed_experts": routes([1]),
+            "ng_generation_weight_version": 1,
+            **cache_metadata,
+        },
+        {
+            "role": "assistant",
+            "token_ids": torch.tensor([11]),
+            "generation_logprobs": torch.tensor([-1.1]),
+            "routed_experts": routes([99]),
+            "ng_generation_weight_version": 1,
+            **cache_metadata,
+        },
+    ]
+    second_call = [
+        {
+            "role": "user",
+            "token_ids": torch.tensor([10, 11, 20]),
+            "routed_experts": routes([1, 2, 3]),
+            "ng_generation_weight_version": 2,
+            "ng_kv_cache_num_cached_tokens": 2,
+            **cache_metadata,
+        },
+        {
+            "role": "assistant",
+            "token_ids": torch.tensor([21]),
+            "generation_logprobs": torch.tensor([-2.1]),
+            "routed_experts": routes([99]),
+            "ng_generation_weight_version": 2,
+            "ng_kv_cache_num_cached_tokens": 2,
+            **cache_metadata,
+        },
+    ]
+
+    cached_tree = _build_exact_call_tree([first_call, second_call])
+    assert cached_tree.layout.unique_token_count == 4
+    assert cached_tree.layout.segment_lengths == (4,)
+
+    uncached_second_call = [
+        {
+            key: value
+            for key, value in message.items()
+            if key != "ng_kv_cache_num_cached_tokens"
+        }
+        for message in second_call
+    ]
+    uncached_tree = _build_exact_call_tree([first_call, uncached_second_call])
+    assert uncached_tree.layout.unique_token_count == 6
+    assert uncached_tree.layout.segment_parents == (-1, -1)
 
 
 def test_exact_calls_compact_when_router_replay_prefix_matches() -> None:

@@ -1106,6 +1106,25 @@ class TestReplayBuffer:
 class TestAsyncTrajectoryCollector:
     """Test cases for AsyncTrajectoryCollector."""
 
+    def test_observed_generation_version_uses_all_exact_calls(self):
+        batch = BatchedDataDict(
+            {
+                "training_message_logs": [
+                    [
+                        [{"ng_generation_weight_version": 3}],
+                        [{"ng_generation_weight_version": 4}],
+                    ],
+                    [[{"ng_generation_weight_version": 2}]],
+                ]
+            }
+        )
+
+        assert trajectory_collector_mod._observed_generation_weight_versions(batch) == [
+            3,
+            4,
+            2,
+        ]
+
     def create_local_collector(
         self, replay_buffer=None, next_nemo_gym_task_index: int = 0
     ):

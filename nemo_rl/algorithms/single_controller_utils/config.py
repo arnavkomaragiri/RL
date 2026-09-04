@@ -51,6 +51,8 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     max_buffered_rollouts: int = 64
     # Enable per-rollout diagnostic prints (prompt content / completion previews).
     diagnostics: bool = False
+    # Capture native model invocations as exact-call trees for tree attention.
+    native_exact_call_tree: bool = False
 
 
 class MasterConfig(BaseModel, extra="allow"):

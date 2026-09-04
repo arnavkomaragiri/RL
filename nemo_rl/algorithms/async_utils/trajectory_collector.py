@@ -51,6 +51,20 @@ _NEMO_GYM_RETRY_DELAY_BASE_SECONDS = 1.0
 _REPLAY_BUFFER_MAX_BACKOFF_SECONDS = 0.5
 
 
+def _observed_generation_weight_versions(
+    batch: BatchedDataDict[DatumSpec],
+) -> list[int]:
+    """Collect per-call generation versions from a completed Gym prompt group."""
+    versions: list[int] = []
+    for rollout_calls in batch.get("training_message_logs", []):
+        for call in rollout_calls:
+            for message in call:
+                version = message.get("ng_generation_weight_version")
+                if version is not None:
+                    versions.append(int(version))
+    return versions
+
+
 @ray.remote  # pragma: no cover
 class AsyncTrajectoryCollector:
     """Collects trajectories asynchronously and adds them to replay buffer."""
@@ -987,6 +1001,16 @@ class AsyncTrajectoryCollector:
         rollout_metrics["trajectory_duration_s"] = (
             time.perf_counter() - collection_started_at
         )
+        observed_versions = _observed_generation_weight_versions(final_batch_cpu)
+        replay_generation_weight_version = (
+            min(observed_versions) if observed_versions else generation_weight_version
+        )
+        rollout_metrics["generation_weight_version/earliest"] = float(
+            replay_generation_weight_version
+        )
+        rollout_metrics["generation_weight_version/latest"] = float(
+            max(observed_versions) if observed_versions else generation_weight_version
+        )
         trajectory_group = {
             "batch": final_batch_cpu,
             "rollout_metrics": rollout_metrics,
@@ -1001,7 +1025,7 @@ class AsyncTrajectoryCollector:
             while self.running:
                 status = await self.replay_buffer.add.remote(
                     trajectory_group,
-                    generation_weight_version,
+                    replay_generation_weight_version,
                     target_weight_version,
                 )
                 if status == "success":

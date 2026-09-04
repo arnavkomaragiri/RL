@@ -953,7 +953,9 @@ class SingleControllerActor:
           1. _rollout_permitted.clear()  — no new dispatches
           2. Optionally calibrate FP8 KV-cache scales.
           3. weight_synchronizer.sync_weights(kv_scales=...)
-          4. _rollout_permitted.set()   — resume
+          4. Optionally invalidate reusable generation caches.
+          5. Publish the absolute weight version to generation workers.
+          6. _rollout_permitted.set()   — resume
         """
         self._rollout_permitted.clear()
 
@@ -978,7 +980,11 @@ class SingleControllerActor:
             kv_scales=kv_scales,
         )
         if self._async_cfg.recompute_kv_cache_after_weight_updates:
-            self._gen.invalidate_kv_cache()
+            if not self._gen.invalidate_kv_cache():
+                raise RuntimeError(
+                    "Generation KV-cache invalidation failed after a weight update"
+                )
+        self._gen.set_generation_weight_version(self._trainer_version)
         elapsed = time.monotonic() - t0
 
         print(f"  _sync_weights: sync done in {elapsed:.3f}s", flush=True)

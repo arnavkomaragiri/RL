@@ -792,6 +792,7 @@ Depending on your data shape, you may want to change these values."""
         turn_idx = 0
 
         nemo_rl_message_log = []
+        direct_training_message_logs = []
         seen_token_ids: List[int] = []
         batch_decode_items = []
         for output_item_dict in nemo_gym_result["response"]["output"]:
@@ -825,8 +826,10 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                 for field in (
                     "ng_generation_replica_id",
                     "ng_generation_weight_version",
+                    "ng_generation_weight_version_end",
                     "ng_kv_cache_scheduler_block_size",
                     "ng_kv_cache_hash_block_size",
+                    "ng_kv_cache_num_cached_tokens",
                 )
                 if field in output_item_dict
             }
@@ -884,6 +887,14 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                 user_message["routed_experts"] = routed_experts[prompt_start:prompt_end]
             nemo_rl_message_log.append(user_message)
 
+            direct_user_message = {
+                "role": "user",
+                "content": "",
+                "token_ids": torch.tensor(prompt_token_ids),
+            }
+            if routed_experts is not None:
+                direct_user_message["routed_experts"] = routed_experts[:prompt_end]
+
             if processor is not None:
                 images_this_turn = (
                     per_turn_images[turn_idx] if turn_idx < len(per_turn_images) else []
@@ -920,6 +931,27 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                     generation_start:generation_end
                 ]
             nemo_rl_message_log.append(assistant_message)
+            direct_training_message_logs.append(
+                [
+                    direct_user_message,
+                    {
+                        **assistant_message,
+                        "token_ids": assistant_message["token_ids"].clone(),
+                        "generation_logprobs": assistant_message[
+                            "generation_logprobs"
+                        ].clone(),
+                        **(
+                            {
+                                "routed_experts": assistant_message[
+                                    "routed_experts"
+                                ].clone()
+                            }
+                            if "routed_experts" in assistant_message
+                            else {}
+                        ),
+                    },
+                ]
+            )
 
             seen_token_ids.extend(new_prompt_token_ids)
             seen_token_ids.extend(generation_token_ids)
@@ -971,7 +1003,7 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             )
 
         if not training_message_logs:
-            training_message_logs = [nemo_rl_message_log]
+            training_message_logs = direct_training_message_logs
 
         return {
             "message_log": nemo_rl_message_log,

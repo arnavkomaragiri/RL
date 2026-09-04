@@ -34,9 +34,14 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from nemo_rl.algorithms.grpo import _compact_exact_nemo_gym_call_sequences
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets.response_datasets import NemoGymDataset
 from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.data.packed_rollouts import (
+    TREE_ATTENTION_EDGE_LENGTHS,
+    TREE_ATTENTION_LAYOUTS,
+)
 from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.nemo_gym import NemoGymRolloutFailure
@@ -48,8 +53,10 @@ from nemo_rl.experience.interfaces import (
 )
 from nemo_rl.experience.rollout_manager import (
     AsyncNemoGymRolloutImpl,
+    AsyncRolloutImpl,
     RolloutManager,
 )
+from nemo_rl.experience.payload import record_to_train_batch
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
@@ -231,6 +238,72 @@ class TestGenerateAndPushFlow:
         _, _, start_v, end_v = buf.commit_calls[0]
         assert start_v == 7
         assert end_v == 7
+
+    def test_exact_call_versions_do_not_override_global_tq_staleness(self):
+        call_metadata = {
+            "ng_generation_replica_id": "vllm-0",
+            "ng_kv_cache_scheduler_block_size": 2,
+            "ng_kv_cache_hash_block_size": 2,
+        }
+        calls = [
+            [
+                {
+                    "role": "user",
+                    "token_ids": torch.tensor([1]),
+                    "ng_generation_weight_version": 1,
+                    **call_metadata,
+                },
+                {
+                    "role": "assistant",
+                    "token_ids": torch.tensor([2]),
+                    "generation_logprobs": torch.tensor([-0.1]),
+                    "ng_generation_weight_version": 1,
+                    **call_metadata,
+                },
+            ],
+            [
+                {
+                    "role": "user",
+                    "token_ids": torch.tensor([1, 2]),
+                    "ng_generation_weight_version": 3,
+                    **call_metadata,
+                },
+                {
+                    "role": "assistant",
+                    "token_ids": torch.tensor([3]),
+                    "generation_logprobs": torch.tensor([-0.2]),
+                    "ng_generation_weight_version": 3,
+                    **call_metadata,
+                },
+            ],
+        ]
+        tree = _compact_exact_nemo_gym_call_sequences(calls, materialize_storage=True)
+        record = PromptGroupRecord(
+            prompt_idx=0,
+            prompt=[],
+            extra_env_info=None,
+            metadata={},
+            completions=[
+                Completion(
+                    message_log=calls[-1],
+                    env_extras=None,
+                    truncated=False,
+                    reward=1.0,
+                    exact_call_tree=tree,
+                )
+            ],
+            rollout_metrics={},
+        )
+        buf = _FakeBuffer()
+        mgr = _make_manager(buf, _FakeImpl(record=record))
+        mgr.set_weight_version(3)
+
+        _run(mgr.generate_and_push({"prompt": "p"}))
+
+        assert buf.reserve_calls == [3]
+        _, _, start_v, end_v = buf.commit_calls[0]
+        assert start_v == 3
+        assert end_v == 3
 
     def test_concurrent_dispatch_preserves_reserve_order(self):
         """Two concurrent generate_and_push calls must reserve before either commits.
@@ -648,6 +721,106 @@ def test_result_to_completion_drops_mask_flag_when_gate_off():
 # ---------------------------------------------------------------------------
 # Tests for AsyncRolloutManager (native async path)
 # ---------------------------------------------------------------------------
+
+
+class _NativeExactCallTokenizer:
+    pad_token_id = 0
+
+    def __call__(self, content, **kwargs):
+        del content, kwargs
+        return SimpleNamespace(input_ids=torch.tensor([[90, 91]]))
+
+
+def _native_exact_call_input() -> DatumSpec:
+    return {
+        "message_log": [
+            {
+                "role": "user",
+                "content": "prompt",
+                "token_ids": torch.tensor([10, 11]),
+            }
+        ],
+        "extra_env_info": None,
+        "task_name": "math",
+        "idx": 0,
+    }
+
+
+def test_native_exact_call_tree_captures_model_call_before_environment(
+    monkeypatch,
+) -> None:
+    async def generate_response(_message_log, _stop_strings):
+        return (
+            {
+                "role": "assistant",
+                "content": "answer",
+                "token_ids": torch.tensor([20, 21]),
+                "generation_logprobs": torch.tensor([-0.1, -0.2]),
+            },
+            torch.tensor(2),
+            {},
+        )
+
+    monkeypatch.setattr(
+        "nemo_rl.experience.rollout_manager.calculate_rewards",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            rewards=torch.tensor([1.0]),
+            terminateds=torch.tensor([True]),
+            observations=[{"role": "user", "content": "post-generation feedback"}],
+            next_stop_strings=[None],
+            metadata=[None],
+        ),
+    )
+    impl = AsyncRolloutImpl(
+        tokenizer=_NativeExactCallTokenizer(),
+        task_to_env={},
+        num_generations_per_prompt=1,
+        max_seq_len=32,
+        max_rollout_turns=1,
+        policy_generation=SimpleNamespace(),
+        native_exact_call_tree=True,
+    )
+    impl._generate_response = generate_response  # type: ignore[method-assign]
+
+    record = asyncio.run(impl.run_rollout(_native_exact_call_input()))
+    completion = record.completions[0]
+    assert [message["role"] for message in completion.message_log] == [
+        "user",
+        "assistant",
+        "user",
+    ]
+    assert completion.training_message_logs is not None
+    assert [message["role"] for message in completion.training_message_logs[0]] == [
+        "user",
+        "assistant",
+    ]
+
+    train_batch = record_to_train_batch(
+        record,
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+    )
+    assert train_batch[TREE_ATTENTION_LAYOUTS][0].unique_token_count == 4
+    assert train_batch[TREE_ATTENTION_EDGE_LENGTHS].tolist() == [2]
+    assert train_batch["input_lengths"].tolist() == [4]
+    assert int(train_batch["token_mask"].sum().item()) == 2
+
+
+def test_native_exact_call_tree_is_opt_in(monkeypatch) -> None:
+    async def generate_response(_message_log, _stop_strings):
+        raise RuntimeError("generation failed")
+
+    impl = AsyncRolloutImpl(
+        tokenizer=_NativeExactCallTokenizer(),
+        task_to_env={},
+        num_generations_per_prompt=1,
+        max_seq_len=32,
+        max_rollout_turns=1,
+        policy_generation=SimpleNamespace(),
+    )
+    impl._generate_response = generate_response  # type: ignore[method-assign]
+
+    record = asyncio.run(impl.run_rollout(_native_exact_call_input()))
+    assert record.completions[0].training_message_logs is None
 
 
 @pytest.fixture(scope="function")

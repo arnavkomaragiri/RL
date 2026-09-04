@@ -670,6 +670,7 @@ def setup_single_controller(
                 "max_rollout_retries", DEFAULT_MAX_ROLLOUT_RETRIES
             )
         ),
+        native_exact_call_tree=master_config.async_rl.native_exact_call_tree,
         tq_buffer=tq_buffer,
     )
 

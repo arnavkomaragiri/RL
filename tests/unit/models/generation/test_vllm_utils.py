@@ -591,11 +591,14 @@ def test_attach_and_dump_generation_metadata():
 
     attach_generation_metadata_to_chat_response_choices(
         response,
+        replica_id="http://10.0.0.3:8123/v1",
         weight_version=3,
+        end_weight_version=4,
         kv_cache_block_metadata={
             "scheduler_block_size": 1056,
             "hash_block_size": 1056,
         },
+        num_cached_tokens=2112,
     )
 
     class DumpableResponse:
@@ -606,9 +609,12 @@ def test_attach_and_dump_generation_metadata():
 
     dumped = model_dump_chat_response_with_routed_experts(DumpableResponse())
     message = dumped["choices"][0]["message"]
+    assert message["ng_generation_replica_id"] == "http://10.0.0.3:8123/v1"
     assert message["ng_generation_weight_version"] == 3
+    assert message["ng_generation_weight_version_end"] == 4
     assert message["ng_kv_cache_scheduler_block_size"] == 1056
     assert message["ng_kv_cache_hash_block_size"] == 1056
+    assert message["ng_kv_cache_num_cached_tokens"] == 2112
 
 
 @pytest.mark.vllm

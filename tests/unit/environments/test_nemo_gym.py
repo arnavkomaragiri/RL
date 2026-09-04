@@ -353,6 +353,15 @@ def test_nemo_gym_postprocess_uses_batch_decode():
     assert result["message_log"][1]["token_ids"].tolist() == [3]
     assert result["message_log"][2]["token_ids"].tolist() == [4, 5]
     assert result["message_log"][3]["token_ids"].tolist() == [6, 7]
+    assert len(result["training_message_logs"]) == 2
+    assert result["training_message_logs"][0][0]["token_ids"].tolist() == [1, 2]
+    assert result["training_message_logs"][1][0]["token_ids"].tolist() == [
+        1,
+        2,
+        3,
+        4,
+        5,
+    ]
     assert nemo_gym_result["response"]["output"][0]["prompt_str"] == "1 2"
     assert nemo_gym_result["response"]["output"][0]["generation_str"] == "3"
     assert nemo_gym_result["response"]["output"][1]["prompt_str"] == "1 2 3 4 5"
