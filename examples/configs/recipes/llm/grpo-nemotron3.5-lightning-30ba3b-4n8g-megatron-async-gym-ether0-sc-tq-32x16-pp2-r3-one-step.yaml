@@ -1,0 +1,13 @@
+# Controlled topology comparison against the CP2 Ether0 gate. TP8 remains
+# node-local while PP2 carries stage activations across the two train nodes.
+defaults: ./grpo-nemotron3.5-lightning-30ba3b-4n8g-megatron-async-gym-ether0-sc-tq-32x16-age4-r3-one-step.yaml
+
+policy:
+  megatron_cfg:
+    pipeline_model_parallel_size: 2
+    context_parallel_size: 1
+
+logger:
+  log_dir: logs/grpo-nemotron3.5-lightning-ether0-sc-tq-32x16-pp2-r3-one-step
+  wandb:
+    name: grpo-nemotron3.5-lightning-ether0-sc-tq-32x16-pp2-r3-one-step

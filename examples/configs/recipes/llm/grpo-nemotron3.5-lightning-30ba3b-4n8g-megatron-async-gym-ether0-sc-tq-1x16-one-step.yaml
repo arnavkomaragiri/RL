@@ -1,0 +1,24 @@
+defaults: ./grpo-nemotron3.5-lightning-30ba3b-4n8g-megatron-async-gym-harbor-sc-tq-1x16.yaml
+data:
+  train:
+    data_path: ${oc.env:ETHER0_TRAIN_MANIFEST}
+  validation:
+    data_path: ${oc.env:ETHER0_TRAIN_MANIFEST}
+env:
+  nemo_gym:
+    num_samples_in_parallel: 16
+    max_rollout_retries: 2
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/ether0/configs/ether0.yaml
+    - resources_servers/ether0/configs/ether0_remotes.yaml
+    token_id_capture:
+      dir: ${oc.env:NEMO_GYM_TOKEN_CAPTURE_DIR,${oc.env:RAY_TMPDIR,/tmp}/ng_tokcap_ether0}
+      retain_consumed: false
+policy:
+  generation:
+    max_new_tokens: 4096
+logger:
+  log_dir: logs/grpo-nemotron3.5-lightning-ether0-sc-tq-1x16-one-step
+  wandb:
+    name: grpo-nemotron3.5-lightning-ether0-sc-tq-1x16-one-step

@@ -1,0 +1,26 @@
+defaults: ./grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-single-controller-sync.yaml
+grpo:
+  max_num_steps: 500
+checkpointing:
+  enabled: true
+  metric_name: null
+  keep_top_k: null
+  save_period: 50
+  ft_save_period: 1
+  ft_keep_latest_k: 1
+  checkpoint_must_save_by: 00:03:40:00
+async_rl:
+  native_exact_call_tree: true
+  max_buffered_rollouts: ${grpo.num_prompts_per_step}
+policy:
+  dynamic_batching:
+    enabled: false
+  sequence_packing:
+    enabled: true
+data:
+  train:
+    split_validation_size: 0.0
+logger:
+  log_dir: logs/grpo-qwen2.5-math-1.5b-megatron-sc-tq-treeattn-500step
+  wandb:
+    name: grpo-qwen2.5-math-1.5b-megatron-sc-tq-treeattn-500step

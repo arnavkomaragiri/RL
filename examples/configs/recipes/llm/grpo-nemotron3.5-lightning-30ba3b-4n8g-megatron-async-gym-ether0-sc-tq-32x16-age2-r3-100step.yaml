@@ -1,0 +1,25 @@
+defaults: ./grpo-nemotron3.5-lightning-30ba3b-4n8g-megatron-async-gym-ether0-sc-tq-32x16-age4-r3-one-step.yaml
+grpo:
+  max_num_steps: 100
+  max_num_epochs: 1
+  async_grpo:
+    max_trajectory_age_steps: 2
+async_rl:
+  sampler:
+    max_lookahead_versions: 2
+  max_inflight_prompts: 96
+  max_buffered_rollouts: 96
+policy:
+  generation:
+    top_p: 1.0
+checkpointing:
+  enabled: true
+  metric_name: null
+  keep_top_k: null
+  save_period: 8
+  ft_save_period: 1
+  ft_keep_latest_k: 1
+logger:
+  log_dir: logs/grpo-nemotron3.5-lightning-ether0-sc-tq-32x16-age2-r3-100step
+  wandb:
+    name: grpo-nemotron3.5-lightning-ether0-sc-tq-32x16-age2-r3-100step
