@@ -18,6 +18,7 @@ policy:
   sequence_packing:
     enabled: true
 data:
+  shuffle: false
   train:
     split_validation_size: 0.0
 logger:
