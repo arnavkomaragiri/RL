@@ -41,6 +41,9 @@ results/
 code_snapshots*/
 .cache/
 
+# Generated cross-cluster operational handoffs (may contain site-local paths/certs)
+/handoffs/bbh-gbs8192-cross-cluster-20260905/
+
 # Runtime env
 *runtime_env.yaml
 !default_runtime_env.yaml
