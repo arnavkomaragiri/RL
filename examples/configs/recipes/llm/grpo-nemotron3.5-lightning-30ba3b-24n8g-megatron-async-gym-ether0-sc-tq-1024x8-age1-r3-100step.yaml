@@ -1,0 +1,41 @@
+# Preserve the working G=64 run's per-replica load while increasing each
+# optimizer step to 1,024 independent prompts. Eight generation nodes provide
+# 16 TP=4 vLLM replicas; 16 training nodes provide DP=8 over TP=8, CP=2.
+defaults: ./grpo-nemotron3.5-lightning-30ba3b-6n8g-megatron-async-gym-ether0-sc-tq-32x16-age4-r3-100step.yaml
+
+grpo:
+  num_prompts_per_step: 1024
+  num_generations_per_prompt: 8
+  async_grpo:
+    max_trajectory_age_steps: 1
+
+policy:
+  train_global_batch_size: 8192
+  generation_batch_size: 8192
+  generation:
+    colocated:
+      resources:
+        num_nodes: 8
+
+env:
+  nemo_gym:
+    num_samples_in_parallel: 8192
+
+data_plane:
+  # Scale storage shards with the 4x increase in samples per step.
+  num_storage_units: 8
+
+async_rl:
+  sampler:
+    max_lookahead_versions: 1
+  # One full future batch may overlap the current optimizer step.
+  max_inflight_prompts: 1024
+  max_buffered_rollouts: 2048
+
+logger:
+  log_dir: logs/grpo-nemotron3.5-lightning-ether0-sc-tq-1024x8-age1-r3-100step-dp8
+  wandb:
+    name: grpo-nemotron3.5-lightning-ether0-sc-tq-1024x8-age1-r3-100step-dp8
+
+cluster:
+  num_nodes: 24

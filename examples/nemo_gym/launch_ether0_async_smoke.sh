@@ -22,6 +22,7 @@ NUM_GENERATION_NODES=${NUM_GENERATION_NODES:-2}
 RUN_ID=${RUN_ID:-$(date -u +%Y%m%d-%H%M%S)}
 EXP_NAME=${EXP_NAME:-ether0-nemotron35-1x16-${RUN_ID}}
 RUN_ROOT=${RUN_ROOT:-${REPO_LOCATION}/results/${EXP_NAME}}
+NEMO_GYM_VENV_DIR=${NEMO_GYM_VENV_DIR:-${RUN_ROOT}/nemo-gym-venvs}
 RECIPE=${RECIPE:-examples/configs/recipes/llm/grpo-nemotron3.5-lightning-30ba3b-4n8g-megatron-async-gym-ether0-sc-tq-1x16-one-step.yaml}
 WANDB_RUN_ID=${WANDB_RUN_ID:-${EXP_NAME}}
 WANDB_RESUME=${WANDB_RESUME:-allow}
@@ -94,15 +95,20 @@ mkdir -p \
     "${RUN_ROOT}/logs" \
     "${RUN_ROOT}/checkpoints" \
     "${RUN_ROOT}/manifests" \
-    "${RUN_ROOT}/nemo-gym-venvs" \
+    "${NEMO_GYM_VENV_DIR}" \
     "${RUN_ROOT}/megatron-checkpoints"
 ETHER0_TRAIN_MANIFEST=${RUN_ROOT}/manifests/train.jsonl
 if [[ ! -s "${ETHER0_TRAIN_MANIFEST}" ]]; then
-    python3 "${REPO_LOCATION}/3rdparty/Gym-workspace/Gym/resources_servers/ether0/scripts/prepare_ether0.py" \
-        --input-jsonl "${ETHER0_SOURCE_DATASET}" \
-        --output "${ETHER0_TRAIN_MANIFEST}" \
-        --problem-types "${ETHER0_PROBLEM_TYPE}" \
+    PREPARE_ARGS=(
+        --input-jsonl "${ETHER0_SOURCE_DATASET}"
+        --output "${ETHER0_TRAIN_MANIFEST}"
         --limit "${ETHER0_LIMIT}"
+    )
+    if [[ "${ETHER0_PROBLEM_TYPE}" != "all" ]]; then
+        PREPARE_ARGS+=(--problem-types "${ETHER0_PROBLEM_TYPE}")
+    fi
+    python3 "${REPO_LOCATION}/3rdparty/Gym-workspace/Gym/resources_servers/ether0/scripts/prepare_ether0.py" \
+        "${PREPARE_ARGS[@]}"
 fi
 if [[ $(wc -l < "${ETHER0_TRAIN_MANIFEST}") -ne "${ETHER0_LIMIT}" ]]; then
     echo "Expected exactly ${ETHER0_LIMIT} Ether0 rows in ${ETHER0_TRAIN_MANIFEST}." >&2
@@ -120,7 +126,7 @@ set -euo pipefail
 cd ${CONTAINER_REPO_LOCATION}
 export GYM_ROOT=${CONTAINER_REPO_LOCATION}/3rdparty/Gym-workspace/Gym
 export RAY_TMPDIR=/tmp/ray-${RUN_ID}
-export NEMO_GYM_VENV_DIR=${RUN_ROOT}/nemo-gym-venvs
+export NEMO_GYM_VENV_DIR=${NEMO_GYM_VENV_DIR}
 export NRL_MEGATRON_CHECKPOINT_DIR=${RUN_ROOT}/megatron-checkpoints
 export ETHER0_REMOTES_PYTHON=${ETHER0_REMOTES_PYTHON}
 export ETHER0_MOLTRANS_MODEL_PATH=${ETHER0_MOLTRANS_MODEL_PATH}
@@ -141,7 +147,7 @@ uv run python -u examples/run_grpo_single_controller.py \
     ++logger.wandb.id=${WANDB_RUN_ID} \
     ++logger.wandb.resume=${WANDB_RESUME} \
     checkpointing.checkpoint_dir=${RUN_ROOT}/checkpoints \
-    ++env.nemo_gym.uv_venv_dir=${RUN_ROOT}/nemo-gym-venvs \
+    ++env.nemo_gym.uv_venv_dir=${NEMO_GYM_VENV_DIR} \
     ++env.nemo_gym.skip_venv_if_present=false
 EOF
 
@@ -156,6 +162,7 @@ echo "Ether0 manifest:   ${ETHER0_TRAIN_MANIFEST}"
 echo "Ether0 sidecar:    ${ETHER0_REMOTES_PYTHON}"
 echo "Ether0 native lib: ${ETHER0_NATIVE_LIBRARY_DIR}"
 echo "Run root:          ${RUN_ROOT}"
+echo "Gym venvs:         ${NEMO_GYM_VENV_DIR}"
 echo "W&B run ID:        ${WANDB_RUN_ID} (resume=${WANDB_RESUME})"
 echo "Slurm dependency:  ${SLURM_DEPENDENCY:-none}"
 

@@ -1,0 +1,7 @@
+defaults: ./grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-sc-tq-treeattn-500step.yaml
+async_rl:
+  native_exact_call_tree: false
+logger:
+  log_dir: logs/grpo-qwen2.5-math-1.5b-megatron-sc-tq-no-treeattn-500step
+  wandb:
+    name: grpo-qwen2.5-math-1.5b-megatron-sc-tq-no-treeattn-500step
