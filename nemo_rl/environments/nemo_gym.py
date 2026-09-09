@@ -88,6 +88,12 @@ def _has_nan_generation_logprobs(result: dict) -> bool:
     )
 
 
+def _get_nemo_gym_failure_error(result: dict[str, Any]) -> str | None:
+    """Return the diagnostic attached to a structured NeMo-Gym failure."""
+    error = result.get("error") or result.get("_ng_failure_judge_error")
+    return str(error) if error is not None else None
+
+
 def get_nemo_gym_uv_cache_dir() -> str | None:
     """Return the uv cache directory inside a container, or None outside one.
 
@@ -687,10 +693,11 @@ Depending on your data shape, you may want to change these values."""
                 failure_class = nemo_gym_result.get(NG_FAILURE_CLASS_KEY)
                 if failure_class is not None:
                     failure_counts[str(failure_class)] += 1
+                    failure_error = _get_nemo_gym_failure_error(nemo_gym_result)
                     nemo_rl_result: dict | NemoGymRolloutFailure = (
                         NemoGymRolloutFailure(
                             failure_class=str(failure_class),
-                            error=nemo_gym_result.get("error"),
+                            error=failure_error,
                             full_result=nemo_gym_result,
                         )
                     )
@@ -698,7 +705,7 @@ Depending on your data shape, you may want to change these values."""
                         "NeMo-Gym rollout row failed: "
                         f"rowidx={nemo_gym_row['_rowidx']} "
                         f"failure_class={failure_class!r} "
-                        f"error={nemo_gym_result.get('error')!r}",
+                        f"error={failure_error!r}",
                         file=sys.stderr,
                     )
                 else:

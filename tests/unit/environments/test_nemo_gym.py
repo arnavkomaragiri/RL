@@ -28,6 +28,7 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
 from nemo_rl.environments.nemo_gym import (
+    _get_nemo_gym_failure_error,
     _token_capture_metrics,
     NemoGym,
     NemoGymConfig,
@@ -109,6 +110,28 @@ def test_run_rollouts_streams_structured_gym_failure_without_postprocessing():
     assert result.error == "sandbox upload failed"
     assert result.full_result == failure_result
     assert timing_metrics is not None
+
+
+def test_get_nemo_gym_failure_error_reads_judge_diagnostic():
+    assert (
+        _get_nemo_gym_failure_error(
+            {
+                "_ng_failure_class": "judge_failed",
+                "_ng_failure_judge_error": "Ether0 remotes call failed: RetryError",
+            }
+        )
+        == "Ether0 remotes call failed: RetryError"
+    )
+    assert (
+        _get_nemo_gym_failure_error(
+            {
+                "_ng_failure_class": "judge_failed",
+                "error": "canonical error",
+                "_ng_failure_judge_error": "fallback error",
+            }
+        )
+        == "canonical error"
+    )
 
 
 def test_build_reward_component_columns():
